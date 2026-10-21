@@ -1,139 +1,119 @@
 # litemcp — Roadmap
 
-> **Objectif** : le framework MCP le plus rapide et le plus léger en mémoire pour Rust.
-> Zéro runtime async obligatoire, spec MCP **2026-07-28** (stateless) en cible primaire.
+> **Pivot du 2026-10-21 (décision opérateur)** : **HTTP-only, sans stdio.**
+> litemcp = Streamable HTTP **stateless** (spec MCP 2026-07-28) sur un socket
+> bindé — zéro runtime async, zéro session, zéro handshake.
 > Nom `litemcp` vérifié libre sur crates.io le 2026-10-21 (404 API).
 
 ---
 
 ## 1. Positionnement
 
-Le marché Rust est occupé par deux extrêmes : **rmcp** (officiel, excellent mais tokio + hyper + tower + schemars) et **fastmcp_rust** (nightly épinglé, runtime maison asupersync, conformité non vérifiée). Le créneau libre : **stable, minuscule, mesuré**.
-
 | | rmcp (officiel) | fastmcp_rust | **litemcp** |
 |---|---|---|---|
-| Runtime | tokio + hyper + tower | asupersync (maison) | **aucun au core** (threads bloquants `std`) |
+| Runtime | tokio + hyper + tower | asupersync (maison, nightly) | **aucun** (threads bloquants `std`) |
 | Toolchain | stable | nightly épinglé | **stable, MSRV 1.85** |
-| Deps core | tokio, hyper, schemars… | nombreuses, maison | **serde + serde_json uniquement** |
+| Deps core | tokio, hyper, schemars… | nombreuses | **serde + serde_json** |
+| Transports | stdio, HTTP, (WS custom) | stdio, HTTP, SSE, WS | **HTTP stateless uniquement** |
+| Session | oui (ou stateless) | oui | **aucune — chaque POST est auto-suffisant** |
 | `unsafe` | autorisé | interdit | **interdit** (`forbid`) |
-| Spec | 2026-07-28 stable | 2026-07-28 « en cours, non vérifié » | 2026-07-28 stateless-first |
-| Transports | stdio, Streamable HTTP (hyper) | stdio, HTTP, SSE, WS | stdio + **HTTP/1.1 minimal maison** |
 | Mémoire | non communiquée | non communiquée | **SLO mesurés à chaque release** |
 
-Cible d'usage : serveurs MCP embarqués (CLI, TUI, edge, IoT), tests unitaires rapides, processus courts — là où embarquer tokio coûte plus cher que le serveur lui-même.
+Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, processus courts — là où embarquer tokio coûte plus cher que le serveur lui-même.
 
-## 2. Décisions techniques arrêtées (la « config » discutée)
+## 2. Décisions techniques arrêtées
 
-1. **Spec cible** : MCP 2026-07-28 **stateless** — chaque message = un POST sur une route unique, réponse JSON ou flux SSE *request-scoped*. Pas de `initialize`, pas de `Mcp-Session-Id`, métadonnées dans `_meta`. La compat 2025-11-25 (handshake + session) arrive en feature `legacy` en Phase 5.
-2. **Transports** :
-   - **stdio** : framing newline-delimited JSON-RPC (le framing standard de la spec, réutilisable sur tout flux d'octets) ;
-   - **Streamable HTTP** : mini HTTP/1.1 maison sur `std::net::TcpListener` — POST + `Content-Length` + keep-alive + writer SSE (`data: …\n\n`). TLS hors scope : derrière reverse proxy (nginx/caddy), comme la spec le recommande.
-3. **Zéro runtime async dans le core** : threads bloquants, un thread par connexion HTTP. Un adaptateur tokio optionnel pourra exister en feature, jamais par défaut.
-4. **`#![forbid(unsafe_code)]`** sur tous les crates.
-5. **Dépendances core** : `serde`, `serde_json`. Rien d'autre. Pas de `schemars` : génération de JSON Schema maison minimale (Phase 4).
-6. **API** : `ServerBuilder` fluent + macros `#[tool]` / `#[resource]` / `#[prompt]` (crate `litemcp-macros`, split workspace en Phase 4).
-7. **Licence** dual `MIT OR Apache-2.0` (standard écosystème Rust).
-8. **MSRV** : 1.85 (edition 2024), politique documentée ; bump de MSRV = minor mineure.
-9. **Mesures** : RSS (RSS peak), taille binaire stripped et latence p50/p99 publiés dans le README **à chaque release**, avec la même machine et le même harness que les comparatifs (rmcp mesuré à plat, jamais estimé).
-10. **Versioning** : 0.x jusqu'à conformance MCP officielle verte ; semver strict ensuite.
+1. **Spec cible : MCP 2026-07-28 stateless uniquement** — un `POST /mcp` par message, réponse `application/json` (ou `text/event-stream` request-scoped mono-événement si le client ne demande que du SSE), notification → `202` sans corps, `GET` → `405`. Pas de `initialize` obligatoire (toléré pour les inspecteurs), pas de `Mcp-Session-Id`.
+2. **Pas de stdio** (retiré du produit) : le serveur est un démon HTTP joignable par plusieurs clients, pas un sous-processus d'un seul.
+3. **HTTP/1.1 minimal maison** sur `std::net::TcpListener` : route unique, `Content-Length`, keep-alive, garde DNS-rebinding sur `Origin` (refus par défaut, liste blanche explicite), `MAX_BODY` = 1 Mio, erreurs HTTP propres (403/404/405/411/413).
+4. **Zéro runtime async** : threads `std`, un thread par connexion. Adaptateur tokio éventuel plus tard, en feature, jamais par défaut.
+5. **`#![forbid(unsafe_code)]`** ; deps core `serde` + `serde_json` uniquement ; pas de schemars.
+6. **API actuelle (0.1)** : `ServerBuilder` + closures d'outils. **0.2** : macros `#[tool]`/`#[resource]`/`#[prompt]` + schémas dérivés (workspace split `litemcp-macros`).
+7. **Licence** dual `MIT OR Apache-2.0` ; **MSRV 1.85** (edition 2024).
+8. **Versioning** 0.x jusqu'à conformance verte ; publication précoce **0.1.0** assumée comme socle pour réserver le nom crates.io ; 1.0 après conformance.
 
 ## 3. Phases
 
-### Phase 0 — Fondations ✅ *(cette session)*
+### Phase 0 — Fondations ✅ (2026-10-21)
 
-- [x] Arborescence repo + `Cargo.toml` prêt crates.io (métadonnées complètes)
-- [x] Licences MIT + Apache-2.0, `.gitignore`, README avec positionnement
-- [x] CI GitHub Actions : `fmt --check`, `clippy -D warnings`, `test`, `doc`
-- [x] Squelette `src/` compilant + premier test (`jsonrpc::RequestId`, `tests/smoke.rs`)
-- [x] `git init` (branche `main`) + commit initial
-- [ ] Création du repo GitHub `DeamonDev888/litemcp` + premier push — **décision requise : public ou privé** (public recommandé : CI gratuite illimitée + crédibilité crates.io)
-- [ ] CI verte sur GitHub
+- [x] Structure repo, `Cargo.toml` prêt crates.io, licences, `.gitignore`, CI (fmt/clippy/test/doc)
+- [x] `git init` main + commits initial
 
-**Jalon** : `cargo test` + `cargo clippy` verts en local et en CI.
+**Jalon** : `cargo test` vert localement et en CI.
 
-### Phase 1 — Noyau protocole (JSON-RPC + types MCP)
+### Phase 1 — Noyau JSON-RPC + dispatch MCP ✅ (2026-10-21)
 
-- Types JSON-RPC 2.0 : `Request`, `Response`, `Notification`, `ErrorObject`, `RequestId` (string|int), batch
-- Types MCP 2026-07-28 : `tools/list`, `tools/call`, `resources/list|read|templates`, `prompts/list|get`, `ping`, `_meta.io.modelcontextprotocol/*`, capabilities
-- Mapping erreurs domaine → codes JSON-RPC ; `CallToolResult` (content blocks, `isError`, `structuredContent`)
-- Tests : round-trip serde sur un corpus de messages d'exemple de la spec (golden files)
+- [x] `jsonrpc` : `RequestId`, `ErrorObject` (codes -32700/-32600/-32601/-32602/-32603), `Incoming`, `Outgoing` (`id: null` sur parse error comme exigé)
+- [x] `protocol` : `PROTOCOL_VERSION` 2026-07-28, `Tool`/`inputSchema`, `ToolsListResult`, `CallToolResult` (`isError` + `structuredContent`), `ServerInfo`
+- [x] `server` : `ServerBuilder` + `tool()` + dispatch `initialize`/`ping`/`tools/list`/`tools/call`, notifications sans réponse
+- [x] Tests unitaires (round-trip, parse error, succès sans champ `error`)
 
-**Jalon** : 100 % des messages d'exemple de la spec 2026-07-28 encodés/décodés sans perte.
+**Jalon** : dispatch complet, aucune I/O dans le noyau.
 
-### Phase 2 — Transport stdio
+### Phase 2 — Transport HTTP stateless ✅ (2026-10-21)
 
-- `Server::serve(reader: impl Read, writer: impl Write)` — générique, testable sans processus
-- Boucle : ligne → dispatch → réponse ; EOF propre = arrêt ; erreurs non fatales loguées en JSON-RPC error
-- Client stdio minimal (spawn d'un sous-processus) pour les tests e2e
-- Interop : litemcp server ↔ litemcp client, puis ↔ MCP Inspector (mode stdio)
-- **Première mesure** : RSS hello-tool, taille binaire stripped, latence p50/p99
+- [x] `http::BoundServer` : `local_addr()`, `serve()` (accept loop, thread par connexion)
+- [x] Parseur HTTP/1.1 minimal : ligne de requête, en-têtes, `Content-Length`, keep-alive, `Connection: close`
+- [x] Réponses : `200` JSON, `200` SSE mono-événement (`Accept: text/event-stream` seul), `202` notifications, `403` Origin refusée, `404` route, `405` GET, `411`, `413`
+- [x] Garde DNS-rebinding (`Origin` refusée par défaut, `allow_origins()`)
+- [x] 14 tests d'intégration sur **vraies sockets** (bind `127.0.0.1:0`)
+- [x] Exemple `hello`
 
-**Jalon** : serveur utilisable dans Claude Desktop (`mcpServers` → commande stdio) ; tableau de mesures publié dans le README.
+**Jalon** : `cargo test` + `cargo run --example hello` fonctionnels.
 
-### Phase 3 — Streamable HTTP stateless (le socket bindé)
+### Phase 3 — Durcissement HTTP
 
-- Mini HTTP/1.1 : `TcpListener::bind`, accept → thread par connexion, parse requête (méthode, path, headers, `Content-Length`), keep-alive
-- Route unique `POST /mcp` : JSON-RPC → exécution → `application/json` (ou `text/event-stream` request-scoped si le tool streame)
-- Codes propres : 405 sur `GET` (pas de listener channel en stateless), 400 JSON invalide, 415 mauvais `Content-Type`, 413 corps trop gros
-- Garde DNS-rebinding : vérification `Origin`/`Host` (comme le fait le SDK PHP/Symfony)
-- Tests : `curl`, MCP Inspector en mode URL, fuzz basique du parseur HTTP (corpus + proptest en dev-dep)
-- **Mesure comparée** : RSS et latence vs rmcp + axum sur le même scénario
+- [ ] Fuzz du parseur (proptest/corpus), timeouts de lecture (slowloris), limite du nombre d'en-têtes
+- [ ] Tests réels : MCP Inspector (mode URL), Claude, Cursor
+- [ ] Keep-alive multi-requêtes testé; gestion `Expect: 100-continue`
+- [ ] Décision : garder HTTP maison ou basculer sur `tiny_http` selon les résultats du fuzz
 
-**Jalon** : `cargo run --example http` → `http://127.0.0.1:8080/mcp` inspectable dans MCP Inspector ; benchmark publié.
+**Jalon** : aucune panique ni blocage possible depuis un client hostile (fuzz vert).
 
-### Phase 4 — Ergonomie (macros + schémas)
+### Phase 4 — Ergonomie (0.2)
 
-- Split workspace : `crates/litemcp` + `crates/litemcp-macros` (proc-macro)
-- `#[tool]`, `#[resource]`, `#[prompt]` : génération du handler + JSON Schema minimal depuis les types (sans schemars — objectif : binaire plus petit, à mesurer)
-- `ServerBuilder` fluent, état partagé (`Arc`) ou par session, erreurs typées
-- Exemples : `hello`, `multi_tools`, `shared_state`, `http_nginx`
+- [ ] Workspace split : `crates/litemcp` + `crates/litemcp-macros`
+- [ ] `#[tool]`, `#[resource]`, `#[prompt]` — schéma dérivé des types (sans schemars)
+- [ ] Ressources/prompts dans le noyau (aujourd'hui : `tools` seulement)
+- [ ] Exemples enrichis
 
-**Jalon** : hello-tool complet en < 30 lignes ; gains de taille binaire documentés vs schemars.
+**Jalon** : hello-tool en < 15 lignes ; binaire encore plus petit (mesuré).
 
-### Phase 5 — Client + compat legacy
+### Phase 5 — Publication crates.io 🚧
 
-- Client stdio + client HTTP stateless (mêmes types, pas de duplication)
-- Feature `legacy` : ère 2025-11-25 côté serveur **et** client (`initialize`, `Mcp-Session-Id`, GET SSE listener optionnel)
-- Matrice d'interop : litemcp ↔ rmcp ↔ fastmcp_rust (serveur et client), documentée
+- [x] `cargo package --list` propre (src + Cargo.toml + README + licences)
+- [ ] `cargo publish` **0.1.0** — *en attente du token API crates.io de l'opérateur*
+- [ ] docs.rs propre, badge crates.io, CHANGELOG
 
-**Jalon** : litemcp client parle à rmcp server et inversement, dans les deux ères.
+**Jalon** : `crates.io/crates/litemcp` en ligne.
 
-### Phase 6 — Publication crates.io + conformance
+### Phase 6 — Conformance + benchmarks → 1.0
 
-- `docs.rs` propre (toutes features), `CHANGELOG.md`, guide de contribution
-- Suite de conformance officielle MCP (`scripts/run_conformance.sh`, spec 2026-07-28, mode serveur — objectif : 0 FAILURE)
-- `cargo publish --dry-run` puis publication réelle `0.1.0`, tag `v0.1.0`
-- Benchmarks publics dans le README (RSS, binaire, latence) + section « comparé à rmcp »
+- [ ] Suite de conformance officielle MCP 2026-07-28, mode serveur (cible : 0 FAILURE)
+- [ ] Benchmarks publics (RSS, binaire, p99) vs rmcp+axum, dans le README
+- [ ] Client HTTP minimal (optionnel) ; feature `legacy` 2025-11-25 étudiée
 
-**Jalon** : `crates.io/crates/litemcp` en ligne, conformance verte, tableau de bench public.
+**Jalon** : conformance verte + tableau de bench → tag `1.0.0`.
 
-## 4. SLO à établir (Phase 2) et figer (Phase 6)
+## 4. SLO (hypothèses, première mesure en Phase 3)
 
-| Métrique | Cible initiale | Mesure |
+| Métrique | Cible | Mesure |
 |---|---|---|
-| RSS serveur hello-tool (stdio) | < 2 Mo | `/proc/<pid>/status` VmRSS au repos |
-| Binaire release stripped | < 1,5 Mo | `ls -lh target/release` |
-| Latence locale `tools/call` p99 | < 1 ms (hors IO) | harness criterion, 10k appels |
-| Démarrage à froid (stdio) | < 10 ms | time-to-first-response |
+| RSS hello-tool (HTTP, au repos) | < 2 Mo | VmRSS |
+| Binaire release stripped | < 1,5 Mo | `ls -lh` |
+| `tools/call` p99 local | < 1 ms | harness, 10k appels |
+| Démarrage à froid | < 10 ms | time-to-first-response |
 
-Les cibles sont des **hypothèses de départ** : elles seront ajustées une seule fois après la première mesure réelle, puis figées comme SLO de release.
-
-## 5. Risques connus
+## 5. Risques
 
 | Risque | Impact | Mitigation |
 |---|---|---|
-| HTTP/1.1 maison (parsing, edge cases) | Élevé | Périmètre volontairement minimal (POST only, pas de chunked request, pas de TLS) ; fuzz + Inspector ; repli : crate `tiny_http` si bloquant |
-| Génération de schéma sans schemars | Moyen | Golden tests contre les schémas de la spec ; escape hatch : feature `schemars` optionnelle |
-| rmcp avance vite (spec mouvante) | Moyen | Veille à chaque release MCP ; le core suit la spec, pas rmcp |
-| Sur-promesse « le plus rapide » | Réputation | Benchmarks mesurés et publiés, jamais d'adjectif sans chiffre |
+| HTTP/1.1 maison (parsing, edge cases) | Élevé | Périmètre minimal (POST only), fuzz en Phase 3, repli `tiny_http` décidé par les tests |
+| Conformance incomplète en 0.1 | Moyen | 0.1 assumée « socle » ; 1.0 seulement après suite officielle |
+| Superlatif « le plus léger du monde » non mesuré | Réputation | Benchmarks obligatoires à chaque release ; la phrase reste un objectif, les chiffres tranchent |
 
-## 6. Prochaines actions immédiates
+## 6. Journal
 
-1. **Décider** : repo GitHub public ou privé.
-2. Créer `github.com/DeamonDev888/litemcp` + push initial (le token GitHub habituel de la machine suffit — même pattern `url.insteadOf` que les autres repos).
-3. Vérifier la CI verte (ubuntu, Actions gratuites si public).
-4. Attaquer la Phase 1 : types JSON-RPC + corpus golden.
-
-## 7. Journal de bord
-
-- **2026-10-21** — Phase 0 : scaffold créé (Cargo prêt crates.io, licences, CI, README, roadmap), `git init` + commit initial. Nom `litemcp` vérifié libre sur crates.io.
+- **2026-10-21 v1** — Phase 0 : scaffold (Cargo prêt crates.io, licences, CI, README, roadmap), `git init` + commit `16ad4e4`. Nom `litemcp` vérifié libre.
+- **2026-10-21 v2** — README style framework (ViteMCP/FastMCP), commit `3bde75b`.
+- **2026-10-21 v3** — **PIVOT « sans stdio »** (décision opérateur) : Phases 1 et 2 implémentées d'un coup (noyau JSON-RPC + HTTP stateless sur socket bindé, 14 tests d'intégration) ; `transport.rs` supprimé ; `0.1.0` prêt à publier ; en attente du token crates.io.

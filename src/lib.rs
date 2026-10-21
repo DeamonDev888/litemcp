@@ -1,21 +1,41 @@
 #![forbid(unsafe_code)]
 //! # litemcp
 //!
-//! Le framework MCP (Model Context Protocol) le plus rapide et le plus léger
-//! pour Rust — zéro runtime async au cœur, `serde` + `serde_json` seulement.
+//! Le framework MCP (Model Context Protocol) le plus léger pour Rust :
+//! **stateless Streamable HTTP sur un socket bindé — zéro runtime async,
+//! pas de stdio, `serde` + `serde_json` seulement.**
 //!
-//! Cible protocole : **MCP 2026-07-28** (stateless), avec stdio comme
-//! transport natif et Streamable HTTP (POST unique → JSON ou SSE) en Phase 3.
+//! Spec cible : MCP 2026-07-28 — chaque message est un `POST /mcp`, la
+//! réponse arrive en `application/json` (ou en `text/event-stream` si le
+//! client ne demande que du SSE).
 //!
 //! ```no_run
-//! // Phase 2+ : exemple à venir
-//! ```
+//! use litemcp::prelude::*;
 //!
-//! Voir `docs/ROADMAP.md` du dépôt pour les phases et jalons.
+//! ServerBuilder::new("calc", "1.0.0")
+//!     .tool("add", "Additionne deux nombres", |args| {
+//!         let a = args["a"].as_i64().ok_or("a manquant")?;
+//!         let b = args["b"].as_i64().ok_or("b manquant")?;
+//!         Ok(serde_json::json!({ "somme": a + b }))
+//!     })
+//!     .bind("127.0.0.1:8080")?   // socket bindé — un thread par connexion
+//!     .serve()?;                 // bloque : POST /mcp → JSON ou SSE
+//! # Ok::<(), std::io::Error>(())
+//! ```
 
+pub mod http;
 pub mod jsonrpc;
 pub mod protocol;
-pub mod transport;
+pub mod server;
 
-/// Version du crate (utile aux benchmarks et aux logs de démarrage).
+pub use server::{ServerBuilder, ServerCore};
+
+/// Version du crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Tout ce qu'il faut pour écrire un serveur en quelques lignes.
+pub mod prelude {
+    pub use crate::VERSION;
+    pub use crate::protocol::PROTOCOL_VERSION;
+    pub use crate::server::{ServerBuilder, ToolResult};
+}

@@ -2,12 +2,15 @@
 
 # litemcp
 
-**Le framework MCP le plus rapide et le plus léger pour Rust.**
+**Le framework MCP le plus rapide et le plus léger au monde — écrit en Rust.**
 
-Zéro runtime async · 2 dépendances · MCP 2026-07-28 stateless · `forbid(unsafe_code)`
+Stateless · socket bindé · HTTP POST/SSE · **sans stdio** · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-pr%C3%A9--alpha-orange) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.1.0%20socle-orange) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
+<!-- Badge crates.io à activer après publication :
+![crates.io](https://img.shields.io/crates/v/litemcp.svg)
+-->
 <!-- Badge CI à activer après le push GitHub :
 ![CI](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml/badge.svg)
 -->
@@ -15,7 +18,7 @@ Zéro runtime async · 2 dépendances · MCP 2026-07-28 stateless · `forbid(uns
 </div>
 
 > [!IMPORTANT]
-> **Pré-alpha — Phase 0.** litemcp est en fondation. Le code ci-dessous est l'**API cible** : elle se construit phase par phase ([roadmap](docs/ROADMAP.md)). Rien ne sera publié sur crates.io avant la conformance MCP officielle (Phase 6).
+> **0.1.0 — socle fonctionnel.** Le serveur HTTP stateless (bind + POST → JSON/SSE) fonctionne et est testé (14 tests sur vraies sockets). Les macros `#[tool]` et les schémas dérivés arrivent en 0.2 ; la conformance officielle MCP est visée pour 1.0.
 
 ## Sommaire
 
@@ -23,8 +26,9 @@ Zéro runtime async · 2 dépendances · MCP 2026-07-28 stateless · `forbid(uns
 - [Quand choisir litemcp plutôt que rmcp](#quand-choisir-litemcp-plutôt-que-rmcp)
 - [Installation](#installation)
 - [Démarrage rapide](#démarrage-rapide)
+- [Tester](#tester)
 - [Concepts](#concepts)
-- [Transports](#transports)
+- [Protocole](#protocole)
 - [Benchmarks](#benchmarks)
 - [Tests](#tests)
 - [FAQ](#faq)
@@ -33,23 +37,23 @@ Zéro runtime async · 2 dépendances · MCP 2026-07-28 stateless · `forbid(uns
 
 ## Pourquoi litemcp
 
-Un serveur MCP en Rust aujourd'hui, c'est un choix entre deux poids lourds : **rmcp**, l'officiel — excellent, mais il embarque tokio, hyper, tower et schemars — et **fastmcp_rust**, qui exige un nightly épinglé et un runtime maison. Les deux sont conçus pour des serveurs de production riches.
+Un serveur MCP en Rust, aujourd'hui, c'est un choix entre deux poids lourds : **rmcp**, l'officiel — excellent, mais il embarque tokio, hyper, tower et schemars — et **fastmcp_rust**, qui exige un nightly épinglé et un runtime maison. Les deux sont conçus pour des serveurs de production riches.
 
-Il existe un autre créneau : **le serveur MCP qui ne coûte presque rien**.
+litemcp prend le problème par l'autre bout : **un serveur MCP qui ne coûte presque rien**.
 
 - une CLI qui expose trois outils ;
 - un test unitaire qui veut un vrai serveur, sans runtime ;
 - un binaire embarqué (edge, IoT) où une pile HTTP complète, c'est non ;
-- un agent qui spawn cinquante sous-processus et paie le coût à chaque fois.
+- un agent qui spawn cinquante serveurs et paie le coût à chaque fois.
 
-**litemcp traite le protocole comme une bibliothèque, pas comme un service.** Le cœur est une pompe JSON-RPC sur des threads bloquants du `std` — pas de tokio, pas de hyper, pas de schemars.
+**litemcp traite le protocole comme une bibliothèque, pas comme un service.** Le cœur est une pompe JSON-RPC sur des threads bloquants du `std` — pas de tokio, pas de hyper, pas de schemars, pas de stdio.
 
 Les principes :
 
-1. **Zéro runtime async au cœur.** Threads `std`, un thread par connexion HTTP. Un adaptateur tokio existera un jour — en feature optionnelle, jamais par défaut.
-2. **Deux dépendances, pas une de plus.** `serde` et `serde_json`. Le JSON Schema est dérivé à la maison (Phase 4).
-3. **La spec d'abord.** MCP 2026-07-28 (stateless) comme cible primaire ; le legacy 2025-11-25 en feature `legacy`, jamais dans le chemin par défaut.
-4. **Mesuré ou rien.** Chaque release publie RSS, taille de binaire et latence p99 — avec les chiffres de rmcp mesurés à plat à côté. Jamais d'adjectif sans chiffre.
+1. **HTTP stateless uniquement.** Chaque message est un `POST /mcp` auto-suffisant : pas de session, pas d'`initialize` obligatoire, pas de flux permanent. C'est la spec 2026-07-28, à la lettre.
+2. **Zéro runtime async au cœur.** `std::net::TcpListener`, un thread par connexion. Un adaptateur tokio existera un jour — en feature optionnelle, jamais par défaut.
+3. **Deux dépendances, pas une de plus.** `serde` et `serde_json`. Le JSON Schema sera dérivé à la maison (0.2).
+4. **Mesuré ou rien.** Chaque release publie RSS, taille de binaire et latence p99 — avec rmcp mesuré à plat à côté. Jamais d'adjectif sans chiffre.
 
 ## Quand choisir litemcp plutôt que rmcp
 
@@ -58,15 +62,16 @@ Les principes :
 | Un serveur MCP dans une CLI, une TUI, un test | **litemcp** |
 | Budget RAM serré (edge, IoT, embarqué) | **litemcp** |
 | Démarrage à froid < 10 ms, binaire minimal | **litemcp** |
+| Client MCP **local lancé en sous-processus** (stdio) | rmcp |
 | OAuth 2.1, tasks, elicitation, écosystème officiel | rmcp |
 | Serveur de production riche, multi-features | rmcp |
 
-rmcp est excellent — litemcp ne cherche pas à le remplacer partout. litemcp occupe le créneau que la pile officielle ne peut pas occuper sans casser sa compatibilité tokio.
+rmcp est excellent — litemcp ne cherche pas à le remplacer partout. litemcp occupe le créneau que la pile officielle ne peut pas occuper sans casser sa compatibilité tokio : **le serveur MCP stateless, minuscule et mesuré**.
 
 ## Installation
 
 ```toml
-# Phase 6 — pas encore publié sur crates.io
+# Phase 5 — publication crates.io en cours
 [dependencies]
 litemcp = "0.1"
 ```
@@ -80,120 +85,117 @@ litemcp = { git = "https://github.com/DeamonDev888/litemcp" }
 
 ## Démarrage rapide
 
-### Serveur stdio — Phase 2 (API cible)
-
 ```rust
 use litemcp::prelude::*;
 
-#[tool(description = "Additionne deux nombres")]
-fn add(a: i64, b: i64) -> String {
-    (a + b).to_string()
-}
-
 fn main() -> std::io::Result<()> {
     ServerBuilder::new("calc", "1.0.0")
-        .tool(add)
-        .serve_stdio()      // câblé sur stdin/stdout, thread unique
+        .tool("add", "Additionne deux nombres", |args| {
+            let a = args["a"].as_i64().ok_or("a manquant")?;
+            let b = args["b"].as_i64().ok_or("b manquant")?;
+            Ok(serde_json::json!({ "somme": a + b }))
+        })
+        .bind("127.0.0.1:8080")?   // socket bindé, un thread par connexion
+        .serve()                    // bloque : POST /mcp → JSON ou SSE
 }
 ```
 
-C'est tout — ajoutez la commande dans Claude Desktop ou Cursor (`mcpServers`) et le serveur répond.
+C'est tout — votre serveur MCP écoute. Aucune session, aucun handshake, aucun runtime.
 
-### Serveur Streamable HTTP stateless — Phase 3 (API cible)
+## Tester
 
-```rust
-fn main() -> std::io::Result<()> {
-    ServerBuilder::new("calc", "1.0.0")
-        .tool(add)
-        .bind("127.0.0.1:8080")?   // TcpListener, un thread par connexion
-        .serve()                   // POST /mcp → JSON ou SSE
-}
+```bash
+curl -s http://127.0.0.1:8080/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"a":5,"b":7}}}'
 ```
 
-Une seule route, pas de session, chaque POST auto-suffisant : c'est la spec 2026-07-28. Derrière nginx pour le TLS, et le serveur tient dans une poignée de Ko.
+```json
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"somme\":12}"}],"structuredContent":{"somme":12}}}
+```
 
-Testez avec MCP Inspector (mode URL) : `npx @modelcontextprotocol/inspector` → `http://127.0.0.1:8080/mcp`.
+Ou avec MCP Inspector en mode URL : `npx @modelcontextprotocol/inspector` → `http://127.0.0.1:8080/mcp`.
 
 ## Concepts
 
 ### Outils
 
-La macro `#[tool]` génère le handler et le JSON Schema depuis la signature Rust — sans schemars :
+Un outil se déclare par une closure — nom, description, fonction :
 
 ```rust
-#[tool(description = "Recherche un dossier (référence générique)")]
-fn search(query: String, limit: Option<u32>) -> Vec<Hit> { /* … */ }
+.tool("search", "Recherche un dossier (référence générique)", |args| {
+    let query = args["query"].as_str().ok_or("query manquant")?;
+    Ok(serde_json::json!({ "hits": search(query) }))
+})
 ```
 
-`Option<T>` → champ optionnel du schéma ; `Result<T, E>` → erreur JSON-RPC typée ; le retour sérialisé → `structuredContent`.
+La valeur de retour devient `structuredContent` ; une `Err(msg)` devient un `isError: true` avec le message en contenu texte — les deux niveaux d'erreur de la spec, sans confusion.
 
-### Ressources et prompts
-
-```rust
-#[resource(uri = "config://app")]
-fn config() -> String { /* … */ }
-
-#[prompt(description = "Modèle de compte rendu")]
-fn compte_rendu(date: String) -> Vec<Message> { /* … */ }
-```
+La macro `#[tool]` (0.2) remplacera la closure par une simple fonction annotée, schéma dérivé automatiquement.
 
 ### Erreurs
 
-Un `Result` rustique partout, avec la séparation de la spec : une erreur applicative devient une erreur JSON-RPC propre ; une erreur d'exécution d'outil devient un `CallToolResult::isError` que le client affiche. Jamais les deux mélangés.
+- **Erreur d'outil** (le tool a tourné et a échoué) → `CallToolResult::isError` — le client affiche le message ;
+- **Erreur de protocole** (mauvaise requête, outil inconnu, JSON invalide) → erreur JSON-RPC typée (-32700, -32602, -32601…), rendue de façon opaque.
 
-## Transports
+## Protocole
 
-| Transport | Statut | Détail |
-|---|---|---|
-| **stdio** | Phase 2 | JSON-RPC délimité par newlines sur n'importe quel `Read + Write` — le framing canonique de la spec |
-| **Streamable HTTP** | Phase 3 | `POST /mcp` unique → `application/json` ou `text/event-stream` request-scoped ; `GET` → 405 ; garde DNS-rebinding sur `Origin`/`Host` |
-| Adaptateur tokio/hyper | Plus tard | Feature optionnelle, jamais par défaut |
+| Comportement | Réponse |
+|---|---|
+| `POST /mcp` valide | `200 application/json` — réponse JSON-RPC |
+| `POST` avec `Accept: text/event-stream` seul | `200 text/event-stream` — un événement `data:` (SSE request-scoped) |
+| Notification (sans `id`) | `202 Accepted` sans corps |
+| `GET` | `405 Method Not Allowed` (pas de listener SSE permanent en stateless) |
+| Route inconnue | `404` · `Content-Length` absent : `411` · corps > 1 Mio : `413` |
+| En-tête `Origin` non autorisé | `403` (garde DNS-rebinding ; CLI sans `Origin` : libre) |
 
 ## Benchmarks
 
-> Règle du projet : **jamais d'adjectif sans chiffre.** Les cibles ci-dessous sont des hypothèses de départ ; la première mesure (Phase 2) les ajuste une fois, puis elles sont figées comme SLO et republiées à chaque release, avec rmcp mesuré dans les mêmes conditions.
+> Règle du projet : **jamais d'adjectif sans chiffre.** Les cibles ci-dessous sont des hypothèses de départ ; la première campagne (0.2) les ajuste une fois, puis elles sont figées comme SLO et republiées à chaque release, avec rmcp mesuré dans les mêmes conditions.
 
 | Métrique | Cible initiale | Mesuré |
 |---|---|---|
-| RSS hello-tool (stdio) | < 2 Mo | — (Phase 2) |
-| Binaire release stripped | < 1,5 Mo | — (Phase 2) |
-| `tools/call` p99 local | < 1 ms | — (Phase 3) |
-| Démarrage à froid (stdio) | < 10 ms | — (Phase 2) |
+| RSS serveur hello-tool (HTTP, au repos) | < 2 Mo | — (0.2) |
+| Binaire release stripped | < 1,5 Mo | — (0.2) |
+| `tools/call` p99 local | < 1 ms | — (0.2) |
+| Démarrage à froid | < 10 ms | — (0.2) |
 
 ## Tests
 
 ```bash
-cargo test                          # unitaires + intégration
+cargo test                          # 17 tests : unitaires + intégration (vraies sockets)
 cargo clippy -- -D warnings         # CI stricte
 ```
 
-Le corpus de messages vient de la spec (golden files), le parseur HTTP est fuzzé (Phase 3) et chaque transport est testé de bout en bout contre MCP Inspector.
-
 ## FAQ
 
+**Pourquoi pas de stdio ?**
+Parce qu'un serveur lancé comme sous-processus (stdio) meurt avec son client et n'accepte qu'un seul pair — c'est le modèle du client, pas du serveur. litemcp fait le choix inverse : **le serveur est un démon HTTP stateless** que plusieurs agents peuvent joindre, qui survit aux clients et se déploie derrière nginx. Si vous voulez du MCP local en sous-processus, utilisez rmcp.
+
 **Pourquoi pas de tokio ?**
-Parce qu'un serveur MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des lignes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions — et l'adaptateur tokio restera disponible pour les autres cas.
+Un serveur MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des requêtes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions — et l'adaptateur tokio restera disponible pour les autres cas.
 
 **Pourquoi ne pas contribuer à rmcp ?**
-rmcp est le SDK officiel : il doit couvrir toute la spec pour tout le monde, sur tokio. Cette contrainte impose son poids. litemcp explore la question inverse : que reste-t-il quand on retire tout ce qui n'est pas strictement nécessaire ?
+rmcp est le SDK officiel : il doit couvrir toute la spec pour tout le monde, sur tokio, avec stdio. Cette contrainte impose son poids. litemcp explore la question inverse : que reste-t-il quand on retire tout ce qui n'est pas strictement nécessaire à un serveur HTTP stateless ?
 
 **Pourquoi réécrire HTTP ?**
-Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE. Pas de chunked entrant, pas de TLS, pas de compression. Si le périmètre s'avère piégeux, le repli documenté est `tiny_http` — la décision sera tranchée par les tests, pas par le dogme.
+Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE mono-événement. Pas de chunked entrant, pas de TLS, pas de compression. Si le périmètre s'avère piégeux, le repli documenté est `tiny_http` — la décision sera tranchée par les tests, pas par le dogme.
 
 **Quand sur crates.io ?**
-Après la conformance officielle MCP verte (Phase 6). Publier un crate « le plus léger » non conforme serait le meilleur moyen de le rendre inutile.
+Maintenant : `0.1.0` est publié comme socle. La mention « 1.0 » attendra la conformance officielle MCP verte.
 
 ## Feuille de route
 
 | Phase | Contenu | État |
 |---|---|---|
 | 0 | Fondations (repo, Cargo, CI, licences) | ✅ |
-| 1 | Noyau protocole JSON-RPC + types MCP | ⏳ |
-| 2 | Transport stdio + premières mesures | ⏳ |
-| 3 | Streamable HTTP stateless | ⏳ |
+| 1 | Noyau JSON-RPC + dispatch MCP | ✅ |
+| 2 | Transport HTTP stateless (bind, POST/SSE) | ✅ |
+| 3 | Durcissement HTTP (fuzz, timeouts, Inspector réel) | ⏳ |
 | 4 | Macros `#[tool]` + schémas maison | ⏳ |
-| 5 | Client + compat legacy 2025-11-25 | ⏳ |
-| 6 | crates.io + conformance | ⏳ |
+| 5 | Publication crates.io 0.1.0 | 🚧 |
+| 6 | Conformance officielle + benchmarks → 1.0 | ⏳ |
 
 Le détail — jalons, SLO, risques, journal : [docs/ROADMAP.md](docs/ROADMAP.md).
 

@@ -3,11 +3,11 @@ name = "litemcp"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "The fastest, lightest Model Context Protocol (MCP) framework for Rust — zero async runtime, stdio + stateless Streamable HTTP."
+description = "The fastest, lightest MCP (Model Context Protocol) framework for Rust — stateless Streamable HTTP (POST/SSE) on a bound socket. Zero async runtime, no stdio, serde only."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DeamonDev888/litemcp"
 readme = "README.md"
-keywords = ["mcp", "model-context-protocol", "llm", "json-rpc", "ai"]
+keywords = ["mcp", "model-context-protocol", "llm", "json-rpc", "http"]
 categories = ["api-bindings", "network-programming", "web-programming::http-server"]
 exclude = [".github", "docs"]
 
