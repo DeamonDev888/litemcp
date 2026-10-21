@@ -1,0 +1,8 @@
+# Rust
+/target
+Cargo.lock
+
+# Divers
+*.swp
+.DS_Store
+Thumbs.db
