@@ -69,28 +69,30 @@ fn handler_panic_becomes_internal_error_not_connection_drop() {
 
 #[test]
 fn zod_string_counts_characters_not_bytes() {
-    use litemcp::zod::Schema;
+    use litemcp::zod::{Issues, Schema};
     // "é" = 1 caractère, 2 octets : max(3) doit accepter "ééé" (3 caractères)
     let schema = litemcp::zod::object().field("s", litemcp::zod::string().max(3));
-    let mut issues = Vec::new();
+    let mut issues = Issues::new();
     schema.validate("arguments", &serde_json::json!({ "s": "ééé" }), &mut issues);
     assert!(
         issues.is_empty(),
-        "3 caractères (6 octets) doit passer : {issues:?}"
+        "3 caractères (6 octets) doit passer : {:?}",
+        issues.render()
     );
 }
 
 #[test]
 fn zod_integer_accepts_mathematically_integral_floats() {
-    use litemcp::zod::Schema;
+    use litemcp::zod::{Issues, Schema};
     let schema = litemcp::zod::object().field("n", litemcp::zod::integer().max(200));
-    let mut issues = Vec::new();
+    let mut issues = Issues::new();
     schema.validate("arguments", &serde_json::json!({ "n": 1e2 }), &mut issues);
     assert!(
         issues.is_empty(),
-        "1e2 = 100 entier doit passer : {issues:?}"
+        "1e2 = 100 entier doit passer : {:?}",
+        issues.render()
     );
-    let mut issues = Vec::new();
+    let mut issues = Issues::new();
     schema.validate("arguments", &serde_json::json!({ "n": 1.5 }), &mut issues);
     assert!(!issues.is_empty(), "1.5 n'est pas entier");
 }

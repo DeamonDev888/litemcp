@@ -30,7 +30,7 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 3. **HTTP/1.1 minimal maison** sur `std::net::TcpListener` : route unique, `Content-Length`, keep-alive, garde DNS-rebinding sur `Origin` (refus par défaut, liste blanche explicite), `MAX_BODY` = 1 Mio, erreurs HTTP propres (403/404/405/411/413/431). **Décision du 2026-10-22 (bench A/B)** : la route maison est le **seul** backend — ~1,85× plus rapide en keep-alive (0,10 vs 0,19 ms/req), +360 Ko et +4 deps évités ; le repli `tiny_http` (testé 100 % Rust) a été **retiré du dépôt** après la mesure : minimalisme strict, 2 deps.
 4. **Zéro runtime async** : threads `std`, un thread par connexion. Adaptateur tokio éventuel plus tard, en feature, jamais par défaut.
 5. **`#![forbid(unsafe_code)]`** ; deps core `serde` + `serde_json` uniquement ; pas de schemars.
-6. **API actuelle (0.2)** : `ServerBuilder` + 3 registres d'outils — `tool` (closure brute), `tool_typed` (schéma Zod dérivé + validé), `tool_parse` (struct `Deserialize`) — et `.annotate()` / `ToolAnnotations`. **0.3** : macros `#[tool]`/`#[resource]`/`#[prompt]` + schéma dérivé du type Rust (workspace split `litemcp-macros`).
+6. **API actuelle (0.3)** : `ServerBuilder` + 3 registres d'outils — `tool` (closure brute), `tool_typed` (schéma Zod dérivé + validé), `tool_parse` (struct `Deserialize`) — et `.annotate()` / `ToolAnnotations` ; validation bornée (`zod::Issues`), `structuredContent` toujours objet. **0.4** : macros `#[tool]`/`#[resource]`/`#[prompt]` + schéma dérivé du type Rust (workspace split `litemcp-macros`).
 7. **Licence** dual `MIT OR Apache-2.0` ; **MSRV 1.85** (edition 2024).
 8. **Versioning** 0.x jusqu'à conformance verte ; publication précoce **0.1.0** assumée comme socle pour réserver le nom crates.io ; 1.0 après conformance.
 
@@ -63,7 +63,7 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 
 **Jalon** : `cargo test` + `cargo run --example hello` fonctionnels.
 
-### Phase 3 — Durcissement HTTP ✅ (2026-10-22, fuzz corpus → 0.3)
+### Phase 3 — Durcissement HTTP ✅ (2026-10-22, fuzz corpus → 0.4)
 
 - [x] Timeout de lecture par opération (anti-slowloris) : `READ_TIMEOUT` 30 s, configurable `.read_timeout()` ; client trop lent → déconnecté sans réponse (testé)
 - [x] Timeout d'écriture (`WRITE_TIMEOUT` 10 s)
@@ -72,11 +72,12 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 - [x] Keep-alive multi-requêtes sur une connexion (pipelining 2 requêtes, testé)
 - [x] Décision repli tranchée par le bench A/B (`examples/bench_backends`) : maison ~1,85× plus rapide keep-alive, tiny +360 Ko / +4 deps → **tiny retiré du dépôt** (minimalisme strict : 2 deps), la route maison est le seul backend ; l'implémentation tiny avait été vérifiée 100 % Rust (`default-features = false`) et testée (6 tests) avant le retrait
 - [x] Première campagne de benchmarks : binaire 462 Ko (< 1,5 Mo ✅), keep-alive 0,10 ms (< 1 ms ✅), RSS 4,7 Mo (WorkingSet Windows — `VmRSS` Linux à venir), démarrage ~130 ms via shell (in-process à venir)
-- [ ] Fuzz du parseur (proptest/corpus), MCP Inspector / Claude / Cursor réels → **0.3**
+- [x] **Audit complet (revue indépendante, 2026-10-22)** : en-tête `Host` requis et unique en HTTP/1.1 (`400`), `Content-Length` malformé → `400` (le `411` réservé à l'absence), version HTTP ≠ 1.0/1.1 → `505`, ligne de requête stricte (exactement 3 jetons), obs-fold rejeté, `structuredContent` toujours objet (spec MCP), compteur de connexions par instance, timeouts posés avant la réponse `503`, saturation i64 des bornes f64 corrigée
+- [ ] Fuzz du parseur (proptest/corpus), MCP Inspector / Claude / Cursor réels → **0.4**
 
 **Jalon atteint** : aucun blocage ni panique sur les vecteurs hostiles testés (slowloris, lignes/en-têtes géants, corps surdimensionné) ; la décision HTTP maison vs repli est chiffrée, plus un débat.
 
-### Phase 4 — Ergonomie « Zod » ✅ (2026-10-22, macros → 0.3)
+### Phase 4 — Ergonomie « Zod » ✅ (2026-10-22, macros → 0.4)
 
 - [x] Module `zod` : schémas à la Zod (`object().field/.opt/.strict`, `string`, `integer`, `number`, `boolean`, `enumeration`, `array` + bornes) — dérivation JSON Schema (draft 2020-12) **et** validation runtime, zéro dépendance de plus
 - [x] `ServerBuilder::tool_typed` — schéma dérivé dans `tools/list`, arguments validés avant exécution (`-32602` + `error.data.issues`, l'équivalent `ZodError`)
@@ -84,7 +85,7 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 - [x] Annotations MCP 2026-07-28 (`title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) via `.annotate()` / `ToolAnnotations`
 - [x] `ErrorObject::with_data` — erreurs JSON-RPC avec `data` structuré
 - [x] 11 tests unitaires zod + 3 tests E2E typés sur vraies sockets (32 au total) ; exemple `hello` triple registre (brut / schéma / typé)
-- [ ] Macros `#[tool]`/`#[resource]`/`#[prompt]` dérivant le schéma du type Rust → **0.3** (workspace split `litemcp-macros`)
+- [ ] Macros `#[tool]`/`#[resource]`/`#[prompt]` dérivant le schéma du type Rust → **0.4** (workspace split `litemcp-macros`)
 - [ ] Ressources/prompts dans le noyau (aujourd'hui : `tools` seulement)
 
 **Jalon atteint** : l'API outil égale fastmcp TS (schéma → `inputSchema` dérivé → validation → handler typé), en plus léger : toujours 2 deps, zéro async.
@@ -131,3 +132,4 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 - **2026-10-21 v4** — **Publication 0.1.0** : fmt / clippy -D warnings / 18 tests / audit (0 vulnérabilité) verts ; package 17 fichiers, `.cargo_vcs_info.json` intègre ; `cargo publish` OK (`max_version: 0.1.0` confirmé par l'API) ; repo GitHub créé, tag `v0.1.0`, release, CI verte.
 - **2026-10-22 v5** — **Phase 4 « Zod »** : module `zod` (dérivation JSON Schema + validation runtime, 0 dep de plus), `tool_typed`/`tool_parse` (handlers typés façon fastmcp TS), annotations MCP, `ErrorObject::with_data` ; 32 tests verts ; version 0.2.0. Macros `#[tool]` décalées en 0.3.
 - **2026-10-22 v6** — **Phase 3 « Durcissement »** : timeouts lecture/écriture (anti-slowloris, `.read_timeout()`), limites en-têtes/lignes (`431`, lecture bornée `read_line_capped`), `Expect: 100-continue`, keep-alive multi-requêtes (pipelining) — 5 nouveaux tests E2E. Bench A/B **maison vs tiny_http** (`examples/bench_backends`) : maison ~1,85× plus rapide keep-alive (0,10 vs 0,19 ms/req), +360 Ko et +4 deps côté tiny → **route maison confirmée seul backend, tiny retiré du dépôt** (décision opérateur : minimalisme strict). Première campagne SLO : binaire 462 Ko ✅, keep-alive 0,10 ms ✅, RSS 4,7 Mo (WorkingSet), démarrage ~130 ms (shell). 37 tests verts.
+- **2026-10-22 v7** — **Audit complet + publication 0.3.0** : revue indépendante, tout corrigé — plafond d'issues `zod::Issues` (`MAX_ISSUES` 64, amplification mémoire ~15× éliminée), `structuredContent` toujours objet (enveloppe `{"result": …}`), `Host` requis/unique HTTP/1.1, `Content-Length` malformé → `400`, version → `505`, obs-fold → `400`, ligne de requête stricte, compteur de connexions par instance, timeouts avant `503`, saturation i64 corrigée. Changement incompatissant assumé : `Schema::validate` prend `&mut zod::Issues`. Macros/fuzz décalés en 0.4. **67 tests verts**, clippy `-D warnings`, fmt, doc. Version 0.3.0 (bump mineur : breaking 0.x).

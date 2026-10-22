@@ -2,7 +2,7 @@
 
 use crate::jsonrpc::{ErrorObject, Outgoing};
 use crate::protocol::{self, CallToolResult, ServerInfo, Tool, ToolAnnotations, ToolsListResult};
-use crate::zod::Schema;
+use crate::zod::{Issues, Schema};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -10,6 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Résultat d'un outil : `Ok(valeur)` ou `Err(message lisible par le client)`.
+///
+/// À l'ok, la valeur devient `structuredContent` : les objets JSON passent
+/// tels quels ; toute autre valeur (scalaire, tableau, `null`) est enveloppée
+/// dans `{ "result": … }` pour rester conforme à la spec MCP.
 pub type ToolResult = Result<Value, String>;
 
 type ToolFn = dyn Fn(&Value) -> Result<Value, ToolFailure> + Send + Sync;
@@ -22,18 +26,6 @@ type ToolFn = dyn Fn(&Value) -> Result<Value, ToolFailure> + Send + Sync;
 enum ToolFailure {
     Tool(String),
     Protocol(i64, String),
-}
-
-impl From<Result<Value, String>> for ToolFailure {
-    fn from(result: Result<Value, String>) -> Self {
-        match result {
-            Ok(value) => ToolFailure::Tool(
-                serde_json::to_string(&value)
-                    .unwrap_or_else(|_| "valeur non sérialisable".to_string()),
-            ),
-            Err(message) => ToolFailure::Tool(message),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -155,15 +147,16 @@ impl ServerCore {
             .cloned()
             .unwrap_or_else(|| json!({}));
         if let Some(schema) = &tool.schema {
-            let mut issues = Vec::new();
+            let mut issues = Issues::new();
             schema.validate("arguments", &arguments, &mut issues);
             if !issues.is_empty() {
+                let rendered = issues.render();
                 return Outgoing::failure(
                     id.clone(),
                     ErrorObject::with_data(
                         ErrorObject::INVALID_PARAMS,
-                        format!("Arguments invalides : {}", issues.join(" ; ")),
-                        json!({ "issues": issues }),
+                        format!("Arguments invalides : {}", rendered.join(" ; ")),
+                        json!({ "issues": rendered }),
                     ),
                 );
             }
@@ -196,6 +189,7 @@ pub struct ServerBuilder {
 
 impl ServerBuilder {
     /// Nouveau builder — `name`/`version` sont les `serverInfo` MCP.
+    #[must_use]
     pub fn new(name: &str, version: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -212,6 +206,7 @@ impl ServerBuilder {
     ///
     /// Un client qui met plus de temps à produire sa requête est déconnecté
     /// sans réponse. Les tests passent une valeur courte.
+    #[must_use]
     pub fn read_timeout(mut self, timeout: Duration) -> Self {
         self.read_timeout = timeout;
         self
@@ -219,12 +214,14 @@ impl ServerBuilder {
 
     /// Plafond de connexions simultanées (au-delà → `503` immédiat).
     /// Défaut : [`crate::http::MAX_CONNECTIONS`] (256).
+    #[must_use]
     pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
         self
     }
 
     /// Change la route MCP (par défaut `/mcp`).
+    #[must_use]
     pub fn route(mut self, route: &str) -> Self {
         self.route = route.to_string();
         self
@@ -234,6 +231,7 @@ impl ServerBuilder {
     ///
     /// Par défaut, toute requête portant un en-tête `Origin` est refusée
     /// (garde DNS-rebinding) — les clients CLI n'en envoient pas.
+    #[must_use]
     pub fn allow_origins(mut self, origins: &[&str]) -> Self {
         self.allow_origins = origins.iter().map(|o| (*o).to_string()).collect();
         self
@@ -243,6 +241,8 @@ impl ServerBuilder {
     ///
     /// La closure reçoit `arguments` (objet JSON) et renvoie la valeur
     /// structurée, ou un message d'erreur lisible par le client.
+    /// Réenregistrer un nom existant remplace silencieusement l'outil
+    /// précédent (le dernier enregistré gagne).
     pub fn tool<F>(mut self, name: &str, description: &str, f: F) -> Self
     where
         F: Fn(&Value) -> ToolResult + Send + Sync + 'static,
@@ -266,6 +266,8 @@ impl ServerBuilder {
     /// appel : un `tools/call` hors schéma reçoit `-32602` avec la liste des
     /// problèmes dans `error.data.issues` et n'exécute jamais le handler.
     /// La closure reçoit les arguments validés.
+    /// Réenregistrer un nom existant remplace silencieusement l'outil
+    /// précédent.
     pub fn tool_typed<S, F>(mut self, name: &str, description: &str, schema: S, f: F) -> Self
     where
         S: Schema + 'static,
@@ -286,7 +288,8 @@ impl ServerBuilder {
 
     /// Comme [`ServerBuilder::tool_typed`], avec un handler **typé** :
     /// les arguments validés par le schéma sont désérialisés dans `T`
-    /// (généralement un struct `#[derive(Deserialize)]`).
+    /// (généralement un struct `#[derive(Deserialize)]`). Réenregistrer un
+    /// nom existant remplace silencieusement l'outil précédent.
     ///
     /// ```no_run
     /// use litemcp::prelude::*;
@@ -341,6 +344,7 @@ impl ServerBuilder {
     /// Attache des annotations MCP (2026-07-28) à un outil déjà enregistré :
     /// `title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`,
     /// `openWorldHint`. Sans effet si l'outil n'existe pas.
+    #[must_use]
     pub fn annotate(mut self, tool: &str, annotations: ToolAnnotations) -> Self {
         if let Some(def) = self.tools.get_mut(tool) {
             def.annotations = Some(annotations);
@@ -349,6 +353,7 @@ impl ServerBuilder {
     }
 
     /// Construit le cœur de dispatch (tests, intégrations custom).
+    #[must_use]
     pub fn core(&self) -> ServerCore {
         ServerCore {
             name: self.name.clone(),
@@ -372,6 +377,7 @@ impl ServerBuilder {
             allow_origins: self.allow_origins,
             read_timeout: self.read_timeout,
             max_connections: self.max_connections,
+            live_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 }

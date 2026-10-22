@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Identifiant de requête JSON-RPC : nombre ou chaîne.
+///
+/// Choix assumé : un nombre à partie fractionnaire (`1.5`) est refusé en
+/// `-32600` — la spec JSON-RPC déconseille les ids fractionnaires
+/// (« SHOULD NOT ») et MCP ne les emploie jamais.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestId {

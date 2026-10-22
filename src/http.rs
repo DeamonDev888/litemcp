@@ -10,19 +10,29 @@
 //! - timeout de **lecture** par opération (30 s par défaut, `.read_timeout()`)
 //!   **et deadline totale par requête** (60 s) : un client qui dribble des
 //!   octets est coupé lui aussi ;
-//! - plafond de connexions simultanées (`MAX_CONNECTIONS`, défaut 256) :
-//!   au-delà, la connexion est refusée immédiatement — pas de spawn illimité ;
+//! - plafond de connexions simultanées (`MAX_CONNECTIONS`, défaut 256, par
+//!   serveur) : au-delà, la connexion est refusée immédiatement (`503`) —
+//!   pas de spawn illimité ;
 //! - limites `MAX_HEADERS` (64) / `MAX_LINE` (16 Kio) → `431`, `MAX_BODY`
 //!   (1 Mio) → `413` ;
 //! - `Transfer-Encoding` présent ou `Content-Length` dupliqué → `400`
 //!   (pas de désynchronisation type request smuggling derrière un proxy) ;
-//! - `Expect: 100-continue` honoré, et toute réponse d'erreur pré-corps
-//!   **draine ou ferme** : jamais d'octets résiduels réinterprétés comme une
-//!   requête suivante ;
+//! - `Content-Length` malformé → `400` (RFC 9112 §6.3 ; le `411` est réservé
+//!   à l'absence du champ) ;
+//! - en-tête `Host` requis et unique en HTTP/1.1 (`400` sinon, RFC 9112
+//!   §3.2), lignes obs-fold rejetées (`400`), ligne de requête malformée →
+//!   `400`, version autre que HTTP/1.0/1.1 → `505` ;
+//! - `Expect: 100-continue` honoré, et toute réponse d'erreur **ferme la
+//!   connexion** (`Connection: close`) : aucun octet résiduel ne peut être
+//!   réinterprété comme une requête suivante — on ne draine pas le corps
+//!   restant (le drain nourrirait un client qui inonde), au prix possible
+//!   d'un RST côté client avant lecture de la réponse (compromis assumé) ;
 //! - `POST /mcp?query=…` accepté (la query est ignorée) ;
 //! - `HTTP/1.0` sans `Connection: keep-alive` → connexion fermée ;
 //! - panique d'un handler capturée (`catch_unwind`) → `-32603` JSON-RPC,
-//!   la connexion du client reste propre.
+//!   la connexion du client reste propre. NB : compiler avec
+//!   `panic = "abort"` neutralise `catch_unwind` — une panique de handler
+//!   arrête alors le processus entier.
 
 use crate::server::ServerCore;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -52,11 +62,9 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// opération.
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Plafond de connexions simultanées — au-delà, refus immédiat (pas de
-/// spawn). Défaut 256.
+/// Plafond de connexions simultanées **par serveur** — au-delà, refus
+/// immédiat (pas de spawn). Défaut 256.
 pub const MAX_CONNECTIONS: usize = 256;
-
-static LIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Serveur HTTP attaché à un socket bindé
 /// (résultat de [`crate::ServerBuilder::bind`]).
@@ -67,6 +75,9 @@ pub struct BoundServer {
     pub(crate) allow_origins: Vec<String>,
     pub(crate) read_timeout: Duration,
     pub(crate) max_connections: usize,
+    /// Connexions vivantes de **cette** instance — le plafond est par
+    /// serveur, pas global au processus.
+    pub(crate) live_connections: Arc<AtomicUsize>,
 }
 
 impl BoundServer {
@@ -82,9 +93,16 @@ impl BoundServer {
             let Ok(stream) = stream else {
                 continue;
             };
-            // Plafond de concurrence : au-delà, on refuse net — chaque
-            // connexion vivante coûte un thread + un buffer.
-            if LIVE_CONNECTIONS.load(Ordering::Relaxed) >= self.max_connections {
+            // Timeouts posés avant toute écriture : même la réponse 503 ne
+            // peut pas bloquer l'accept loop sur un client qui ne lit pas.
+            let _ = stream.set_read_timeout(Some(self.read_timeout));
+            let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+            let _ = stream.set_nodelay(true);
+            // Plafond de concurrence (par serveur) : au-delà, on refuse net —
+            // chaque connexion vivante coûte un thread + un buffer.
+            let prev = self.live_connections.fetch_add(1, Ordering::Relaxed);
+            if prev >= self.max_connections {
+                self.live_connections.fetch_sub(1, Ordering::Relaxed);
                 let _ = respond(
                     &mut &stream,
                     "503 Service Unavailable",
@@ -95,16 +113,19 @@ impl BoundServer {
                 );
                 continue;
             }
-            LIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-            let _ = stream.set_read_timeout(Some(self.read_timeout));
-            let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-            let _ = stream.set_nodelay(true);
             let core = Arc::clone(&self.core);
             let route = self.route.clone();
             let allow_origins = self.allow_origins.clone();
+            let live = Arc::clone(&self.live_connections);
             std::thread::spawn(move || {
+                struct LiveGuard(Arc<AtomicUsize>);
+                impl Drop for LiveGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                let _guard = LiveGuard(live);
                 let _ = handle_connection(stream, &core, &route, &allow_origins);
-                LIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
             });
         }
         Ok(())
@@ -211,15 +232,40 @@ fn handle_connection(
         let mut parts = request_line.split_whitespace();
         let verb = parts.next().unwrap_or("");
         let full_path = parts.next().unwrap_or("");
-        let version = parts.next().unwrap_or("HTTP/1.1");
+        let version = parts.next().unwrap_or("");
+        // Ligne de requête stricte : exactement trois jetons (méthode, cible,
+        // version). RFC 9112 §3.
+        if verb.is_empty() || full_path.is_empty() || version.is_empty() || parts.next().is_some() {
+            respond_error(
+                &mut stream,
+                "400 Bad Request",
+                "ligne de requête invalide",
+                "",
+            )?;
+            return Ok(());
+        }
         let http10 = version.eq_ignore_ascii_case("HTTP/1.0");
+        if !http10 && !version.eq_ignore_ascii_case("HTTP/1.1") {
+            respond_error(
+                &mut stream,
+                "505 HTTP Version Not Supported",
+                "version HTTP non supportée",
+                "",
+            )?;
+            return Ok(());
+        }
         // La query string est ignorée : POST /mcp?x=1 == POST /mcp.
         let path = full_path.split('?').next().unwrap_or(full_path);
 
         let mut content_length: Option<usize> = None;
+        let mut saw_content_length = false;
+        let mut malformed_length = false;
         let mut duplicate_length = false;
         let mut transfer_encoding = false;
         let mut origin: Option<String> = None;
+        let mut origin_duplicate = false;
+        let mut host: Option<String> = None;
+        let mut host_duplicate = false;
         let mut accept = String::new();
         let mut expect_continue = false;
         let mut close = http10; // HTTP/1.0 : fermeture par défaut
@@ -245,6 +291,18 @@ fn handle_connection(
             if header.is_empty() {
                 break;
             }
+            // obs-fold (RFC 9112 §5.2, obsolète) : une ligne de continuation
+            // serait susceptible d'être réassemblée différemment par un proxy
+            // — refus net plutôt qu'acceptation ambiguë.
+            if header.starts_with(' ') || header.starts_with('\t') {
+                respond_error(
+                    &mut stream,
+                    "400 Bad Request",
+                    "ligne d'en-tête obsolète (obs-fold)",
+                    "",
+                )?;
+                return Ok(());
+            }
             header_count += 1;
             if header_count > MAX_HEADERS {
                 respond(
@@ -262,16 +320,60 @@ fn handle_connection(
                 let value = value.trim();
                 match name.as_str() {
                     "content-length" => {
-                        if content_length.is_some() {
-                            duplicate_length = true; // CL-CL : jamais interprété
+                        if saw_content_length {
+                            duplicate_length = true;
                         } else {
-                            content_length = value.parse().ok();
+                            saw_content_length = true;
+                            if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                                content_length = value.parse().ok();
+                                if content_length.is_none() {
+                                    // Que des chiffres mais dépasse usize :
+                                    // malformé lui aussi.
+                                    malformed_length = true;
+                                }
+                            } else {
+                                malformed_length = true;
+                            }
                         }
                     }
                     "transfer-encoding" => transfer_encoding = true, // TE : refusé
-                    "origin" => origin = Some(value.to_string()),
-                    "accept" => accept = value.to_ascii_lowercase(),
-                    "connection" if value.eq_ignore_ascii_case("close") => close = true,
+                    "origin" => {
+                        if origin.is_some() {
+                            origin_duplicate = true;
+                        } else {
+                            origin = Some(value.to_string());
+                        }
+                    }
+                    "host" => {
+                        if host.is_some() {
+                            host_duplicate = true;
+                        } else {
+                            host = Some(value.to_string());
+                        }
+                    }
+                    "accept" => {
+                        let v = value.to_ascii_lowercase();
+                        if accept.is_empty() {
+                            accept = v;
+                        } else {
+                            accept.push_str(", ");
+                            accept.push_str(&v);
+                        }
+                    }
+                    "connection" => {
+                        let lower = value.to_ascii_lowercase();
+                        let tokens: Vec<&str> = lower.split(',').map(str::trim).collect();
+                        if tokens.contains(&"close") {
+                            close = true;
+                        }
+                        if http10 {
+                            if tokens.contains(&"keep-alive") && !tokens.contains(&"close") {
+                                close = false;
+                            } else if !tokens.contains(&"keep-alive") {
+                                close = true;
+                            }
+                        }
+                    }
                     "expect" if value.to_ascii_lowercase().contains("100-continue") => {
                         expect_continue = true;
                     }
@@ -280,12 +382,37 @@ fn handle_connection(
             }
         }
 
+        // En-tete `Origin` duplique : requete ambigue (contournement possible
+        // de la garde DNS-rebinding) - refus 400.
+        if origin_duplicate {
+            respond_error(
+                &mut stream,
+                "400 Bad Request",
+                "en-tete Origin duplique",
+                "",
+            )?;
+            return Ok(());
+        }
+
         // Garde DNS-rebinding : un navigateur qui parle au serveur envoie un
         // `Origin` ; par défaut on refuse, sauf origines explicitement permises.
         if let Some(origin) = &origin {
             let allowed = allow_origins.iter().any(|o| o.eq_ignore_ascii_case(origin));
             if !allowed {
                 respond_error(&mut stream, "403 Forbidden", "origin refusée", "")?;
+                return Ok(());
+            }
+        }
+
+        // RFC 9112 §3.2 : `Host` obligatoire — et unique — en HTTP/1.1.
+        // HTTP/1.0 en est dispensé (le champ y est facultatif).
+        if !http10 {
+            if host.is_none() {
+                respond_error(&mut stream, "400 Bad Request", "en-tête Host requis", "")?;
+                return Ok(());
+            }
+            if host_duplicate {
+                respond_error(&mut stream, "400 Bad Request", "en-tête Host dupliqué", "")?;
                 return Ok(());
             }
         }
@@ -319,6 +446,17 @@ fn handle_connection(
 
         let len = match content_length {
             Some(len) => len,
+            None if malformed_length => {
+                // RFC 9112 §6.3 : un Content-Length présent mais invalide
+                // (non numérique ou hors usize) rend la requête invalide.
+                respond_error(
+                    &mut stream,
+                    "400 Bad Request",
+                    "Content-Length invalide",
+                    "",
+                )?;
+                return Ok(());
+            }
             None => {
                 respond_error(
                     &mut stream,
@@ -350,7 +488,14 @@ fn handle_connection(
 
         let mut body = vec![0u8; len];
         if read_exact_deadline(&mut reader, &mut body, deadline).is_err() {
-            // Corps incomplet à mi-chemin : connexion non réutilisable.
+            // Corps incomplet a mi-chemin : on tente une reponse 400 puis on
+            // ferme - aucun octet residuel ne doit etre reinterprete.
+            let _ = respond_error(
+                &mut stream,
+                "400 Bad Request",
+                "corps tronque ou trop lent",
+                "",
+            );
             return Ok(());
         }
 
@@ -373,20 +518,13 @@ fn handle_connection(
                 }
                 continue;
             }
-            Err(panicked) => {
+            Err(_) => {
                 // Panique du handler (code utilisateur) : réponse propre,
                 // connexion fermée par prudence.
-                let message = if let Some(text) = panicked.downcast_ref::<&str>() {
-                    (*text).to_string()
-                } else if let Some(text) = panicked.downcast_ref::<String>() {
-                    text.clone()
-                } else {
-                    "panique de l'outil".to_string()
-                };
                 let payload = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": null,
-                    "error": { "code": -32603, "message": format!("erreur interne : {message}") }
+                    "error": { "code": -32603, "message": "erreur interne" }
                 });
                 respond(
                     &mut stream,
@@ -433,11 +571,12 @@ fn handle_connection(
     Ok(())
 }
 
-/// Réponse d'erreur pré-corps : si un `Content-Length` valide et dans la
-/// limite a déjà été lu, le corps est **drainé** (borné par `MAX_BODY`) pour
-/// préserver le keep-alive ; sinon la connexion est **fermée** — dans les
-/// deux cas, aucun octet résiduel ne peut être réinterprété comme une
-/// requête suivante.
+/// Réponse d'erreur : la connexion est **toujours fermée** — `Connection:
+/// close` explicite + `shutdown(Write)`, jamais réutilisée. On ne draine pas
+/// le corps restant : le drain nourrirait un client qui inonde (le 413 ferme
+/// net), au prix possible d'un RST côté client avant lecture de la réponse —
+/// dans les deux cas, aucun octet résiduel ne peut être réinterprété comme
+/// une requête suivante.
 fn respond_error(
     stream: &mut TcpStream,
     status: &str,

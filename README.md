@@ -6,7 +6,7 @@
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.2.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.3.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
 ![crates.io](https://img.shields.io/crates/v/litemcp.svg) ![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI) ![Docs](https://img.shields.io/docsrs/litemcp)
 
@@ -47,7 +47,7 @@ Les principes :
 
 ```toml
 [dependencies]
-litemcp = "0.2"
+litemcp = "0.3"
 ```
 
 Ou directement depuis GitHub :
@@ -146,7 +146,7 @@ Métadonnées de la spec 2026-07-28, publiées dans `tools/list` : `.title()`, `
 - **Erreur d'outil** (le handler a tourné et a échoué) → `CallToolResult::isError` — le client affiche le message ;
 - **Erreur de protocole** (mauvaise requête, outil inconnu, JSON invalide) → erreur JSON-RPC typée (-32700, -32602, -32601…), rendue de façon opaque.
 
-La valeur de retour d'un outil devient `structuredContent` ; une `Err(msg)` devient `isError: true` avec le message en contenu texte.
+La valeur de retour d'un outil devient `structuredContent` — les objets JSON passent tels quels, toute autre valeur (scalaire, tableau, `null`) est enveloppée dans `{"result": …}` pour rester conforme à la spec ; une `Err(msg)` devient `isError: true` avec le message en contenu texte.
 
 ## Configuration
 
@@ -155,6 +155,7 @@ La valeur de retour d'un outil devient `structuredContent` ; une `Err(msg)` devi
 | `.route(path)` | `/mcp` | chemin unique du serveur |
 | `.allow_origins(&[..])` | vide | origines `Origin` autorisées (clients navigateur) — toute requête avec `Origin` non listée est refusée (garde DNS-rebinding) ; les clients CLI n'en envoient pas |
 | `.read_timeout(duration)` | 30 s | timeout de lecture par opération (anti-slowloris) — un client trop lent est déconnecté sans réponse |
+| `.max_connections(n)` | 256 (par serveur) | plafond de connexions simultanées — au-delà, `503` immédiat, pas de spawn |
 | Corps de requête | 1 Mio | au-delà → `413` |
 | En-têtes | 64 max, lignes 16 Kio max | au-delà → `431` |
 
@@ -166,7 +167,9 @@ La valeur de retour d'un outil devient `structuredContent` ; une `Err(msg)` devi
 | `POST` avec `Accept: text/event-stream` seul | `200 text/event-stream` — un événement `data:` (SSE request-scoped) |
 | Notification (sans `id`) | `202 Accepted` sans corps |
 | `GET` | `405 Method Not Allowed` (pas de listener SSE permanent en stateless) |
-| Route inconnue | `404` · `Content-Length` absent : `411` · corps > 1 Mio : `413` |
+| Version HTTP ≠ 1.0/1.1 · ligne de requête malformée | `505` · `400` |
+| HTTP/1.1 sans `Host` (ou `Host` dupliqué) · ligne obs-fold | `400` |
+| Route inconnue | `404` · `Content-Length` absent : `411` · malformé : `400` · corps > 1 Mio : `413` |
 | En-tête `Origin` non autorisé | `403` (garde DNS-rebinding ; CLI sans `Origin` : libre) |
 
 ## Benchmarks
@@ -196,7 +199,7 @@ La valeur de retour d'un outil devient `structuredContent` ; une `Err(msg)` devi
 ## Tests
 
 ```bash
-cargo test                          # 32 tests : unitaires + intégration (vraies sockets)
+cargo test                          # 67 tests : unitaires + intégration (vraies sockets) + doctests
 cargo clippy -- -D warnings         # CI stricte
 ```
 
@@ -211,8 +214,8 @@ L'historique complet et détaillé vit dans [CHANGELOG.md](CHANGELOG.md) — sec
 | 0 | Fondations (repo, Cargo, CI, licences) | ✅ |
 | 1 | Noyau JSON-RPC + dispatch MCP | ✅ |
 | 2 | Transport HTTP stateless (bind, POST/SSE) | ✅ |
-| 3 | Durcissement HTTP (timeouts, limites, 100-continue, keep-alive) | ✅ (fuzz corpus + Inspector réel → 0.3) |
-| 4 | Schémas Zod + outils typés + annotations | ✅ (macros → 0.3) |
+| 3 | Durcissement HTTP (timeouts, limites, 100-continue, keep-alive) | ✅ (+ audit complet : Host/505/obs-fold/CL malformé, plafond d'issues ; fuzz + Inspector → 0.4) |
+| 4 | Schémas Zod + outils typés + annotations | ✅ (macros → 0.4) |
 | 5 | Publication crates.io | ✅ |
 | 6 | Conformance officielle + benchmarks → 1.0 | ⏳ |
 

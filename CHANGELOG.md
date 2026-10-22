@@ -12,7 +12,16 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
-### Ajouts en cours (non publiés)
+### Prévu (cible 0.4)
+
+- Macros `#[tool]` / `#[resource]` / `#[prompt]` dérivant le schéma du type Rust (workspace split `litemcp-macros`) — finira de supprimer la double déclaration schéma/struct.
+- Fuzz du parseur HTTP (proptest/corpus) et tests clients réels (MCP Inspector, Claude, Cursor).
+- Ressources et prompts dans le noyau (aujourd'hui : `tools` seulement).
+- Mesures SLO Linux (`VmRSS`, démarrage in-process) et publication des conditions figées.
+
+## [0.3.0] - 2026-10-22
+
+### Added
 
 - **Durcissement HTTP (Phase 3)** :
   - timeout de lecture par opération anti-slowloris (`READ_TIMEOUT` 30 s, configurable `.read_timeout(durée)`) — un client trop lent est déconnecté sans réponse ;
@@ -22,14 +31,36 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
   - keep-alive multi-requêtes testé (pipelining 2 requêtes sur une connexion).
 - **Backend HTTP alternatif testé puis retiré** (bench A/B du 2026-10-22, `examples/bench_backends`) : tiny_http (vérifié 100 % Rust) s'est avéré ~1,85× plus lent en keep-alive (0,19 vs 0,10 ms/req), +360 Ko de binaire et +4 deps — il a été **supprimé du dépôt** : la route maison est le seul backend, le crate garde exactement **2 dépendances** (`serde`, `serde_json`).
 - **Première campagne de benchmarks** : binaire hello 462 Ko (cible < 1,5 Mo ✅), keep-alive 0,10 ms (cible < 1 ms ✅), RSS 4,7 Mo (WorkingSet Windows, mesure `VmRSS` Linux à venir), démarrage ~130 ms via shell Windows (mesure in-process à venir).
-- 37 tests au total (11 `zod`, 21 HTTP dont 5 durcissement, 4 JSON-RPC, 1 smoke).
+- 67 tests au total (19 unitaires JSON-RPC/zod/protocol, 39 HTTP sur vraies sockets, 5 smoke, 4 doctests).
 
-### Prévu (cible 0.3)
+### Audit complet du 2026-10-22 — durcissement & conformité
 
-- Macros `#[tool]` / `#[resource]` / `#[prompt]` dérivant le schéma du type Rust (workspace split `litemcp-macros`) — finira de supprimer la double déclaration schéma/struct.
-- Fuzz du parseur HTTP (proptest/corpus) et tests clients réels (MCP Inspector, Claude, Cursor).
-- Ressources et prompts dans le noyau (aujourd'hui : `tools` seulement).
-- Mesures SLO Linux (`VmRSS`, démarrage in-process) et publication des conditions figées.
+**Sécurité / robustesse :**
+
+- **Plafond d'issues de validation** — nouveau collecteur borné `zod::Issues` (`MAX_ISSUES` = 64) : au-delà du plafond, les problèmes sont comptés sans être stockés. Avant : un corps de 1 Mio d'éléments invalides produisait ~15 Mo d'issues (~15× le corps, ~4 Go potentiels sur 256 connexions). L'amplification mémoire est éliminée.
+- **Lignes obs-fold rejetées `400`** (RFC 9112 §5.2) : une ligne d'en-tête commençant par une espace/tabulation serait susceptible d'être réassemblée différemment par un proxy — refus net plutôt qu'acceptation ambiguë.
+- **`Content-Length` malformé → `400`** (RFC 9112 §6.3, non numérique ou hors usize) ; le `411` est désormais réservé à l'absence du champ.
+- **En-tête `Host`** : requis et unique en HTTP/1.1 → `400` sinon (RFC 9112 §3.2) ; HTTP/1.0 dispensé.
+- **Version HTTP validée** : ligne de requête malformée (version absente, jeton superflu) → `400` ; version ≠ HTTP/1.0/1.1 → `505`.
+- **Réponse `503` non bloquante** : les timeouts socket sont posés avant la branche « trop de connexions » — l'écriture ne peut plus bloquer l'accept loop sur un client qui ne lit pas.
+- **Compteur de connexions par serveur** : le plafond vit dans `BoundServer` (plus de static global partagé entre toutes les instances du processus).
+
+**Conformité MCP / JSON-RPC :**
+
+- **`structuredContent` toujours objet** (spec MCP) : une valeur de handler scalaire/tableau/`null` est enveloppée dans `{ "result": … }`, et le contenu texte reflète la valeur structurée réellement envoyée — `structuredContent: 42` ou `: null` violait la spec.
+- **`integer()` ne sature plus** : les valeurs f64 aux bornes ±2^63 sont rejetées au lieu de saturer en `i64::MIN`/`i64::MAX` au cast.
+- Refus des `id` JSON-RPC fractionnaires (1.5) documenté comme choix assumé (la spec les déconseille, MCP ne les emploie jamais).
+
+**Changements incompatibles (0.x) :**
+
+- `zod::Schema::validate` accumule dans `zod::Issues` (borné) au lieu d'un `Vec<String>` — les implémentations du trait doivent s'adapter (une ligne).
+- Réenregistrer un outil du même nom remplace l'ancien — documenté (comportement inchangé).
+
+**Docs :**
+
+- Doc-comment de `respond_error` aligné sur le code (fermeture systématique, jamais de drain) + compromis RST documenté.
+- Note `panic = "abort"` : neutralise `catch_unwind`, une panique de handler arrête le processus.
+- README : compte de tests corrigé, lignes de protocole `505`/`Host`/obs-fold/CL malformé, `.max_connections` dans la configuration, enveloppe `structuredContent` documentée.
 
 ## [0.2.0] - 2026-10-22
 
@@ -92,6 +123,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - GitHub : dépôt [DeamonDev888/litemcp](https://github.com/DeamonDev888/litemcp), tag `v0.1.0`, release, CI verte (fmt / clippy / test / doc).
 - Token API crates.io stocké dans `~/.cargo/credentials.toml` (hors repo), garde `.cargo/` au `.gitignore`.
 
-[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/DeamonDev888/litemcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/DeamonDev888/litemcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/DeamonDev888/litemcp/releases/tag/v0.1.0

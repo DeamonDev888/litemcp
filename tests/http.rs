@@ -543,8 +543,9 @@ fn error_path_closes_connection_no_desync_possible() {
 }
 
 #[test]
-fn error_path_with_unknown_body_length_closes_connection() {
-    // CL invalide sur 411 : connexion fermée (Connection: close), jamais de désync
+fn malformed_content_length_is_400() {
+    // RFC 9112 §6.3 : un CL présent mais invalide (non numérique ou hors
+    // usize) rend la requête invalide — le 411 est réservé à l'absence.
     let addr = spawn_hardened();
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
@@ -552,8 +553,110 @@ fn error_path_with_unknown_body_length_closes_connection() {
         .unwrap();
     let mut raw = String::new();
     stream.read_to_string(&mut raw).unwrap();
-    assert!(raw.contains("HTTP/1.1 411"), "{raw:?}");
+    assert!(raw.contains("HTTP/1.1 400"), "{raw:?}");
     assert!(raw.contains("Connection: close"), "{raw:?}");
+
+    // Dépassement usize : malformé lui aussi.
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .write_all(
+            b"POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Length: 99999999999999999999\r\n\r\n{}",
+        )
+        .unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    assert!(raw.contains("HTTP/1.1 400"), "{raw:?}");
+}
+
+#[test]
+fn missing_host_header_is_400() {
+    // RFC 9112 §3.2 : Host obligatoire en HTTP/1.1.
+    let addr = spawn_hardened();
+    let (status, _) = raw_request(
+        addr,
+        "POST /mcp HTTP/1.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn duplicate_host_header_is_400() {
+    let addr = spawn_hardened();
+    let (status, _) = raw_request(
+        addr,
+        "POST /mcp HTTP/1.1\r\nHost: a\r\nHost: b\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn http10_without_host_is_served() {
+    // HTTP/1.0 : le Host est facultatif — la requête est servie normalement.
+    let addr = spawn_hardened();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.0\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, resp_body) = raw_request(addr, &request);
+    assert_eq!(status, 200);
+    assert!(resp_body.contains("\"result\":{}"), "{resp_body:?}");
+}
+
+#[test]
+fn unsupported_version_is_505() {
+    let addr = spawn_hardened();
+    let (status, _) = raw_request(
+        addr,
+        "POST /mcp HTTP/2.0\r\nHost: t\r\nContent-Length: 2\r\n\r\n{}",
+    );
+    assert_eq!(status, 505);
+}
+
+#[test]
+fn malformed_request_line_is_400() {
+    let addr = spawn_hardened();
+    // Version absente (deux jetons seulement).
+    let (status, _) = raw_request(addr, "POST /mcp\r\nHost: t\r\nContent-Length: 2\r\n\r\n{}");
+    assert_eq!(status, 400);
+    // Jeton superflu (quatre jetons).
+    let (status, _) = raw_request(
+        addr,
+        "POST /mcp HTTP/1.1 extra\r\nHost: t\r\nContent-Length: 2\r\n\r\n{}",
+    );
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn obs_fold_header_line_is_400() {
+    // Ligne de continuation obsolète (commence par une espace) : refus net.
+    let addr = spawn_hardened();
+    let (status, _) = raw_request(
+        addr,
+        "POST /mcp HTTP/1.1\r\nHost: t\r\n X-Fold: y\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn over_capacity_connections_get_503() {
+    let bound = ServerBuilder::new("cap", "0.2.0")
+        .tool("ok", "Répond ok", |_args| Ok(serde_json::json!({})))
+        .read_timeout(std::time::Duration::from_millis(300))
+        .max_connections(1)
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+
+    let first = TcpStream::connect(addr).unwrap(); // occupe l'unique slot
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut second = TcpStream::connect(addr).unwrap();
+    let mut raw = String::new();
+    second.read_to_string(&mut raw).unwrap();
+    assert!(raw.contains("HTTP/1.1 503"), "{raw:?}");
+    assert!(raw.contains("trop de connexions"), "{raw:?}");
+    drop(first);
 }
 
 #[test]
@@ -648,4 +751,26 @@ fn batch_gets_32600_not_32700() {
         v["error"]["code"], -32600,
         "batch = Invalid Request, pas Parse Error"
     );
+}
+
+#[test]
+fn duplicate_origin_header_is_rejected_400() {
+    let addr = spawn_hardened();
+    let request = "POST /mcp HTTP/1.1\r\nHost: t\r\nOrigin: https://a.example\r\nOrigin: https://b.example\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+    let (status, _) = raw_request(addr, request);
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn truncated_body_gets_400() {
+    let addr = spawn_hardened();
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .write_all(
+            b"POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
+        )
+        .unwrap();
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+    assert!(raw.contains("HTTP/1.1 400"), "{raw:?}");
 }

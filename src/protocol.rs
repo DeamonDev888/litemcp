@@ -46,17 +46,20 @@ pub struct ToolAnnotations {
 
 impl ToolAnnotations {
     /// Annotations vides — tout est omis du JSON jusqu'à ce qu'il soit posé.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Titre lisible par l'humain.
+    #[must_use]
     pub fn title(mut self, title: &str) -> Self {
         self.title = Some(title.to_string());
         self
     }
 
     /// `readOnlyHint` — l'outil ne modifie pas son environnement.
+    #[must_use]
     pub fn read_only(mut self, hint: bool) -> Self {
         self.read_only_hint = Some(hint);
         self
@@ -64,18 +67,21 @@ impl ToolAnnotations {
 
     /// `destructiveHint` — l'outil peut modifier de façon destructive
     /// (sans effet si `readOnlyHint` est vrai).
+    #[must_use]
     pub fn destructive(mut self, hint: bool) -> Self {
         self.destructive_hint = Some(hint);
         self
     }
 
     /// `idempotentHint` — répéter l'appel ne change rien de plus.
+    #[must_use]
     pub fn idempotent(mut self, hint: bool) -> Self {
         self.idempotent_hint = Some(hint);
         self
     }
 
     /// `openWorldHint` — l'outil interagit avec le monde extérieur.
+    #[must_use]
     pub fn open_world(mut self, hint: bool) -> Self {
         self.open_world_hint = Some(hint);
         self
@@ -109,14 +115,25 @@ pub struct CallToolResult {
 impl From<Result<Value, String>> for CallToolResult {
     fn from(result: Result<Value, String>) -> Self {
         match result {
-            Ok(value) => Self {
-                content: vec![TextContent {
-                    kind: "text",
-                    text: value.to_string(),
-                }],
-                is_error: None,
-                structured_content: Some(value),
-            },
+            Ok(value) => {
+                // La spec MCP exige un objet dans `structuredContent` : toute
+                // valeur non-objet (scalaire, tableau, null) est enveloppée
+                // dans `{ "result": … }`, et le contenu texte reflète la
+                // valeur structurée réellement envoyée.
+                let structured = if value.is_object() {
+                    value
+                } else {
+                    serde_json::json!({ "result": value })
+                };
+                Self {
+                    content: vec![TextContent {
+                        kind: "text",
+                        text: structured.to_string(),
+                    }],
+                    is_error: None,
+                    structured_content: Some(structured),
+                }
+            }
             Err(message) => Self {
                 content: vec![TextContent {
                     kind: "text",
@@ -134,4 +151,33 @@ impl From<Result<Value, String>> for CallToolResult {
 pub struct ServerInfo {
     pub name: String,
     pub version: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn non_object_results_are_wrapped_into_an_object() {
+        // La spec MCP exige un objet dans structuredContent.
+        let result = CallToolResult::from(Ok::<Value, String>(json!(42)));
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(v["structuredContent"], json!({ "result": 42 }));
+        assert_eq!(v["content"][0]["text"], r#"{"result":42}"#);
+
+        let result = CallToolResult::from(Ok::<Value, String>(Value::Null));
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(v["structuredContent"], json!({ "result": null }));
+
+        let result = CallToolResult::from(Ok::<Value, String>(json!([1, 2])));
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(v["structuredContent"], json!({ "result": [1, 2] }));
+
+        // Un objet passe tel quel, sans enveloppe.
+        let result = CallToolResult::from(Ok::<Value, String>(json!({ "somme": 12 })));
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(v["structuredContent"], json!({ "somme": 12 }));
+        assert_eq!(v["content"][0]["text"], r#"{"somme":12}"#);
+    }
 }
