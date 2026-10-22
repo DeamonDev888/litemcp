@@ -484,3 +484,168 @@ fn keep_alive_serves_multiple_requests_on_one_connection() {
     assert!(raw.contains("\"id\":1"));
     assert!(raw.contains("\"id\":2"));
 }
+
+// --- Corrections issues de l'audit (revue indépendante) ---
+
+#[test]
+fn error_path_closes_connection_no_desync_possible() {
+    // 404 pré-corps : réponse + fermeture systématique — les octets du corps
+    // non lu ne peuvent JAMAIS être réinterprétés (connexion fermée).
+    let addr = spawn_hardened();
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .write_all(b"POST /autre HTTP/1.1\r\nHost: t\r\nContent-Length: 6\r\n\r\nbuffer")
+        .unwrap();
+
+    // Lire une réponse bornée par son Content-Length (garder la socket ouverte).
+    fn read_one_response(stream: &mut TcpStream) -> std::io::Result<String> {
+        let mut buf = [0u8; 4096];
+        let mut received = Vec::new();
+        let mut expected = 0usize;
+        loop {
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..n]);
+            if expected == 0 {
+                if let Ok(text) = std::str::from_utf8(&received) {
+                    if let Some(pos) = text.find("Content-Length: ") {
+                        let rest = &text[pos + "Content-Length: ".len()..];
+                        let digits: String =
+                            rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        let head_len = text.find("\r\n\r\n").map(|p| p + 4).unwrap_or(0);
+                        expected = head_len + digits.parse::<usize>().unwrap_or(0);
+                    }
+                }
+            }
+            if expected > 0 && received.len() >= expected {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&received).into_owned())
+    }
+
+    let raw = read_one_response(&mut stream).unwrap();
+    assert!(raw.contains("HTTP/1.1 404"), "{raw:?}");
+    assert!(
+        raw.contains("Connection: close"),
+        "erreur pré-corps = fermeture : {raw:?}"
+    );
+
+    // Le serveur ferme : la relecture retombe sur EOF (pas de réponse fantôme).
+    let mut leftover = Vec::new();
+    let n = stream.read_to_end(&mut leftover).unwrap_or(0);
+    assert!(
+        !String::from_utf8_lossy(&leftover).contains("jsonrpc"),
+        "aucune réponse fantôme après fermeture : {n} octets résiduels"
+    );
+}
+
+#[test]
+fn error_path_with_unknown_body_length_closes_connection() {
+    // CL invalide sur 411 : connexion fermée (Connection: close), jamais de désync
+    let addr = spawn_hardened();
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .write_all(b"POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Length: abc\r\n\r\n{}")
+        .unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    assert!(raw.contains("HTTP/1.1 411"), "{raw:?}");
+    assert!(raw.contains("Connection: close"), "{raw:?}");
+}
+
+#[test]
+fn transfer_encoding_is_rejected_400() {
+    let addr = spawn_hardened();
+    let (status, _) = raw_request(
+        addr,
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    );
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn duplicate_content_length_is_rejected_400() {
+    let addr = spawn_hardened();
+    let (status, _) = raw_request(
+        addr,
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n{}",
+    );
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn query_string_is_ignored_in_route_match() {
+    let addr = spawn_hardened();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    assert!(body.contains("\"result\":{}"));
+}
+
+#[test]
+fn oversized_body_gets_413_and_connection_closes() {
+    let addr = spawn_hardened();
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
+        (litemcp::http::MAX_BODY) + 1
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    assert!(raw.contains("HTTP/1.1 413"), "{raw:?}");
+    assert!(raw.contains("Connection: close"), "{raw:?}");
+}
+
+#[test]
+fn explicit_null_id_gets_a_response_with_null_id() {
+    let addr = spawn_hardened();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200, "id:null explicite = requête, pas notification");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["id"], Value::Null);
+    assert_eq!(v["result"], serde_json::json!({}));
+}
+
+#[test]
+fn wrong_jsonrpc_version_gets_32600() {
+    let addr = spawn_hardened();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], -32600);
+}
+
+#[test]
+fn batch_gets_32600_not_32700() {
+    let addr = spawn_hardened();
+    let (status, body) = post(
+        addr,
+        r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["error"]["code"], -32600,
+        "batch = Invalid Request, pas Parse Error"
+    );
+}

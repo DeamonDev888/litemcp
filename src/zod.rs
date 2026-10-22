@@ -138,7 +138,7 @@ impl Schema for Obj {
     }
 }
 
-/// `z.string()` — contraintes `.min(n)` / `.max(n)` (longueur en octets UTF-8).
+/// `z.string()` — contraintes `.min(n)` / `.max(n)` (longueur en caractères, conforme JSON Schema).
 #[derive(Clone, Default)]
 pub struct Str {
     min: Option<usize>,
@@ -179,13 +179,16 @@ impl Schema for Str {
     fn validate(&self, key: &str, value: &Value, issues: &mut Vec<String>) {
         match value.as_str() {
             Some(s) => {
+                // JSON Schema compte minLength/maxLength en CARACTÈRES
+                // (points de code), pas en octets — conforme au schéma publié.
+                let chars = s.chars().count();
                 if let Some(min) = self.min {
-                    if s.len() < min {
+                    if chars < min {
                         issues.push(format!("`{key}` : au moins {min} caractère(s)"));
                     }
                 }
                 if let Some(max) = self.max {
-                    if s.len() > max {
+                    if chars > max {
                         issues.push(format!("`{key}` : au plus {max} caractère(s)"));
                     }
                 }
@@ -234,7 +237,15 @@ impl Schema for Int {
     }
 
     fn validate(&self, key: &str, value: &Value, issues: &mut Vec<String>) {
-        match value.as_i64() {
+        // JSON Schema "type":"integer" accepte tout nombre mathématiquement
+        // entier (1e2, 3.0) — pas seulement les i64 syntaxiques.
+        let as_int = value.as_i64().or_else(|| {
+            value
+                .as_f64()
+                .filter(|n| n.fract() == 0.0 && n.abs() <= i64::MAX as f64)
+                .map(|n| n as i64)
+        });
+        match as_int {
             Some(n) => {
                 if let Some(min) = self.min {
                     if n < min {

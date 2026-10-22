@@ -1,6 +1,6 @@
 //! Noyau de dispatch JSON-RPC + builder — indépendant du transport.
 
-use crate::jsonrpc::{ErrorObject, Incoming, Outgoing};
+use crate::jsonrpc::{ErrorObject, Outgoing};
 use crate::protocol::{self, CallToolResult, ServerInfo, Tool, ToolAnnotations, ToolsListResult};
 use crate::zod::Schema;
 use serde::de::DeserializeOwned;
@@ -12,7 +12,29 @@ use std::time::Duration;
 /// Résultat d'un outil : `Ok(valeur)` ou `Err(message lisible par le client)`.
 pub type ToolResult = Result<Value, String>;
 
-type ToolFn = dyn Fn(&Value) -> ToolResult + Send + Sync;
+type ToolFn = dyn Fn(&Value) -> Result<Value, ToolFailure> + Send + Sync;
+
+/// Échec remonté par un wrapper de handler :
+/// - `Tool(String)` → échec d'exécution (`isError: true`, HTTP 200) ;
+/// - `Protocol(i64, String)` → erreur de protocole (ex. arguments qui ne
+///   désérialisent pas dans le struct typé → `-32602`).
+#[derive(Debug)]
+enum ToolFailure {
+    Tool(String),
+    Protocol(i64, String),
+}
+
+impl From<Result<Value, String>> for ToolFailure {
+    fn from(result: Result<Value, String>) -> Self {
+        match result {
+            Ok(value) => ToolFailure::Tool(
+                serde_json::to_string(&value)
+                    .unwrap_or_else(|_| "valeur non sérialisable".to_string()),
+            ),
+            Err(message) => ToolFailure::Tool(message),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct ToolDef {
@@ -35,14 +57,28 @@ impl ServerCore {
     ///
     /// Renvoie `None` pour une notification (aucune réponse attendue —
     /// le transport répondra `202 Accepted` sans corps).
+    ///
+    /// Conforme JSON-RPC : `id: null` explicite reçoit une réponse avec
+    /// `id: null` ; version `jsonrpc` invalide ou lot → `-32600` ; JSON
+    /// illisible → `-32700`.
     pub fn dispatch(&self, body: &[u8]) -> Option<Vec<u8>> {
-        let incoming: Incoming = match serde_json::from_slice(body) {
-            Ok(value) => value,
-            Err(_) => return Some(Outgoing::parse_error().to_vec()),
+        let incoming = match crate::jsonrpc::parse_incoming(body) {
+            Ok(incoming) => incoming,
+            Err(crate::jsonrpc::ParseFail::Syntax) => {
+                return Some(Outgoing::parse_error().to_vec());
+            }
+            Err(crate::jsonrpc::ParseFail::Invalid(message)) => {
+                return Some(
+                    Outgoing::invalid_request(None, format!("requête invalide : {message}"))
+                        .to_vec(),
+                );
+            }
         };
         if incoming.is_notification() {
             return None;
         }
+        // id réel, ou null explicite : les deux exigent une réponse ; l'id
+        // null explicite est rendu tel quel (Value::Null).
         let id = incoming
             .id
             .as_ref()
@@ -132,7 +168,13 @@ impl ServerCore {
                 );
             }
         }
-        let result = CallToolResult::from((tool.f)(&arguments));
+        let result = match (tool.f)(&arguments) {
+            Ok(value) => CallToolResult::from(Ok::<Value, String>(value)),
+            Err(ToolFailure::Tool(message)) => CallToolResult::from(Err::<Value, String>(message)),
+            Err(ToolFailure::Protocol(code, message)) => {
+                return Outgoing::failure(id.clone(), ErrorObject::new(code, message));
+            }
+        };
         Outgoing::success(
             id.clone(),
             serde_json::to_value(result).unwrap_or(Value::Null),
@@ -148,6 +190,7 @@ pub struct ServerBuilder {
     route: String,
     allow_origins: Vec<String>,
     read_timeout: Duration,
+    max_connections: usize,
     tools: BTreeMap<String, ToolDef>,
 }
 
@@ -160,6 +203,7 @@ impl ServerBuilder {
             route: "/mcp".to_string(),
             allow_origins: Vec::new(),
             read_timeout: crate::http::READ_TIMEOUT,
+            max_connections: crate::http::MAX_CONNECTIONS,
             tools: BTreeMap::new(),
         }
     }
@@ -170,6 +214,13 @@ impl ServerBuilder {
     /// sans réponse. Les tests passent une valeur courte.
     pub fn read_timeout(mut self, timeout: Duration) -> Self {
         self.read_timeout = timeout;
+        self
+    }
+
+    /// Plafond de connexions simultanées (au-delà → `503` immédiat).
+    /// Défaut : [`crate::http::MAX_CONNECTIONS`] (256).
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max;
         self
     }
 
@@ -196,13 +247,14 @@ impl ServerBuilder {
     where
         F: Fn(&Value) -> ToolResult + Send + Sync + 'static,
     {
+        let wrapped = move |args: &Value| f(args).map_err(ToolFailure::Tool);
         self.tools.insert(
             name.to_string(),
             ToolDef {
                 description: Some(description.to_string()),
                 schema: None,
                 annotations: None,
-                f: Arc::new(f),
+                f: Arc::new(wrapped),
             },
         );
         self
@@ -219,13 +271,14 @@ impl ServerBuilder {
         S: Schema + 'static,
         F: Fn(&Value) -> ToolResult + Send + Sync + 'static,
     {
+        let wrapped = move |args: &Value| f(args).map_err(ToolFailure::Tool);
         self.tools.insert(
             name.to_string(),
             ToolDef {
                 description: Some(description.to_string()),
                 schema: Some(Arc::new(schema)),
                 annotations: None,
-                f: Arc::new(f),
+                f: Arc::new(wrapped),
             },
         );
         self
@@ -266,8 +319,11 @@ impl ServerBuilder {
         let handler =
             Arc::new(
                 move |value: &Value| match serde_json::from_value::<T>(value.clone()) {
-                    Ok(parsed) => f(parsed),
-                    Err(error) => Err(format!("arguments invalides : {error}")),
+                    Ok(parsed) => f(parsed).map_err(ToolFailure::Tool),
+                    Err(error) => Err(ToolFailure::Protocol(
+                        ErrorObject::INVALID_PARAMS,
+                        format!("arguments invalides pour le type attendu : {error}"),
+                    )),
                 },
             );
         self.tools.insert(
@@ -315,6 +371,7 @@ impl ServerBuilder {
             route: self.route,
             allow_origins: self.allow_origins,
             read_timeout: self.read_timeout,
+            max_connections: self.max_connections,
         })
     }
 }
