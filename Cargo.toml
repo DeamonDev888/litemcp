@@ -7,7 +7,7 @@ description = "The fastest, lightest MCP (Model Context Protocol) framework for 
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DeamonDev888/litemcp"
 readme = "README.md"
-keywords = ["mcp", "model-context-protocol", "llm", "json-rpc", "http"]
+keywords = ["mcp", "mcp-server", "llm", "json-rpc", "http"]
 categories = ["api-bindings", "network-programming", "web-programming::http-server"]
 exclude = [".github", "docs"]
 
