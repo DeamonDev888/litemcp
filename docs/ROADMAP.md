@@ -30,7 +30,7 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 3. **HTTP/1.1 minimal maison** sur `std::net::TcpListener` : route unique, `Content-Length`, keep-alive, garde DNS-rebinding sur `Origin` (refus par défaut, liste blanche explicite), `MAX_BODY` = 1 Mio, erreurs HTTP propres (403/404/405/411/413).
 4. **Zéro runtime async** : threads `std`, un thread par connexion. Adaptateur tokio éventuel plus tard, en feature, jamais par défaut.
 5. **`#![forbid(unsafe_code)]`** ; deps core `serde` + `serde_json` uniquement ; pas de schemars.
-6. **API actuelle (0.1)** : `ServerBuilder` + closures d'outils. **0.2** : macros `#[tool]`/`#[resource]`/`#[prompt]` + schémas dérivés (workspace split `litemcp-macros`).
+6. **API actuelle (0.2)** : `ServerBuilder` + 3 registres d'outils — `tool` (closure brute), `tool_typed` (schéma Zod dérivé + validé), `tool_parse` (struct `Deserialize`) — et `.annotate()` / `ToolAnnotations`. **0.3** : macros `#[tool]`/`#[resource]`/`#[prompt]` + schéma dérivé du type Rust (workspace split `litemcp-macros`).
 7. **Licence** dual `MIT OR Apache-2.0` ; **MSRV 1.85** (edition 2024).
 8. **Versioning** 0.x jusqu'à conformance verte ; publication précoce **0.1.0** assumée comme socle pour réserver le nom crates.io ; 1.0 après conformance.
 
