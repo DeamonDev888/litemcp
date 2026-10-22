@@ -2,9 +2,10 @@
 
 > **Pivot du 2026-10-21 (décision opérateur)** : **HTTP-only. Streamable HTTP
 > est l'unique transport.**
-> litemcp = Streamable HTTP **stateless** (spec MCP 2026-07-28) sur un socket
-> bindé — zéro runtime async, zéro session, zéro handshake.
-> Nom `litemcp` vérifié libre sur crates.io le 2026-10-21 (404 API).
+> Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro
+> runtime async — spec MCP 2026-07-28, zéro session, zéro handshake.
+> **Publié le 2026-10-21** : [crates.io/crates/litemcp](https://crates.io/crates/litemcp)
+> · [github.com/DeamonDev888/litemcp](https://github.com/DeamonDev888/litemcp) (tag `v0.1.0`).
 
 ---
 
@@ -80,13 +81,14 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 
 **Jalon** : hello-tool en < 15 lignes ; binaire encore plus petit (mesuré).
 
-### Phase 5 — Publication crates.io 🚧
+### Phase 5 — Publication crates.io ✅ (2026-10-21)
 
 - [x] `cargo package --list` propre (src + Cargo.toml + README + licences)
-- [ ] `cargo publish` **0.1.0** — *token API reçu le 2026-10-21, stocké dans `~/.cargo/credentials.toml` (hors repo) ; garde-fou `.cargo/` ajouté au `.gitignore`*
-- [ ] docs.rs propre, badge crates.io, CHANGELOG
+- [x] `cargo publish` **0.1.0** — *token API stocké dans `~/.cargo/credentials.toml` (hors repo), garde-fou `.cargo/` au `.gitignore` ; keyword trop long corrigé (limite 20 caractères → `mcp-server`)*
+- [x] docs.rs, badges crates.io + CI + docsrs dans le README, CHANGELOG
+- [x] Repo GitHub créé + push, tag `v0.1.0` sur le SHA publié, release GitHub, CI verte
 
-**Jalon** : `crates.io/crates/litemcp` en ligne.
+**Jalon atteint** : [crates.io/crates/litemcp](https://crates.io/crates/litemcp) en ligne (`max_version: 0.1.0`).
 
 ### Phase 6 — Conformance + benchmarks → 1.0
 
@@ -118,3 +120,4 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 - **2026-10-21 v1** — Phase 0 : scaffold (Cargo prêt crates.io, licences, CI, README, roadmap), `git init` + commit `16ad4e4`. Nom `litemcp` vérifié libre.
 - **2026-10-21 v2** — README style framework (ViteMCP/FastMCP), commit `3bde75b`.
 - **2026-10-21 v3** — **PIVOT HTTP-only** (décision opérateur) : Phases 1 et 2 implémentées d'un coup (noyau JSON-RPC + HTTP stateless sur socket bindé, 14 tests d'intégration) ; `transport.rs` supprimé ; `0.1.0` prêt à publier ; token crates.io reçu et stocké hors repo.
+- **2026-10-21 v4** — **Publication 0.1.0** : fmt / clippy -D warnings / 18 tests / audit (0 vulnérabilité) verts ; package 17 fichiers, `.cargo_vcs_info.json` intègre ; `cargo publish` OK (`max_version: 0.1.0` confirmé par l'API) ; repo GitHub créé, tag `v0.1.0`, release, CI verte.

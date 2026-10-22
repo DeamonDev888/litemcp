@@ -6,19 +6,14 @@
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.1.0%20socle-orange) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.1.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
-<!-- Badge crates.io à activer après publication :
-![crates.io](https://img.shields.io/crates/v/litemcp.svg)
--->
-<!-- Badge CI à activer après le push GitHub :
-![CI](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml/badge.svg)
--->
+![crates.io](https://img.shields.io/crates/v/litemcp.svg) ![CI](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml/badge.svg) ![Docs](https://img.shields.io/docsrs/litemcp)
 
 </div>
 
 > [!IMPORTANT]
-> **0.1.0 — socle fonctionnel.** Le serveur HTTP stateless (bind + POST → JSON/SSE) fonctionne et est testé (14 tests sur vraies sockets). Les macros `#[tool]` et les schémas dérivés arrivent en 0.2 ; la conformance officielle MCP est visée pour 1.0.
+> **0.1.0 — publié sur [crates.io](https://crates.io/crates/litemcp).** Le serveur Streamable HTTP stateless (socket bindé + POST → JSON/SSE) fonctionne et est testé (18 tests sur vraies sockets). Les macros `#[tool]` et les schémas dérivés arrivent en 0.2 ; la conformance officielle MCP est visée pour 1.0.
 
 ## Sommaire
 
@@ -71,12 +66,11 @@ rmcp est excellent — litemcp ne cherche pas à le remplacer partout. litemcp o
 ## Installation
 
 ```toml
-# Phase 5 — publication crates.io en cours
 [dependencies]
 litemcp = "0.1"
 ```
 
-En attendant la publication, la dépendance se prend par git :
+Alternativement, directement depuis GitHub :
 
 ```toml
 [dependencies]
@@ -194,7 +188,7 @@ Maintenant : `0.1.0` est publié comme socle. La mention « 1.0 » attendra la c
 | 2 | Transport HTTP stateless (bind, POST/SSE) | ✅ |
 | 3 | Durcissement HTTP (fuzz, timeouts, Inspector réel) | ⏳ |
 | 4 | Macros `#[tool]` + schémas maison | ⏳ |
-| 5 | Publication crates.io 0.1.0 | 🚧 |
+| 5 | Publication crates.io 0.1.0 | ✅ |
 | 6 | Conformance officielle + benchmarks → 1.0 | ⏳ |
 
 Le détail — jalons, SLO, risques, journal : [docs/ROADMAP.md](docs/ROADMAP.md).
