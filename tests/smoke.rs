@@ -36,7 +36,7 @@ fn tool_parse_deserialize_failure_is_protocol_error_32602() {
 
 #[test]
 fn handler_panic_becomes_internal_error_not_connection_drop() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     // Le catch_unwind vit dans le transport HTTP : test via une vraie socket.
     let bound = litemcp::ServerBuilder::new("t", "0.2.0")
         .tool("boom", "Panique exprès", |_args| {
