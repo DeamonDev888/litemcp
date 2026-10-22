@@ -36,6 +36,15 @@ impl ErrorObject {
             data: None,
         }
     }
+
+    /// Erreur avec `data` structuré (ex. liste de problèmes de validation).
+    pub fn with_data(code: i64, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: Some(data),
+        }
+    }
 }
 
 /// Message JSON-RPC entrant (requête ou notification).

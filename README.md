@@ -6,14 +6,14 @@
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.1.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.2.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
 ![crates.io](https://img.shields.io/crates/v/litemcp.svg) ![CI](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml/badge.svg) ![Docs](https://img.shields.io/docsrs/litemcp)
 
 </div>
 
 > [!IMPORTANT]
-> **0.1.0 — publié sur [crates.io](https://crates.io/crates/litemcp).** Le serveur Streamable HTTP stateless (socket bindé + POST → JSON/SSE) fonctionne et est testé (18 tests sur vraies sockets). Les macros `#[tool]` et les schémas dérivés arrivent en 0.2 ; la conformance officielle MCP est visée pour 1.0.
+> **0.2.0 — publié sur [crates.io](https://crates.io/crates/litemcp).** Serveur Streamable HTTP stateless (socket bindé + POST → JSON/SSE) avec **schémas à la Zod** : `inputSchema` dérivé, arguments validés avant exécution, handlers typés (`tool_typed` / `tool_parse`), annotations MCP. 32 tests sur vraies sockets. Macros `#[tool]` visées en 0.3 ; conformance officielle MCP pour 1.0.
 
 ## Sommaire
 
@@ -67,7 +67,7 @@ rmcp est excellent — litemcp ne cherche pas à le remplacer partout. litemcp o
 
 ```toml
 [dependencies]
-litemcp = "0.1"
+litemcp = "0.2"
 ```
 
 Alternativement, directement depuis GitHub :
@@ -113,25 +113,60 @@ Ou avec MCP Inspector en mode URL : `npx @modelcontextprotocol/inspector` → `h
 
 ## Concepts
 
-### Outils
+### Outils — schéma à la Zod, comme fastmcp
 
-Un outil se déclare par une closure — nom, description, fonction :
+L'API type : on déclare un schéma, l'`inputSchema` de `tools/list` en est **dérivé**, chaque `tools/call` est **validé** avant exécution et le handler reçoit des arguments **typés**. Un appel hors schéma ne touche jamais votre code : il reçoit `-32602` avec la liste des problèmes dans `error.data.issues` — l'équivalent d'une `ZodError`.
 
 ```rust
-.tool("search", "Recherche un dossier (référence générique)", |args| {
-    let query = args["query"].as_str().ok_or("query manquant")?;
-    Ok(serde_json::json!({ "hits": search(query) }))
-})
+use litemcp::prelude::*;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct SearchArgs {
+    query: String,       // requis
+    limit: Option<u32>,  // optionnel
+}
+
+ServerBuilder::new("recherche", "1.0.0")
+    .tool_parse(
+        "search",
+        "Recherche indexée",
+        zod::object()
+            .field("query", zod::string().min(2).max(64))
+            .opt("limit", zod::integer().min(1).max(100))
+            .strict(), // refuse les champs inconnus
+        |args: SearchArgs| {
+            Ok(serde_json::json!({ "hits": search(&args.query, args.limit) }))
+        },
+    )
+    .annotate("search", ToolAnnotations::new().title("Recherche").read_only(true))
+    .bind("127.0.0.1:8080")?
+    .serve()?;
 ```
 
-La valeur de retour devient `structuredContent` ; une `Err(msg)` devient un `isError: true` avec le message en contenu texte — les deux niveaux d'erreur de la spec, sans confusion.
+Trois registres, du plus rapide au plus confortable :
 
-La macro `#[tool]` (0.2) remplacera la closure par une simple fonction annotée, schéma dérivé automatiquement.
+| API | Handler reçoit | `inputSchema` | Validation |
+|---|---|---|---|
+| `tool` | `&Value` brut | générique (`{"type":"object"}`) | à votre charge |
+| `tool_typed` | `&Value` (déjà validé) | dérivé du schéma | automatique |
+| `tool_parse` | struct `Deserialize` | dérivé du schéma | automatique |
+
+Schémas : `object().field(..)/.opt(..)/.strict()`, `string().min/.max`, `integer().min/.max`, `number().min/.max`, `boolean()`, `enumeration(&[..])`, `array(s).min/.max`. Les contraintes deviennent `minLength`/`maxLength`/`minimum`/`maximum`/`minItems`/`maxItems`/`enum` dans le JSON Schema publié à `tools/list`.
+
+### Annotations
+
+Métadonnées de la spec 2026-07-28, publiées dans `tools/list` : `.title()`, `.read_only()`, `.destructive()`, `.idempotent()`, `.open_world()`. Un client peut ainsi savoir qu'un outil ne modifie rien avant de l'appeler.
 
 ### Erreurs
 
-- **Erreur d'outil** (le tool a tourné et a échoué) → `CallToolResult::isError` — le client affiche le message ;
+- **Hors schéma** → `-32602` avant exécution ; `error.data.issues` liste chaque problème (champ manquant, type, borne, champ inconnu) ;
+- **Erreur d'outil** (le handler a tourné et a échoué) → `CallToolResult::isError` — le client affiche le message ;
 - **Erreur de protocole** (mauvaise requête, outil inconnu, JSON invalide) → erreur JSON-RPC typée (-32700, -32602, -32601…), rendue de façon opaque.
+
+La valeur de retour d'un outil devient `structuredContent` ; une `Err(msg)` devient `isError: true` avec le message en contenu texte.
+
+La macro `#[tool]` (0.3) remplacera la déclaration par une simple fonction annotée, schéma dérivé du type Rust.
 
 ## Protocole
 
@@ -158,7 +193,7 @@ La macro `#[tool]` (0.2) remplacera la closure par une simple fonction annotée,
 ## Tests
 
 ```bash
-cargo test                          # 18 tests : unitaires + intégration (vraies sockets)
+cargo test                          # 32 tests : unitaires + intégration (vraies sockets)
 cargo clippy -- -D warnings         # CI stricte
 ```
 
@@ -166,6 +201,9 @@ cargo clippy -- -D warnings         # CI stricte
 
 **Pourquoi un seul transport ?**
 Parce qu'un serveur lancé comme sous-processus d'un client meurt avec lui et n'accepte qu'un seul pair — c'est le modèle du client, pas du serveur. litemcp fait le choix inverse : **le serveur est un démon Streamable HTTP stateless**, bindé sur un socket TCP, que plusieurs agents peuvent joindre, qui survit aux clients et se déploie derrière nginx. Pour du MCP local en sous-processus, utilisez rmcp.
+
+**Zod ? En Rust ?**
+Le duo de fastmcp TypeScript — schéma déclaré, `inputSchema` dérivé, arguments validés avant `execute` — existe ici nativement : le module `zod` fait dérivation JSON Schema + validation runtime sans aucune dépendance de plus (schemars pèse plus lourd que le serveur lui-même). La macro `#[tool]` dérivera en plus le schéma du type Rust en 0.3.
 
 **Pourquoi pas de tokio ?**
 Un serveur MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des requêtes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions — et l'adaptateur tokio restera disponible pour les autres cas.
@@ -187,7 +225,7 @@ Maintenant : `0.1.0` est publié comme socle. La mention « 1.0 » attendra la c
 | 1 | Noyau JSON-RPC + dispatch MCP | ✅ |
 | 2 | Transport HTTP stateless (bind, POST/SSE) | ✅ |
 | 3 | Durcissement HTTP (fuzz, timeouts, Inspector réel) | ⏳ |
-| 4 | Macros `#[tool]` + schémas maison | ⏳ |
+| 4 | Schémas Zod + outils typés + annotations | ✅ (macros → 0.3) |
 | 5 | Publication crates.io 0.1.0 | ✅ |
 | 6 | Conformance officielle + benchmarks → 1.0 | ⏳ |
 

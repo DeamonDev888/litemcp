@@ -236,3 +236,136 @@ fn sse_when_client_accepts_only_event_stream() {
     let v: Value = serde_json::from_str(payload.trim()).unwrap();
     assert_eq!(v["result"]["structuredContent"]["somme"], 3);
 }
+
+// --- Outils typés : schéma dérivé + validation avant exécution ---
+
+fn spawn_typed_server() -> SocketAddr {
+    use litemcp::zod;
+
+    #[derive(serde::Deserialize)]
+    struct SearchArgs {
+        query: String,
+        limit: Option<u32>,
+    }
+
+    let bound = ServerBuilder::new("recherche", "0.2.0")
+        .tool_parse(
+            "search",
+            "Recherche indexée",
+            zod::object()
+                .field("query", zod::string().min(2).max(64))
+                .opt("limit", zod::integer().min(1).max(100))
+                .strict(),
+            |args: SearchArgs| {
+                let limit = args.limit.unwrap_or(10);
+                Ok(serde_json::json!({ "query": args.query, "limit": limit }))
+            },
+        )
+        .tool_typed("clock", "Heure courante", zod::object(), |_args| {
+            Ok(serde_json::json!({ "now": "2026-10-22T00:00:00Z" }))
+        })
+        .annotate(
+            "clock",
+            litemcp::protocol::ToolAnnotations::new()
+                .title("Horloge")
+                .read_only(true)
+                .idempotent(true),
+        )
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+    addr
+}
+
+#[test]
+fn typed_tool_derives_schema_and_annotations_in_tools_list() {
+    let addr = spawn_typed_server();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let tools = v["result"]["tools"].as_array().unwrap();
+
+    let search = tools.iter().find(|t| t["name"] == "search").unwrap();
+    let schema = &search["inputSchema"];
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["properties"]["query"]["type"], "string");
+    assert_eq!(schema["properties"]["query"]["minLength"], 2);
+    assert_eq!(schema["properties"]["query"]["maxLength"], 64);
+    assert_eq!(schema["properties"]["limit"]["type"], "integer");
+    assert_eq!(schema["properties"]["limit"]["maximum"], 100);
+    assert_eq!(schema["required"], serde_json::json!(["query"]));
+    assert_eq!(schema["additionalProperties"], false);
+
+    let clock = tools.iter().find(|t| t["name"] == "clock").unwrap();
+    assert_eq!(clock["annotations"]["title"], "Horloge");
+    assert_eq!(clock["annotations"]["readOnlyHint"], true);
+    assert_eq!(clock["annotations"]["idempotentHint"], true);
+    assert!(clock["annotations"].get("destructiveHint").is_none());
+}
+
+#[test]
+fn typed_tool_executes_valid_arguments() {
+    let addr = spawn_typed_server();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"query":"rust mcp","limit":5}}}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["result"]["structuredContent"]["query"], "rust mcp");
+    assert_eq!(v["result"]["structuredContent"]["limit"], 5);
+    assert!(v["result"].get("isError").is_none());
+}
+
+#[test]
+fn typed_tool_rejects_invalid_arguments_without_running_handler() {
+    let addr = spawn_typed_server();
+    // query trop court + champ inconnu (objet strict) : -32602 avec issues
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"query":"r","extra":1}}}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], -32602);
+    let issues = v["error"]["data"]["issues"].as_array().unwrap();
+    assert!(issues.iter().any(|i| i.as_str().unwrap().contains("query")));
+    assert!(issues.iter().any(|i| i.as_str().unwrap().contains("extra")));
+
+    // limite hors bornes : rejetée aussi
+    let (_, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search","arguments":{"query":"ok","limit":1000}}}"#,
+        "application/json",
+        None,
+    );
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], -32602);
+
+    // champ requis manquant : rejeté
+    let (_, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search","arguments":{}}}"#,
+        "application/json",
+        None,
+    );
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], -32602);
+    assert!(
+        v["error"]["data"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i.as_str().unwrap().contains("requis"))
+    );
+}

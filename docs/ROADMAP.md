@@ -72,14 +72,18 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 
 **Jalon** : aucune panique ni blocage possible depuis un client hostile (fuzz vert).
 
-### Phase 4 — Ergonomie (0.2)
+### Phase 4 — Ergonomie « Zod » ✅ (2026-10-22, macros → 0.3)
 
-- [ ] Workspace split : `crates/litemcp` + `crates/litemcp-macros`
-- [ ] `#[tool]`, `#[resource]`, `#[prompt]` — schéma dérivé des types (sans schemars)
+- [x] Module `zod` : schémas à la Zod (`object().field/.opt/.strict`, `string`, `integer`, `number`, `boolean`, `enumeration`, `array` + bornes) — dérivation JSON Schema (draft 2020-12) **et** validation runtime, zéro dépendance de plus
+- [x] `ServerBuilder::tool_typed` — schéma dérivé dans `tools/list`, arguments validés avant exécution (`-32602` + `error.data.issues`, l'équivalent `ZodError`)
+- [x] `ServerBuilder::tool_parse` — arguments désérialisés dans un struct `Deserialize` après validation
+- [x] Annotations MCP 2026-07-28 (`title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) via `.annotate()` / `ToolAnnotations`
+- [x] `ErrorObject::with_data` — erreurs JSON-RPC avec `data` structuré
+- [x] 11 tests unitaires zod + 3 tests E2E typés sur vraies sockets (32 au total) ; exemple `hello` triple registre (brut / schéma / typé)
+- [ ] Macros `#[tool]`/`#[resource]`/`#[prompt]` dérivant le schéma du type Rust → **0.3** (workspace split `litemcp-macros`)
 - [ ] Ressources/prompts dans le noyau (aujourd'hui : `tools` seulement)
-- [ ] Exemples enrichis
 
-**Jalon** : hello-tool en < 15 lignes ; binaire encore plus petit (mesuré).
+**Jalon atteint** : l'API outil égale fastmcp TS (schéma → `inputSchema` dérivé → validation → handler typé), en plus léger : toujours 2 deps, zéro async.
 
 ### Phase 5 — Publication crates.io ✅ (2026-10-21)
 
@@ -121,3 +125,4 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 - **2026-10-21 v2** — README style framework (ViteMCP/FastMCP), commit `3bde75b`.
 - **2026-10-21 v3** — **PIVOT HTTP-only** (décision opérateur) : Phases 1 et 2 implémentées d'un coup (noyau JSON-RPC + HTTP stateless sur socket bindé, 14 tests d'intégration) ; `transport.rs` supprimé ; `0.1.0` prêt à publier ; token crates.io reçu et stocké hors repo.
 - **2026-10-21 v4** — **Publication 0.1.0** : fmt / clippy -D warnings / 18 tests / audit (0 vulnérabilité) verts ; package 17 fichiers, `.cargo_vcs_info.json` intègre ; `cargo publish` OK (`max_version: 0.1.0` confirmé par l'API) ; repo GitHub créé, tag `v0.1.0`, release, CI verte.
+- **2026-10-22 v5** — **Phase 4 « Zod »** : module `zod` (dérivation JSON Schema + validation runtime, 0 dep de plus), `tool_typed`/`tool_parse` (handlers typés façon fastmcp TS), annotations MCP, `ErrorObject::with_data` ; 32 tests verts ; version 0.2.0. Macros `#[tool]` décalées en 0.3.

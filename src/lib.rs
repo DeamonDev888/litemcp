@@ -9,6 +9,9 @@
 //! sur un socket TCP bindé, la réponse arrive en JSON ou en flux SSE.
 //! Aucun autre transport n'est implémenté.
 //!
+//! Schémas à la Zod ([`crate::zod`]) : dérivation de l'`inputSchema` et
+//! validation des arguments avant exécution — l'API type de fastmcp.
+//!
 //! Spec cible : MCP 2026-07-28 — chaque message est un `POST /mcp`, la
 //! réponse arrive en `application/json` (ou en `text/event-stream` si le
 //! client ne demande que du SSE).
@@ -31,6 +34,7 @@ pub mod http;
 pub mod jsonrpc;
 pub mod protocol;
 pub mod server;
+pub mod zod;
 
 pub use server::{ServerBuilder, ServerCore};
 
@@ -40,6 +44,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Tout ce qu'il faut pour écrire un serveur en quelques lignes.
 pub mod prelude {
     pub use crate::VERSION;
-    pub use crate::protocol::PROTOCOL_VERSION;
+    pub use crate::protocol::{PROTOCOL_VERSION, ToolAnnotations};
     pub use crate::server::{ServerBuilder, ToolResult};
+    pub use crate::zod;
 }

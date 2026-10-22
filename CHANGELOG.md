@@ -3,6 +3,18 @@
 Toutes les évolutions notables de ce projet sont documentées dans ce fichier.
 Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer.
 
+## [0.2.0] - 2026-10-22
+
+### Added
+
+- **Module `zod`** — schémas à la Zod : `object().field(..)/.opt(..)/.strict()`, `string().min/.max`, `integer().min/.max`, `number().min/.max`, `boolean()`, `enumeration(&[..])`, `array(s).min/.max`. Chaque schéma produit son fragment JSON Schema (draft 2020-12) **et** valide les arguments à l'exécution — zéro dépendance de plus.
+- **`ServerBuilder::tool_typed`** — `inputSchema` dérivé du schéma dans `tools/list` ; chaque `tools/call` est validé avant exécution, un appel hors schéma reçoit `-32602` avec la liste des problèmes dans `error.data.issues` (équivalent `ZodError`) et n'exécute jamais le handler.
+- **`ServerBuilder::tool_parse`** — comme `tool_typed` avec les arguments désérialisés dans un struct `Deserialize` : le handler reçoit des données typées.
+- **Annotations MCP 2026-07-28** — `ToolAnnotations` (`title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) publiées dans `tools/list` via `.annotate()`.
+- **`ErrorObject::with_data`** — erreurs JSON-RPC avec `data` structuré.
+- Exemple `hello` enrichi : les trois registres d'outils (brut / schéma / typé) + annotations.
+- 32 tests (11 unitaires `zod`, 3 tests E2E typés sur vraies sockets en plus des 18 existants).
+
 ## [0.1.0] - 2026-10-21
 
 ### Added

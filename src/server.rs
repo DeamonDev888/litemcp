@@ -1,7 +1,9 @@
 //! Noyau de dispatch JSON-RPC + builder — indépendant du transport.
 
 use crate::jsonrpc::{ErrorObject, Incoming, Outgoing};
-use crate::protocol::{self, CallToolResult, ServerInfo, Tool, ToolsListResult};
+use crate::protocol::{self, CallToolResult, ServerInfo, Tool, ToolAnnotations, ToolsListResult};
+use crate::zod::Schema;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,7 +16,8 @@ type ToolFn = dyn Fn(&Value) -> ToolResult + Send + Sync;
 #[derive(Clone)]
 struct ToolDef {
     description: Option<String>,
-    schema: Option<Value>,
+    schema: Option<Arc<dyn Schema>>,
+    annotations: Option<ToolAnnotations>,
     f: Arc<ToolFn>,
 }
 
@@ -81,9 +84,11 @@ impl ServerCore {
             .map(|(name, def)| Tool {
                 name: name.clone(),
                 description: def.description.clone(),
+                annotations: def.annotations.clone(),
                 input_schema: Some(
                     def.schema
-                        .clone()
+                        .as_ref()
+                        .map(|schema| schema.json())
                         .unwrap_or_else(|| json!({ "type": "object" })),
                 ),
             })
@@ -112,6 +117,20 @@ impl ServerCore {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        if let Some(schema) = &tool.schema {
+            let mut issues = Vec::new();
+            schema.validate("arguments", &arguments, &mut issues);
+            if !issues.is_empty() {
+                return Outgoing::failure(
+                    id.clone(),
+                    ErrorObject::with_data(
+                        ErrorObject::INVALID_PARAMS,
+                        format!("Arguments invalides : {}", issues.join(" ; ")),
+                        json!({ "issues": issues }),
+                    ),
+                );
+            }
+        }
         let result = CallToolResult::from((tool.f)(&arguments));
         Outgoing::success(
             id.clone(),
@@ -170,9 +189,94 @@ impl ServerBuilder {
             ToolDef {
                 description: Some(description.to_string()),
                 schema: None,
+                annotations: None,
                 f: Arc::new(f),
             },
         );
+        self
+    }
+
+    /// Enregistre un outil avec un **schéma à la Zod** (module [`crate::zod`]).
+    ///
+    /// Le schéma dérive l'`inputSchema` de `tools/list` **et** valide chaque
+    /// appel : un `tools/call` hors schéma reçoit `-32602` avec la liste des
+    /// problèmes dans `error.data.issues` et n'exécute jamais le handler.
+    /// La closure reçoit les arguments validés.
+    pub fn tool_typed<S, F>(mut self, name: &str, description: &str, schema: S, f: F) -> Self
+    where
+        S: Schema + 'static,
+        F: Fn(&Value) -> ToolResult + Send + Sync + 'static,
+    {
+        self.tools.insert(
+            name.to_string(),
+            ToolDef {
+                description: Some(description.to_string()),
+                schema: Some(Arc::new(schema)),
+                annotations: None,
+                f: Arc::new(f),
+            },
+        );
+        self
+    }
+
+    /// Comme [`ServerBuilder::tool_typed`], avec un handler **typé** :
+    /// les arguments validés par le schéma sont désérialisés dans `T`
+    /// (généralement un struct `#[derive(Deserialize)]`).
+    ///
+    /// ```no_run
+    /// use litemcp::prelude::*;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct AddArgs { a: i64, b: i64 }
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// ServerBuilder::new("calc", "1.0.0")
+    ///     .tool_parse(
+    ///         "add",
+    ///         "Additionne deux entiers",
+    ///         zod::object()
+    ///             .field("a", zod::integer())
+    ///             .field("b", zod::integer()),
+    ///         |args: AddArgs| Ok(serde_json::json!({ "somme": args.a + args.b })),
+    ///     )
+    ///     .bind("127.0.0.1:8080")?
+    ///     .serve()?;
+    /// # Ok::<(), std::io::Error>(())
+    /// # }
+    /// ```
+    pub fn tool_parse<S, T, F>(mut self, name: &str, description: &str, schema: S, f: F) -> Self
+    where
+        S: Schema + 'static,
+        T: DeserializeOwned,
+        F: Fn(T) -> ToolResult + Send + Sync + 'static,
+    {
+        let handler =
+            Arc::new(
+                move |value: &Value| match serde_json::from_value::<T>(value.clone()) {
+                    Ok(parsed) => f(parsed),
+                    Err(error) => Err(format!("arguments invalides : {error}")),
+                },
+            );
+        self.tools.insert(
+            name.to_string(),
+            ToolDef {
+                description: Some(description.to_string()),
+                schema: Some(Arc::new(schema)),
+                annotations: None,
+                f: handler,
+            },
+        );
+        self
+    }
+
+    /// Attache des annotations MCP (2026-07-28) à un outil déjà enregistré :
+    /// `title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`,
+    /// `openWorldHint`. Sans effet si l'outil n'existe pas.
+    pub fn annotate(mut self, tool: &str, annotations: ToolAnnotations) -> Self {
+        if let Some(def) = self.tools.get_mut(tool) {
+            def.annotations = Some(annotations);
+        }
         self
     }
 

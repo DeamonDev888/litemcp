@@ -22,6 +22,64 @@ pub struct Tool {
     pub description: Option<String>,
     #[serde(rename = "inputSchema", skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
+}
+
+/// Annotations d'un outil (spec MCP 2026-07-28) — métadonnées descriptives
+/// pour les clients : `title` lisible et indices de comportement.
+/// Champ absent = le client applique le défaut de la spec (ex. un outil sans
+/// `readOnlyHint` est considéré comme potentiellement modifiant).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ToolAnnotations {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(rename = "readOnlyHint", skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    #[serde(rename = "destructiveHint", skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    #[serde(rename = "idempotentHint", skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    #[serde(rename = "openWorldHint", skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
+}
+
+impl ToolAnnotations {
+    /// Annotations vides — tout est omis du JSON jusqu'à ce qu'il soit posé.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Titre lisible par l'humain.
+    pub fn title(mut self, title: &str) -> Self {
+        self.title = Some(title.to_string());
+        self
+    }
+
+    /// `readOnlyHint` — l'outil ne modifie pas son environnement.
+    pub fn read_only(mut self, hint: bool) -> Self {
+        self.read_only_hint = Some(hint);
+        self
+    }
+
+    /// `destructiveHint` — l'outil peut modifier de façon destructive
+    /// (sans effet si `readOnlyHint` est vrai).
+    pub fn destructive(mut self, hint: bool) -> Self {
+        self.destructive_hint = Some(hint);
+        self
+    }
+
+    /// `idempotentHint` — répéter l'appel ne change rien de plus.
+    pub fn idempotent(mut self, hint: bool) -> Self {
+        self.idempotent_hint = Some(hint);
+        self
+    }
+
+    /// `openWorldHint` — l'outil interagit avec le monde extérieur.
+    pub fn open_world(mut self, hint: bool) -> Self {
+        self.open_world_hint = Some(hint);
+        self
+    }
 }
 
 /// Résultat de `tools/list`.
