@@ -10,7 +10,7 @@
 //! Aucun autre transport n'est implémenté.
 //!
 //! Schémas à la Zod ([`crate::zod`]) : dérivation de l'`inputSchema` et
-//! validation des arguments avant exécution — l'API type de fastmcp.
+//! validation des arguments avant exécution, handlers typés disponibles.
 //!
 //! Spec cible : MCP 2026-07-28 — chaque message est un `POST /mcp`, la
 //! réponse arrive en `application/json` (ou en `text/event-stream` si le
