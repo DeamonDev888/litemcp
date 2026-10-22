@@ -6,3 +6,6 @@ Cargo.lock
 *.swp
 .DS_Store
 Thumbs.db
+
+# Secrets / credentials crates.io — ne jamais committer
+.cargo/

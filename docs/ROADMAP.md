@@ -1,6 +1,7 @@
 # litemcp — Roadmap
 
-> **Pivot du 2026-10-21 (décision opérateur)** : **HTTP-only, sans stdio.**
+> **Pivot du 2026-10-21 (décision opérateur)** : **HTTP-only. Streamable HTTP
+> est l'unique transport.**
 > litemcp = Streamable HTTP **stateless** (spec MCP 2026-07-28) sur un socket
 > bindé — zéro runtime async, zéro session, zéro handshake.
 > Nom `litemcp` vérifié libre sur crates.io le 2026-10-21 (404 API).
@@ -14,7 +15,7 @@
 | Runtime | tokio + hyper + tower | asupersync (maison, nightly) | **aucun** (threads bloquants `std`) |
 | Toolchain | stable | nightly épinglé | **stable, MSRV 1.85** |
 | Deps core | tokio, hyper, schemars… | nombreuses | **serde + serde_json** |
-| Transports | stdio, HTTP, (WS custom) | stdio, HTTP, SSE, WS | **HTTP stateless uniquement** |
+| Transports | multi (HTTP, WS, sous-processus) | multi (HTTP, SSE, WS, sous-processus) | **Streamable HTTP uniquement (POST/SSE)** |
 | Session | oui (ou stateless) | oui | **aucune — chaque POST est auto-suffisant** |
 | `unsafe` | autorisé | interdit | **interdit** (`forbid`) |
 | Mémoire | non communiquée | non communiquée | **SLO mesurés à chaque release** |
@@ -24,7 +25,7 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 ## 2. Décisions techniques arrêtées
 
 1. **Spec cible : MCP 2026-07-28 stateless uniquement** — un `POST /mcp` par message, réponse `application/json` (ou `text/event-stream` request-scoped mono-événement si le client ne demande que du SSE), notification → `202` sans corps, `GET` → `405`. Pas de `initialize` obligatoire (toléré pour les inspecteurs), pas de `Mcp-Session-Id`.
-2. **Pas de stdio** (retiré du produit) : le serveur est un démon HTTP joignable par plusieurs clients, pas un sous-processus d'un seul.
+2. **Un seul transport** (décision opérateur) : le serveur est un démon Streamable HTTP joignable par plusieurs clients, pas un sous-processus d'un seul. Tout autre mode d'exécution est hors périmètre du produit.
 3. **HTTP/1.1 minimal maison** sur `std::net::TcpListener` : route unique, `Content-Length`, keep-alive, garde DNS-rebinding sur `Origin` (refus par défaut, liste blanche explicite), `MAX_BODY` = 1 Mio, erreurs HTTP propres (403/404/405/411/413).
 4. **Zéro runtime async** : threads `std`, un thread par connexion. Adaptateur tokio éventuel plus tard, en feature, jamais par défaut.
 5. **`#![forbid(unsafe_code)]`** ; deps core `serde` + `serde_json` uniquement ; pas de schemars.
@@ -82,7 +83,7 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 ### Phase 5 — Publication crates.io 🚧
 
 - [x] `cargo package --list` propre (src + Cargo.toml + README + licences)
-- [ ] `cargo publish` **0.1.0** — *en attente du token API crates.io de l'opérateur*
+- [ ] `cargo publish` **0.1.0** — *token API reçu le 2026-10-21, stocké dans `~/.cargo/credentials.toml` (hors repo) ; garde-fou `.cargo/` ajouté au `.gitignore`*
 - [ ] docs.rs propre, badge crates.io, CHANGELOG
 
 **Jalon** : `crates.io/crates/litemcp` en ligne.
@@ -116,4 +117,4 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 
 - **2026-10-21 v1** — Phase 0 : scaffold (Cargo prêt crates.io, licences, CI, README, roadmap), `git init` + commit `16ad4e4`. Nom `litemcp` vérifié libre.
 - **2026-10-21 v2** — README style framework (ViteMCP/FastMCP), commit `3bde75b`.
-- **2026-10-21 v3** — **PIVOT « sans stdio »** (décision opérateur) : Phases 1 et 2 implémentées d'un coup (noyau JSON-RPC + HTTP stateless sur socket bindé, 14 tests d'intégration) ; `transport.rs` supprimé ; `0.1.0` prêt à publier ; en attente du token crates.io.
+- **2026-10-21 v3** — **PIVOT HTTP-only** (décision opérateur) : Phases 1 et 2 implémentées d'un coup (noyau JSON-RPC + HTTP stateless sur socket bindé, 14 tests d'intégration) ; `transport.rs` supprimé ; `0.1.0` prêt à publier ; token crates.io reçu et stocké hors repo.

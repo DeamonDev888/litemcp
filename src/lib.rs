@@ -2,8 +2,12 @@
 //! # litemcp
 //!
 //! Le framework MCP (Model Context Protocol) le plus léger pour Rust :
-//! **stateless Streamable HTTP sur un socket bindé — zéro runtime async,
-//! pas de stdio, `serde` + `serde_json` seulement.**
+//! **Streamable HTTP stateless sur un socket bindé — zéro runtime async,
+//! `serde` + `serde_json` seulement.**
+//!
+//! Transport unique : Streamable HTTP — chaque message est un `POST /mcp`
+//! sur un socket TCP bindé, la réponse arrive en JSON ou en flux SSE.
+//! Aucun autre transport n'est implémenté.
 //!
 //! Spec cible : MCP 2026-07-28 — chaque message est un `POST /mcp`, la
 //! réponse arrive en `application/json` (ou en `text/event-stream` si le

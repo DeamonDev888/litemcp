@@ -4,7 +4,7 @@
 
 **Le framework MCP le plus rapide et le plus léger au monde — écrit en Rust.**
 
-Stateless · socket bindé · HTTP POST/SSE · **sans stdio** · zéro runtime async
+Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
 ![Statut](https://img.shields.io/badge/statut-0.1.0%20socle-orange) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
@@ -46,11 +46,11 @@ litemcp prend le problème par l'autre bout : **un serveur MCP qui ne coûte pre
 - un binaire embarqué (edge, IoT) où une pile HTTP complète, c'est non ;
 - un agent qui spawn cinquante serveurs et paie le coût à chaque fois.
 
-**litemcp traite le protocole comme une bibliothèque, pas comme un service.** Le cœur est une pompe JSON-RPC sur des threads bloquants du `std` — pas de tokio, pas de hyper, pas de schemars, pas de stdio.
+**litemcp traite le protocole comme une bibliothèque, pas comme un service.** Le cœur est une pompe JSON-RPC sur des threads bloquants du `std` — pas de tokio, pas de hyper, pas de schemars : rien que `serde`.
 
 Les principes :
 
-1. **HTTP stateless uniquement.** Chaque message est un `POST /mcp` auto-suffisant : pas de session, pas d'`initialize` obligatoire, pas de flux permanent. C'est la spec 2026-07-28, à la lettre.
+1. **Streamable HTTP uniquement.** Un seul transport : un socket TCP bindé ; chaque message est un `POST /mcp` auto-suffisant, la réponse arrive en `application/json` ou en flux SSE (`text/event-stream`, request-scoped). Pas de session, pas d'`initialize` obligatoire, pas de flux permanent. C'est la spec 2026-07-28, à la lettre.
 2. **Zéro runtime async au cœur.** `std::net::TcpListener`, un thread par connexion. Un adaptateur tokio existera un jour — en feature optionnelle, jamais par défaut.
 3. **Deux dépendances, pas une de plus.** `serde` et `serde_json`. Le JSON Schema sera dérivé à la maison (0.2).
 4. **Mesuré ou rien.** Chaque release publie RSS, taille de binaire et latence p99 — avec rmcp mesuré à plat à côté. Jamais d'adjectif sans chiffre.
@@ -62,7 +62,7 @@ Les principes :
 | Un serveur MCP dans une CLI, une TUI, un test | **litemcp** |
 | Budget RAM serré (edge, IoT, embarqué) | **litemcp** |
 | Démarrage à froid < 10 ms, binaire minimal | **litemcp** |
-| Client MCP **local lancé en sous-processus** (stdio) | rmcp |
+| Client MCP **local lancé en sous-processus** | rmcp |
 | OAuth 2.1, tasks, elicitation, écosystème officiel | rmcp |
 | Serveur de production riche, multi-features | rmcp |
 
@@ -164,20 +164,20 @@ La macro `#[tool]` (0.2) remplacera la closure par une simple fonction annotée,
 ## Tests
 
 ```bash
-cargo test                          # 17 tests : unitaires + intégration (vraies sockets)
+cargo test                          # 18 tests : unitaires + intégration (vraies sockets)
 cargo clippy -- -D warnings         # CI stricte
 ```
 
 ## FAQ
 
-**Pourquoi pas de stdio ?**
-Parce qu'un serveur lancé comme sous-processus (stdio) meurt avec son client et n'accepte qu'un seul pair — c'est le modèle du client, pas du serveur. litemcp fait le choix inverse : **le serveur est un démon HTTP stateless** que plusieurs agents peuvent joindre, qui survit aux clients et se déploie derrière nginx. Si vous voulez du MCP local en sous-processus, utilisez rmcp.
+**Pourquoi un seul transport ?**
+Parce qu'un serveur lancé comme sous-processus d'un client meurt avec lui et n'accepte qu'un seul pair — c'est le modèle du client, pas du serveur. litemcp fait le choix inverse : **le serveur est un démon Streamable HTTP stateless**, bindé sur un socket TCP, que plusieurs agents peuvent joindre, qui survit aux clients et se déploie derrière nginx. Pour du MCP local en sous-processus, utilisez rmcp.
 
 **Pourquoi pas de tokio ?**
 Un serveur MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des requêtes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions — et l'adaptateur tokio restera disponible pour les autres cas.
 
 **Pourquoi ne pas contribuer à rmcp ?**
-rmcp est le SDK officiel : il doit couvrir toute la spec pour tout le monde, sur tokio, avec stdio. Cette contrainte impose son poids. litemcp explore la question inverse : que reste-t-il quand on retire tout ce qui n'est pas strictement nécessaire à un serveur HTTP stateless ?
+rmcp est le SDK officiel : il doit couvrir toute la spec pour tout le monde, sur tokio, tous transports confondus. Cette contrainte impose son poids. litemcp explore la question inverse : que reste-t-il quand on retire tout ce qui n'est pas strictement nécessaire à un serveur HTTP stateless ?
 
 **Pourquoi réécrire HTTP ?**
 Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE mono-événement. Pas de chunked entrant, pas de TLS, pas de compression. Si le périmètre s'avère piégeux, le repli documenté est `tiny_http` — la décision sera tranchée par les tests, pas par le dogme.
