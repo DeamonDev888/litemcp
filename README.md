@@ -154,7 +154,9 @@ La valeur de retour d'un outil devient `structuredContent` ; une `Err(msg)` devi
 |---|---|---|
 | `.route(path)` | `/mcp` | chemin unique du serveur |
 | `.allow_origins(&[..])` | vide | origines `Origin` autorisées (clients navigateur) — toute requête avec `Origin` non listée est refusée (garde DNS-rebinding) ; les clients CLI n'en envoient pas |
+| `.read_timeout(duration)` | 30 s | timeout de lecture par opération (anti-slowloris) — un client trop lent est déconnecté sans réponse |
 | Corps de requête | 1 Mio | au-delà → `413` |
+| En-têtes | 64 max, lignes 16 Kio max | au-delà → `431` |
 
 ## Protocole
 
@@ -169,14 +171,27 @@ La valeur de retour d'un outil devient `structuredContent` ; une `Err(msg)` devi
 
 ## Benchmarks
 
-> Règle du projet : **jamais d'adjectif sans chiffre.** Les cibles ci-dessous sont des hypothèses de départ ; la première campagne les ajuste une fois, puis elles sont figées comme SLO et republiées à chaque release.
+> Règle du projet : **jamais d'adjectif sans chiffre.** Première campagne mesurée (Windows 11, release, loopback) — les conditions seront figées et republiées à chaque release.
 
-| Métrique | Cible initiale | Mesuré |
+**Route maison vs backend alternatif `tiny_http`** (bench A/B exécuté le 2026-10-22, `examples/bench_backends`) :
+
+| Métrique | Route maison | tiny_http | Verdict |
+|---|---|---|---|
+| `tools/call` keep-alive | **0,10–0,11 ms/req** | 0,19–0,20 ms/req | maison ~1,85× plus rapide |
+| Connexions neuves | 1 750–2 000 conn/s | 2 080–2 180 conn/s | tiny +10–25 % |
+| Coût binaire | — | +360 Ko (+80 %) | maison plus légère |
+| Dépendances ajoutées | 0 | +4 (ascii, chunked_transfer, httpdate, log) | maison plus légère |
+
+**Décision tranchée par les chiffres** : la route maison reste le seul backend — plus rapide en régime keep-alive (le cas d'un agent qui parle à ses serveurs), plus légère en deps et en binaire. Le backend alternatif a été **retiré du dépôt** : le crate garde exactement deux dépendances (`serde`, `serde_json`).
+
+**SLO (conditions : Windows 11, release, loopback — mesures Linux/`VmRSS` à la prochaine campagne) :**
+
+| Métrique | Cible | Mesuré |
 |---|---|---|
-| RSS serveur hello-tool (HTTP, au repos) | < 2 Mo | — (à venir) |
-| Binaire release stripped | < 1,5 Mo | — (à venir) |
-| `tools/call` p99 local | < 1 ms | — (à venir) |
-| Démarrage à froid | < 10 ms | — (à venir) |
+| Binaire release stripped (hello) | < 1,5 Mo | **462 Ko** ✅ |
+| `tools/call` keep-alive (moyenne) | < 1 ms | **0,10 ms** ✅ |
+| RSS serveur hello (au repos) | < 2 Mo | 4,7 Mo (WorkingSet Windows, DLL partagées incluses — mesure `VmRSS` Linux à venir) |
+| Démarrage à froid | < 10 ms | ~130 ms via shell Windows (overhead de spawn inclus ; mesure in-process à venir) |
 
 ## Tests
 
@@ -196,7 +211,7 @@ L'historique complet et détaillé vit dans [CHANGELOG.md](CHANGELOG.md) — sec
 | 0 | Fondations (repo, Cargo, CI, licences) | ✅ |
 | 1 | Noyau JSON-RPC + dispatch MCP | ✅ |
 | 2 | Transport HTTP stateless (bind, POST/SSE) | ✅ |
-| 3 | Durcissement HTTP (fuzz, timeouts, Inspector réel) | ⏳ |
+| 3 | Durcissement HTTP (timeouts, limites, 100-continue, keep-alive) | ✅ (fuzz corpus + Inspector réel → 0.3) |
 | 4 | Schémas Zod + outils typés + annotations | ✅ (macros → 0.3) |
 | 5 | Publication crates.io | ✅ |
 | 6 | Conformance officielle + benchmarks → 1.0 | ⏳ |
@@ -215,7 +230,7 @@ Un serveur MCP sans schéma n'est qu'un routeur JSON : les clients ont besoin de
 Un serveur MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des requêtes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions — et l'adaptateur tokio restera disponible pour les autres cas.
 
 **Pourquoi réécrire HTTP ?**
-Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE mono-événement. Pas de chunked entrant, pas de TLS, pas de compression. Si le périmètre s'avère piégeux, le repli est documenté — la décision sera tranchée par les tests, pas par le dogme.
+Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE mono-événement. Pas de chunked entrant, pas de TLS, pas de compression. Ce choix est **tranché par les tests** : le bench maison contre le backend alternatif testé (tiny_http) montre la route maison ~1,85× plus rapide en keep-alive et 0 dépendance de plus (voir [Benchmarks](#benchmarks)) — et elle embarque son durcissement (timeouts, limites d'en-têtes, `Expect: 100-continue`).
 
 **Comment sont choisies les versions ?**
 Pacement volontaire : toute modification atterrit d'abord dans la section `[Unreleased]` du [CHANGELOG](CHANGELOG.md) ; une version n'est coupée que pour un lot cohérent (fonction, correctif, doc majeure). Le `0.x` court jusqu'à la conformance officielle MCP verte ; la mention « 1.0 » attend ce jalon.

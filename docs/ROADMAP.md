@@ -27,7 +27,7 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 
 1. **Spec cible : MCP 2026-07-28 stateless uniquement** — un `POST /mcp` par message, réponse `application/json` (ou `text/event-stream` request-scoped mono-événement si le client ne demande que du SSE), notification → `202` sans corps, `GET` → `405`. Pas de `initialize` obligatoire (toléré pour les inspecteurs), pas de `Mcp-Session-Id`.
 2. **Un seul transport** (décision opérateur) : le serveur est un démon Streamable HTTP joignable par plusieurs clients, pas un sous-processus d'un seul. Tout autre mode d'exécution est hors périmètre du produit.
-3. **HTTP/1.1 minimal maison** sur `std::net::TcpListener` : route unique, `Content-Length`, keep-alive, garde DNS-rebinding sur `Origin` (refus par défaut, liste blanche explicite), `MAX_BODY` = 1 Mio, erreurs HTTP propres (403/404/405/411/413).
+3. **HTTP/1.1 minimal maison** sur `std::net::TcpListener` : route unique, `Content-Length`, keep-alive, garde DNS-rebinding sur `Origin` (refus par défaut, liste blanche explicite), `MAX_BODY` = 1 Mio, erreurs HTTP propres (403/404/405/411/413/431). **Décision du 2026-10-22 (bench A/B)** : la route maison est le **seul** backend — ~1,85× plus rapide en keep-alive (0,10 vs 0,19 ms/req), +360 Ko et +4 deps évités ; le repli `tiny_http` (testé 100 % Rust) a été **retiré du dépôt** après la mesure : minimalisme strict, 2 deps.
 4. **Zéro runtime async** : threads `std`, un thread par connexion. Adaptateur tokio éventuel plus tard, en feature, jamais par défaut.
 5. **`#![forbid(unsafe_code)]`** ; deps core `serde` + `serde_json` uniquement ; pas de schemars.
 6. **API actuelle (0.2)** : `ServerBuilder` + 3 registres d'outils — `tool` (closure brute), `tool_typed` (schéma Zod dérivé + validé), `tool_parse` (struct `Deserialize`) — et `.annotate()` / `ToolAnnotations`. **0.3** : macros `#[tool]`/`#[resource]`/`#[prompt]` + schéma dérivé du type Rust (workspace split `litemcp-macros`).
@@ -63,14 +63,18 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 
 **Jalon** : `cargo test` + `cargo run --example hello` fonctionnels.
 
-### Phase 3 — Durcissement HTTP
+### Phase 3 — Durcissement HTTP ✅ (2026-10-22, fuzz corpus → 0.3)
 
-- [ ] Fuzz du parseur (proptest/corpus), timeouts de lecture (slowloris), limite du nombre d'en-têtes
-- [ ] Tests réels : MCP Inspector (mode URL), Claude, Cursor
-- [ ] Keep-alive multi-requêtes testé; gestion `Expect: 100-continue`
-- [ ] Décision : garder HTTP maison ou basculer sur `tiny_http` selon les résultats du fuzz
+- [x] Timeout de lecture par opération (anti-slowloris) : `READ_TIMEOUT` 30 s, configurable `.read_timeout()` ; client trop lent → déconnecté sans réponse (testé)
+- [x] Timeout d'écriture (`WRITE_TIMEOUT` 10 s)
+- [x] Limite du nombre d'en-têtes (`MAX_HEADERS` 64 → `431`, testé) et de longueur de ligne (`MAX_LINE` 16 Kio → `431`, testé) — lecture bornée mémoire (`read_line_capped`)
+- [x] `Expect: 100-continue` : intermédiaire `100` envoyé avant la lecture du corps (testé)
+- [x] Keep-alive multi-requêtes sur une connexion (pipelining 2 requêtes, testé)
+- [x] Décision repli tranchée par le bench A/B (`examples/bench_backends`) : maison ~1,85× plus rapide keep-alive, tiny +360 Ko / +4 deps → **tiny retiré du dépôt** (minimalisme strict : 2 deps), la route maison est le seul backend ; l'implémentation tiny avait été vérifiée 100 % Rust (`default-features = false`) et testée (6 tests) avant le retrait
+- [x] Première campagne de benchmarks : binaire 462 Ko (< 1,5 Mo ✅), keep-alive 0,10 ms (< 1 ms ✅), RSS 4,7 Mo (WorkingSet Windows — `VmRSS` Linux à venir), démarrage ~130 ms via shell (in-process à venir)
+- [ ] Fuzz du parseur (proptest/corpus), MCP Inspector / Claude / Cursor réels → **0.3**
 
-**Jalon** : aucune panique ni blocage possible depuis un client hostile (fuzz vert).
+**Jalon atteint** : aucun blocage ni panique sur les vecteurs hostiles testés (slowloris, lignes/en-têtes géants, corps surdimensionné) ; la décision HTTP maison vs repli est chiffrée, plus un débat.
 
 ### Phase 4 — Ergonomie « Zod » ✅ (2026-10-22, macros → 0.3)
 
@@ -126,3 +130,4 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 - **2026-10-21 v3** — **PIVOT HTTP-only** (décision opérateur) : Phases 1 et 2 implémentées d'un coup (noyau JSON-RPC + HTTP stateless sur socket bindé, 14 tests d'intégration) ; `transport.rs` supprimé ; `0.1.0` prêt à publier ; token crates.io reçu et stocké hors repo.
 - **2026-10-21 v4** — **Publication 0.1.0** : fmt / clippy -D warnings / 18 tests / audit (0 vulnérabilité) verts ; package 17 fichiers, `.cargo_vcs_info.json` intègre ; `cargo publish` OK (`max_version: 0.1.0` confirmé par l'API) ; repo GitHub créé, tag `v0.1.0`, release, CI verte.
 - **2026-10-22 v5** — **Phase 4 « Zod »** : module `zod` (dérivation JSON Schema + validation runtime, 0 dep de plus), `tool_typed`/`tool_parse` (handlers typés façon fastmcp TS), annotations MCP, `ErrorObject::with_data` ; 32 tests verts ; version 0.2.0. Macros `#[tool]` décalées en 0.3.
+- **2026-10-22 v6** — **Phase 3 « Durcissement »** : timeouts lecture/écriture (anti-slowloris, `.read_timeout()`), limites en-têtes/lignes (`431`, lecture bornée `read_line_capped`), `Expect: 100-continue`, keep-alive multi-requêtes (pipelining) — 5 nouveaux tests E2E. Bench A/B **maison vs tiny_http** (`examples/bench_backends`) : maison ~1,85× plus rapide keep-alive (0,10 vs 0,19 ms/req), +360 Ko et +4 deps côté tiny → **route maison confirmée seul backend, tiny retiré du dépôt** (décision opérateur : minimalisme strict). Première campagne SLO : binaire 462 Ko ✅, keep-alive 0,10 ms ✅, RSS 4,7 Mo (WorkingSet), démarrage ~130 ms (shell). 37 tests verts.

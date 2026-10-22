@@ -369,3 +369,118 @@ fn typed_tool_rejects_invalid_arguments_without_running_handler() {
             .any(|i| i.as_str().unwrap().contains("requis"))
     );
 }
+
+// --- Phase 3 : durcissement HTTP (timeouts, limites, 100-continue) ---
+
+fn spawn_hardened() -> SocketAddr {
+    let bound = ServerBuilder::new("durci", "0.2.0")
+        .tool("ok", "Répond ok", |_args| {
+            Ok(serde_json::json!({ "ok": true }))
+        })
+        .read_timeout(std::time::Duration::from_millis(400))
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+    addr
+}
+
+#[test]
+fn slowloris_is_disconnected_without_response() {
+    let addr = spawn_hardened();
+    let mut stream = TcpStream::connect(addr).unwrap();
+    // Le client n'envoie qu'un fragment de requête, puis se tait.
+    stream
+        .write_all(b"POST /mcp HTTP/1.1\r\nHost: t\r\n")
+        .unwrap();
+    let _ = stream.flush();
+    std::thread::sleep(std::time::Duration::from_millis(900)); // > timeout (400 ms)
+    let mut raw = String::new();
+    let result = stream.read_to_string(&mut raw);
+    // Le serveur doit avoir coupé : EOF (0 octet) ou erreur — jamais de réponse.
+    let closed = match result {
+        Ok(n) => n == 0,
+        Err(_) => true,
+    };
+    assert!(closed, "le serveur aurait dû déconnecter le slowloris");
+}
+
+#[test]
+fn excessive_headers_get_431() {
+    let addr = spawn_hardened();
+    let mut request = String::from("POST /mcp HTTP/1.1\r\nHost: t\r\n");
+    for i in 0..80 {
+        request.push_str(&format!("X-Pad-{i}: y\r\n"));
+    }
+    request.push_str("Content-Length: 2\r\nConnection: close\r\n\r\n{}");
+    let (status, _) = raw_request(addr, &request);
+    assert_eq!(status, 431);
+}
+
+#[test]
+fn oversized_line_gets_431() {
+    let addr = spawn_hardened();
+    let long_path = "a".repeat(20_000); // > MAX_LINE (16 KiB)
+    let request = format!("POST /{long_path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    let (status, _) = raw_request(addr, &request);
+    assert_eq!(status, 431);
+}
+
+#[test]
+fn expect_100_continue_receives_interim_then_final_response() {
+    let addr = spawn_hardened();
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let head = "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json\r\nExpect: 100-continue\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n";
+    stream.write_all(head.as_bytes()).unwrap();
+    // Lire l'intermédiaire 100 Continue avant d'envoyer le corps.
+    let mut buf = [0u8; 512];
+    let mut interim = Vec::new();
+    loop {
+        let n = stream.read(&mut buf).unwrap();
+        if n == 0 {
+            break; // EOF : le serveur a fermé sans intermédiaire
+        }
+        interim.extend_from_slice(&buf[..n]);
+        if interim.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let interim_str = String::from_utf8_lossy(&interim);
+    assert!(
+        interim_str.starts_with("HTTP/1.1 100 Continue"),
+        "intermédiaire attendu, reçu : {interim_str:?}"
+    );
+    let body = r#"{"jsonrpc":"2.0","id":9,"method":"ping"}"#;
+    assert_eq!(body.len(), 40); // cohérent avec Content-Length ci-dessus
+    stream.write_all(body.as_bytes()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    assert!(raw.contains("HTTP/1.1 200 OK"), "réponse finale : {raw:?}");
+    assert!(raw.contains("\"result\":{}"));
+}
+
+#[test]
+fn keep_alive_serves_multiple_requests_on_one_connection() {
+    let addr = spawn_hardened();
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let ping_body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let ok_body =
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ok","arguments":{}}}"#;
+    let mut pipeline = String::new();
+    for body in [ping_body, ok_body] {
+        pipeline.push_str(&format!(
+            "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ));
+    }
+    stream.write_all(pipeline.as_bytes()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    assert_eq!(
+        raw.matches("HTTP/1.1 200 OK").count(),
+        2,
+        "2 réponses keep-alive : {raw:?}"
+    );
+    assert!(raw.contains("\"id\":1"));
+    assert!(raw.contains("\"id\":2"));
+}

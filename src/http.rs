@@ -5,14 +5,32 @@
 //! (SSE request-scoped, un seul événement de réponse) selon l'en-tête
 //! `Accept`. Pas de session, pas de listener `GET` (405), garde
 //! DNS-rebinding sur `Origin`.
+//!
+//! Durcissement (Phase 3) : timeout de lecture par opération (anti-slowloris,
+//! configurable via [`crate::ServerBuilder::read_timeout`]), timeout
+//! d'écriture, limite du nombre d'en-têtes (`431`), limite de longueur de
+//! ligne (`431`), support `Expect: 100-continue`.
 
 use crate::server::ServerCore;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Taille maximale d'un corps de requête (1 Mio par défaut).
 pub const MAX_BODY: usize = 1 << 20;
+
+/// Nombre maximal d'en-têtes par requête (au-delà → `431`).
+pub const MAX_HEADERS: usize = 64;
+
+/// Longueur maximale d'une ligne (requête ou en-tête) — au-delà → `431`.
+pub const MAX_LINE: usize = 16 * 1024;
+
+/// Timeout de lecture par opération (anti-slowloris) — défaut 30 s.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout d'écriture par opération — défaut 10 s.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serveur HTTP attaché à un socket bindé
 /// (résultat de [`crate::ServerBuilder::bind`]).
@@ -21,6 +39,7 @@ pub struct BoundServer {
     pub(crate) core: Arc<ServerCore>,
     pub(crate) route: String,
     pub(crate) allow_origins: Vec<String>,
+    pub(crate) read_timeout: Duration,
 }
 
 impl BoundServer {
@@ -32,7 +51,11 @@ impl BoundServer {
     /// Bloque et sert les connexions — un thread par connexion.
     pub fn serve(self) -> std::io::Result<()> {
         for stream in self.listener.incoming() {
-            let Ok(stream) = stream else { continue };
+            let Ok(stream) = stream else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(self.read_timeout));
+            let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
             let core = Arc::clone(&self.core);
             let route = self.route.clone();
             let allow_origins = self.allow_origins.clone();
@@ -41,6 +64,60 @@ impl BoundServer {
             });
         }
         Ok(())
+    }
+}
+
+/// Échec de lecture d'une ligne : trop longue, client trop lent, ou
+/// connexion fermée.
+enum LineFail {
+    TooLong,
+    TimedOut,
+    Closed,
+}
+
+/// Lit une ligne (jusqu'à `\n` inclus) dans `out` — sans jamais la dépasser
+/// `cap` octets.
+///
+/// Contrairement à `BufRead::read_line`, la mémoire consommée est bornée :
+/// un client hostile ne peut pas faire grossir le buffer au-delà de `cap`.
+/// `Ok(())` : ligne complète dans `out`.
+fn read_line_capped(
+    reader: &mut BufReader<TcpStream>,
+    out: &mut String,
+    cap: usize,
+) -> Result<(), LineFail> {
+    out.clear();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(LineFail::TimedOut);
+            }
+            Err(_) => return Err(LineFail::Closed),
+        };
+        if available.is_empty() {
+            return Err(LineFail::Closed);
+        }
+        if let Some(pos) = available.iter().position(|&byte| byte == b'\n') {
+            let chunk = &available[..=pos];
+            if out.len() + chunk.len() > cap {
+                return Err(LineFail::TooLong);
+            }
+            out.push_str(&String::from_utf8_lossy(chunk));
+            reader.consume(pos + 1);
+            return Ok(());
+        }
+        if out.len() + available.len() > cap {
+            return Err(LineFail::TooLong);
+        }
+        out.push_str(&String::from_utf8_lossy(available));
+        let filled = available.len();
+        reader.consume(filled);
     }
 }
 
@@ -53,9 +130,22 @@ fn handle_connection(
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut stream = stream;
     loop {
+        // Ligne de requête — bornée, timeout par opération.
         let mut request_line = String::new();
-        if reader.read_line(&mut request_line)? == 0 {
-            return Ok(()); // connexion fermée par le client
+        match read_line_capped(&mut reader, &mut request_line, MAX_LINE) {
+            Ok(()) => {}
+            Err(LineFail::TooLong) => {
+                respond(
+                    &mut stream,
+                    "431 Request Header Fields Too Large",
+                    "",
+                    "application/json",
+                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"ligne trop longue"}}"#,
+                    false,
+                )?;
+                return Ok(());
+            }
+            Err(LineFail::TimedOut) | Err(LineFail::Closed) => return Ok(()), // slowloris / coupure : sans réponse
         }
         let mut parts = request_line.split_whitespace();
         let verb = parts.next().unwrap_or("");
@@ -65,15 +155,41 @@ fn handle_connection(
         let mut content_length: Option<usize> = None;
         let mut origin: Option<String> = None;
         let mut accept = String::new();
+        let mut expect_continue = false;
         let mut close = false;
+        let mut header_count = 0usize;
         loop {
             let mut header = String::new();
-            if reader.read_line(&mut header)? == 0 {
-                return Ok(());
+            match read_line_capped(&mut reader, &mut header, MAX_LINE) {
+                Ok(()) => {}
+                Err(LineFail::TooLong) => {
+                    respond(
+                        &mut stream,
+                        "431 Request Header Fields Too Large",
+                        "",
+                        "application/json",
+                        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"ligne trop longue"}}"#.as_bytes(),
+                        false,
+                    )?;
+                    return Ok(());
+                }
+                Err(LineFail::TimedOut) | Err(LineFail::Closed) => return Ok(()),
             }
             let header = header.trim_end();
             if header.is_empty() {
                 break;
+            }
+            header_count += 1;
+            if header_count > MAX_HEADERS {
+                respond(
+                    &mut stream,
+                    "431 Request Header Fields Too Large",
+                    "",
+                    "application/json",
+                    r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"trop d'en-têtes"}}"#.as_bytes(),
+                    false,
+                )?;
+                return Ok(());
             }
             if let Some((name, value)) = header.split_once(':') {
                 let name = name.trim().to_ascii_lowercase();
@@ -83,6 +199,9 @@ fn handle_connection(
                     "origin" => origin = Some(value.to_string()),
                     "accept" => accept = value.to_ascii_lowercase(),
                     "connection" if value.eq_ignore_ascii_case("close") => close = true,
+                    "expect" if value.to_ascii_lowercase().contains("100-continue") => {
+                        expect_continue = true;
+                    }
                     _ => {}
                 }
             }
@@ -165,6 +284,13 @@ fn handle_connection(
                 break;
             }
             continue;
+        }
+
+        // `Expect: 100-continue` : le client attend notre feu vert avant
+        // d'envoyer le corps — on l'envoie, puis on lit le corps.
+        if expect_continue && len > 0 {
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            stream.flush()?;
         }
 
         let mut body = vec![0u8; len];

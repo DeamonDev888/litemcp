@@ -14,14 +14,22 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ### Ajouts en cours (non publiés)
 
-- *(section alimentée au fil des commits — rien en attente actuellement)*
+- **Durcissement HTTP (Phase 3)** :
+  - timeout de lecture par opération anti-slowloris (`READ_TIMEOUT` 30 s, configurable `.read_timeout(durée)`) — un client trop lent est déconnecté sans réponse ;
+  - timeout d'écriture (`WRITE_TIMEOUT` 10 s) ;
+  - limites `MAX_HEADERS` (64) et `MAX_LINE` (16 Kio) → `431 Request Header Fields Too Large`, avec lecture de lignes bornée en mémoire (`read_line_capped`) — un client hostile ne peut plus faire grossir le buffer ;
+  - support `Expect: 100-continue` (intermédiaire `100` avant lecture du corps) ;
+  - keep-alive multi-requêtes testé (pipelining 2 requêtes sur une connexion).
+- **Backend HTTP alternatif testé puis retiré** (bench A/B du 2026-10-22, `examples/bench_backends`) : tiny_http (vérifié 100 % Rust) s'est avéré ~1,85× plus lent en keep-alive (0,19 vs 0,10 ms/req), +360 Ko de binaire et +4 deps — il a été **supprimé du dépôt** : la route maison est le seul backend, le crate garde exactement **2 dépendances** (`serde`, `serde_json`).
+- **Première campagne de benchmarks** : binaire hello 462 Ko (cible < 1,5 Mo ✅), keep-alive 0,10 ms (cible < 1 ms ✅), RSS 4,7 Mo (WorkingSet Windows, mesure `VmRSS` Linux à venir), démarrage ~130 ms via shell Windows (mesure in-process à venir).
+- 37 tests au total (11 `zod`, 21 HTTP dont 5 durcissement, 4 JSON-RPC, 1 smoke).
 
 ### Prévu (cible 0.3)
 
 - Macros `#[tool]` / `#[resource]` / `#[prompt]` dérivant le schéma du type Rust (workspace split `litemcp-macros`) — finira de supprimer la double déclaration schéma/struct.
+- Fuzz du parseur HTTP (proptest/corpus) et tests clients réels (MCP Inspector, Claude, Cursor).
 - Ressources et prompts dans le noyau (aujourd'hui : `tools` seulement).
-- Durcissement HTTP (Phase 3) : fuzz du parseur, timeouts de lecture (slowloris), limite du nombre d'en-têtes, `Expect: 100-continue`.
-- Première campagne de benchmarks (RSS, binaire, p99) → SLO figés dans le README.
+- Mesures SLO Linux (`VmRSS`, démarrage in-process) et publication des conditions figées.
 
 ## [0.2.0] - 2026-10-22
 

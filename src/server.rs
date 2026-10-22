@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Résultat d'un outil : `Ok(valeur)` ou `Err(message lisible par le client)`.
 pub type ToolResult = Result<Value, String>;
@@ -146,6 +147,7 @@ pub struct ServerBuilder {
     version: String,
     route: String,
     allow_origins: Vec<String>,
+    read_timeout: Duration,
     tools: BTreeMap<String, ToolDef>,
 }
 
@@ -157,8 +159,18 @@ impl ServerBuilder {
             version: version.to_string(),
             route: "/mcp".to_string(),
             allow_origins: Vec::new(),
+            read_timeout: crate::http::READ_TIMEOUT,
             tools: BTreeMap::new(),
         }
+    }
+
+    /// Timeout de lecture par opération (anti-slowloris). Défaut : 30 s.
+    ///
+    /// Un client qui met plus de temps à produire sa requête est déconnecté
+    /// sans réponse. Les tests passent une valeur courte.
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = timeout;
+        self
     }
 
     /// Change la route MCP (par défaut `/mcp`).
@@ -302,6 +314,7 @@ impl ServerBuilder {
             core,
             route: self.route,
             allow_origins: self.allow_origins,
+            read_timeout: self.read_timeout,
         })
     }
 }
