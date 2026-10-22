@@ -88,7 +88,7 @@ pub enum ParseFail {
 /// Message JSON-RPC sortant.
 #[derive(Debug, Serialize)]
 pub struct Outgoing {
-    jsonrpc: String,
+    jsonrpc: &'static str,
     id: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<Value>,
@@ -99,7 +99,7 @@ pub struct Outgoing {
 impl Outgoing {
     pub fn success(id: Value, result: Value) -> Self {
         Self {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: "2.0",
             id,
             result: Some(result),
             error: None,
@@ -108,7 +108,7 @@ impl Outgoing {
 
     pub fn failure(id: Value, error: ErrorObject) -> Self {
         Self {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: "2.0",
             id,
             result: None,
             error: Some(error),
@@ -142,9 +142,12 @@ impl Outgoing {
 /// Parse un corps en [`Incoming`] — la séparation notification / `id: null`
 /// explicite / requête normalement identifiée est exacte, et la version
 /// `jsonrpc` est vérifiée.
+///
+/// `params` et `id` sont **déplacés** hors de l'objet parsé (jamais clonés)
+/// : le chemin chaud d'un `tools/call` ne duplique pas les arguments.
 pub fn parse_incoming(body: &[u8]) -> Result<Incoming, ParseFail> {
-    let value: Value = serde_json::from_slice(body).map_err(|_| ParseFail::Syntax)?;
-    let Some(object) = value.as_object() else {
+    let mut value: Value = serde_json::from_slice(body).map_err(|_| ParseFail::Syntax)?;
+    let Some(object) = value.as_object_mut() else {
         // Lot (tableau) ou primitive : MCP n'envoie jamais de batch — requête invalide.
         return Err(ParseFail::Invalid(
             "objet attendu (les lots ne sont pas supportés)".to_string(),
@@ -164,18 +167,18 @@ pub fn parse_incoming(body: &[u8]) -> Result<Incoming, ParseFail> {
     // id : absent → notification ; null → requête à id null ; string/number → id.
     let mut id = None;
     let mut null_id = false;
-    match object.get("id") {
+    match object.remove("id") {
         None => {}
         Some(Value::Null) => null_id = true,
         Some(raw) => {
-            let parsed: RequestId = serde_json::from_value(raw.clone()).map_err(|_| {
+            let parsed: RequestId = serde_json::from_value(raw).map_err(|_| {
                 ParseFail::Invalid("id doit être un nombre, une chaîne ou null".to_string())
             })?;
             id = Some(parsed);
         }
     }
 
-    let params = object.get("params").cloned().filter(|p| p.is_object());
+    let params = object.remove("params").filter(|p| p.is_object());
 
     Ok(Incoming {
         method,

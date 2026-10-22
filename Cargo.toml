@@ -17,4 +17,5 @@ serde_json = "1"
 
 [profile.release]
 strip = true
-lto = "thin"
+lto = "fat"
+codegen-units = 1

@@ -18,6 +18,14 @@ pub type ToolResult = Result<Value, String>;
 
 type ToolFn = dyn Fn(&Value) -> Result<Value, ToolFailure> + Send + Sync;
 
+/// Objet vide partagé — utilisé quand `params` ou `arguments` sont absents,
+/// sans réallouer à chaque appel.
+static EMPTY_OBJECT: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+
+fn empty_object() -> &'static Value {
+    EMPTY_OBJECT.get_or_init(|| json!({}))
+}
+
 /// Échec remonté par un wrapper de handler :
 /// - `Tool(String)` → échec d'exécution (`isError: true`, HTTP 200) ;
 /// - `Protocol(i64, String)` → erreur de protocole (ex. arguments qui ne
@@ -94,7 +102,10 @@ impl ServerCore {
                 id,
                 serde_json::to_value(self.list_tools()).unwrap_or_else(|_| json!({ "tools": [] })),
             ),
-            protocol::method::TOOLS_CALL => self.call_tool(&id, incoming.params),
+            protocol::method::TOOLS_CALL => self.call_tool(
+                &id,
+                incoming.params.as_ref().unwrap_or_else(|| empty_object()),
+            ),
             other => Outgoing::failure(
                 id,
                 ErrorObject::new(
@@ -125,8 +136,7 @@ impl ServerCore {
         ToolsListResult { tools }
     }
 
-    fn call_tool(&self, id: &Value, params: Option<Value>) -> Outgoing {
-        let params = params.unwrap_or_else(|| json!({}));
+    fn call_tool(&self, id: &Value, params: &Value) -> Outgoing {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return Outgoing::failure(
                 id.clone(),
@@ -142,13 +152,13 @@ impl ServerCore {
                 ),
             );
         };
-        let arguments = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        // Emprunté, jamais cloné : le handler et la validation reçoivent une
+        // référence sur les arguments (tool_parse clone en interne pour la
+        // désérialisation typée).
+        let arguments = params.get("arguments").unwrap_or_else(|| empty_object());
         if let Some(schema) = &tool.schema {
             let mut issues = Issues::new();
-            schema.validate("arguments", &arguments, &mut issues);
+            schema.validate("arguments", arguments, &mut issues);
             if !issues.is_empty() {
                 let rendered = issues.render();
                 return Outgoing::failure(
@@ -161,7 +171,7 @@ impl ServerCore {
                 );
             }
         }
-        let result = match (tool.f)(&arguments) {
+        let result = match (tool.f)(arguments) {
             Ok(value) => CallToolResult::from(Ok::<Value, String>(value)),
             Err(ToolFailure::Tool(message)) => CallToolResult::from(Err::<Value, String>(message)),
             Err(ToolFailure::Protocol(code, message)) => {
@@ -373,8 +383,8 @@ impl ServerBuilder {
         Ok(crate::http::BoundServer {
             listener,
             core,
-            route: self.route,
-            allow_origins: self.allow_origins,
+            route: Arc::new(self.route),
+            allow_origins: Arc::new(self.allow_origins),
             read_timeout: self.read_timeout,
             max_connections: self.max_connections,
             live_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

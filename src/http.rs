@@ -71,8 +71,9 @@ pub const MAX_CONNECTIONS: usize = 256;
 pub struct BoundServer {
     pub(crate) listener: TcpListener,
     pub(crate) core: Arc<ServerCore>,
-    pub(crate) route: String,
-    pub(crate) allow_origins: Vec<String>,
+    /// Partagés par `Arc` : aucun clone par connexion sur le chemin d'accept.
+    pub(crate) route: Arc<String>,
+    pub(crate) allow_origins: Arc<Vec<String>>,
     pub(crate) read_timeout: Duration,
     pub(crate) max_connections: usize,
     /// Connexions vivantes de **cette** instance — le plafond est par
@@ -114,8 +115,8 @@ impl BoundServer {
                 continue;
             }
             let core = Arc::clone(&self.core);
-            let route = self.route.clone();
-            let allow_origins = self.allow_origins.clone();
+            let route = Arc::clone(&self.route);
+            let allow_origins = Arc::clone(&self.allow_origins);
             let live = Arc::clone(&self.live_connections);
             std::thread::spawn(move || {
                 struct LiveGuard(Arc<AtomicUsize>);
@@ -145,17 +146,20 @@ enum LineFail {
 ///
 /// Contrairement à `BufRead::read_line`, la mémoire consommée est bornée :
 /// un client hostile ne peut pas faire grossir le buffer au-delà de `cap`.
-/// La ligne doit être du UTF-8 valide (sinon `Closed` → coupure propre) et
-/// la `deadline` globale est contrôlée à chaque remplissage — un client qui
-/// drible des octets est coupé aussi.
+/// `out` et `scratch` sont réutilisés d'un appel à l'autre (le chemin chaud
+/// n'alloue que si la ligne dépasse la capacité retenue). La ligne doit être
+/// du UTF-8 valide (sinon `Closed` → coupure propre) et la `deadline`
+/// globale est contrôlée à chaque remplissage — un client qui drible des
+/// octets est coupé aussi.
 fn read_line_capped(
     reader: &mut BufReader<TcpStream>,
     out: &mut String,
+    scratch: &mut Vec<u8>,
     cap: usize,
     deadline: Instant,
 ) -> Result<(), LineFail> {
     out.clear();
-    let mut bytes = Vec::new();
+    scratch.clear();
     loop {
         if Instant::now() >= deadline {
             return Err(LineFail::Slow);
@@ -177,43 +181,50 @@ fn read_line_capped(
         }
         if let Some(pos) = available.iter().position(|&byte| byte == b'\n') {
             let chunk = &available[..=pos];
-            if bytes.len() + chunk.len() > cap {
+            if scratch.len() + chunk.len() > cap {
                 return Err(LineFail::TooLong);
             }
-            bytes.extend_from_slice(chunk);
+            scratch.extend_from_slice(chunk);
             reader.consume(pos + 1);
-            return match String::from_utf8(bytes) {
+            return match std::str::from_utf8(scratch) {
                 Ok(text) => {
-                    *out = text;
+                    out.push_str(text);
                     Ok(())
                 }
                 Err(_) => Err(LineFail::Closed), // non-UTF8 : coupure propre
             };
         }
-        if bytes.len() + available.len() > cap {
+        if scratch.len() + available.len() > cap {
             return Err(LineFail::TooLong);
         }
-        bytes.extend_from_slice(available);
+        scratch.extend_from_slice(available);
         let filled = available.len();
         reader.consume(filled);
     }
 }
 
-/// État du corps : à drainer (borné) ou connexion à fermer.
 fn handle_connection(
     stream: TcpStream,
     core: &ServerCore,
     route: &str,
     allow_origins: &[String],
 ) -> std::io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    // Buffer de lecture 4 Ko (et non les 8 Ko par défaut) : les en-têtes
+    // tiennent largement dedans, et un corps plus grand que la capacité est
+    // lu directement depuis la socket — moitié moins de mémoire par
+    // connexion (1 Mio au plafond de 256 connexions).
+    let mut reader = BufReader::with_capacity(4 * 1024, stream.try_clone()?);
     let mut stream = stream;
+    // Buffers réutilisés sur toute la connexion (keep-alive inclus) : le
+    // chemin chaud n'alloue que le corps, l'en-tête de réponse et la
+    // réplique JSON-RPC.
+    let mut line = String::new();
+    let mut scratch = Vec::new();
     loop {
         let deadline = Instant::now() + REQUEST_DEADLINE;
 
         // Ligne de requête — bornée, deadline globale.
-        let mut request_line = String::new();
-        match read_line_capped(&mut reader, &mut request_line, MAX_LINE, deadline) {
+        match read_line_capped(&mut reader, &mut line, &mut scratch, MAX_LINE, deadline) {
             Ok(()) => {}
             Err(LineFail::TooLong) => {
                 respond(
@@ -229,7 +240,7 @@ fn handle_connection(
             // slowloris (timeout OU deadline globale) ou coupure : sans réponse
             Err(_) => return Ok(()),
         }
-        let mut parts = request_line.split_whitespace();
+        let mut parts = line.split_whitespace();
         let verb = parts.next().unwrap_or("");
         let full_path = parts.next().unwrap_or("");
         let version = parts.next().unwrap_or("");
@@ -255,24 +266,31 @@ fn handle_connection(
             return Ok(());
         }
         // La query string est ignorée : POST /mcp?x=1 == POST /mcp.
+        // Verdicts calculés maintenant : `line` est réemprunté (mutable)
+        // par la lecture des en-têtes, on ne garde que les booléens.
         let path = full_path.split('?').next().unwrap_or(full_path);
+        let is_post = verb == "POST";
+        let route_matched = path == route;
 
         let mut content_length: Option<usize> = None;
         let mut saw_content_length = false;
         let mut malformed_length = false;
         let mut duplicate_length = false;
         let mut transfer_encoding = false;
-        let mut origin: Option<String> = None;
+        // Origin/Host sans allocation : seul le verdict est conservé, jamais
+        // la valeur — le garde ne compare qu'avec la liste autorisée.
+        let mut origin_seen = false;
         let mut origin_duplicate = false;
-        let mut host: Option<String> = None;
+        let mut origin_allowed = false;
+        let mut host_seen = false;
         let mut host_duplicate = false;
-        let mut accept = String::new();
+        let mut accept_json = false;
+        let mut accept_sse = false;
         let mut expect_continue = false;
         let mut close = http10; // HTTP/1.0 : fermeture par défaut
         let mut header_count = 0usize;
         loop {
-            let mut header = String::new();
-            match read_line_capped(&mut reader, &mut header, MAX_LINE, deadline) {
+            match read_line_capped(&mut reader, &mut line, &mut scratch, MAX_LINE, deadline) {
                 Ok(()) => {}
                 Err(LineFail::TooLong) => {
                     respond(
@@ -287,7 +305,7 @@ fn handle_connection(
                 }
                 Err(_) => return Ok(()),
             }
-            let header = header.trim_end();
+            let header = line.trim_end();
             if header.is_empty() {
                 break;
             }
@@ -316,68 +334,70 @@ fn handle_connection(
                 return Ok(());
             }
             if let Some((name, value)) = header.split_once(':') {
-                let name = name.trim().to_ascii_lowercase();
+                // Comparaison insensible à la casse sans réallouer le nom ni
+                // la valeur — le chemin d'en-têtes n'alloue rien.
+                let name = name.trim();
                 let value = value.trim();
-                match name.as_str() {
-                    "content-length" => {
-                        if saw_content_length {
-                            duplicate_length = true;
-                        } else {
-                            saw_content_length = true;
-                            if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
-                                content_length = value.parse().ok();
-                                if content_length.is_none() {
-                                    // Que des chiffres mais dépasse usize :
-                                    // malformé lui aussi.
-                                    malformed_length = true;
-                                }
-                            } else {
+                if name.eq_ignore_ascii_case("content-length") {
+                    if saw_content_length {
+                        duplicate_length = true;
+                    } else {
+                        saw_content_length = true;
+                        if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                            content_length = value.parse().ok();
+                            if content_length.is_none() {
+                                // Que des chiffres mais dépasse usize :
+                                // malformé lui aussi.
                                 malformed_length = true;
                             }
-                        }
-                    }
-                    "transfer-encoding" => transfer_encoding = true, // TE : refusé
-                    "origin" => {
-                        if origin.is_some() {
-                            origin_duplicate = true;
                         } else {
-                            origin = Some(value.to_string());
+                            malformed_length = true;
                         }
                     }
-                    "host" => {
-                        if host.is_some() {
-                            host_duplicate = true;
-                        } else {
-                            host = Some(value.to_string());
+                } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                    transfer_encoding = true; // TE : refusé
+                } else if name.eq_ignore_ascii_case("origin") {
+                    if origin_seen {
+                        origin_duplicate = true;
+                    } else {
+                        origin_seen = true;
+                        origin_allowed =
+                            allow_origins.iter().any(|o| o.eq_ignore_ascii_case(value));
+                    }
+                } else if name.eq_ignore_ascii_case("host") {
+                    if host_seen {
+                        host_duplicate = true;
+                    } else {
+                        host_seen = true;
+                    }
+                } else if name.eq_ignore_ascii_case("accept") {
+                    accept_json |= contains_ignore_case(value, "application/json");
+                    accept_sse |= contains_ignore_case(value, "text/event-stream");
+                } else if name.eq_ignore_ascii_case("connection") {
+                    let mut has_close = false;
+                    let mut has_keep_alive = false;
+                    for token in value.split(',') {
+                        let token = token.trim();
+                        if token.eq_ignore_ascii_case("close") {
+                            has_close = true;
+                        } else if token.eq_ignore_ascii_case("keep-alive") {
+                            has_keep_alive = true;
                         }
                     }
-                    "accept" => {
-                        let v = value.to_ascii_lowercase();
-                        if accept.is_empty() {
-                            accept = v;
-                        } else {
-                            accept.push_str(", ");
-                            accept.push_str(&v);
-                        }
+                    if has_close {
+                        close = true;
                     }
-                    "connection" => {
-                        let lower = value.to_ascii_lowercase();
-                        let tokens: Vec<&str> = lower.split(',').map(str::trim).collect();
-                        if tokens.contains(&"close") {
+                    if http10 {
+                        if has_keep_alive && !has_close {
+                            close = false;
+                        } else if !has_keep_alive {
                             close = true;
                         }
-                        if http10 {
-                            if tokens.contains(&"keep-alive") && !tokens.contains(&"close") {
-                                close = false;
-                            } else if !tokens.contains(&"keep-alive") {
-                                close = true;
-                            }
-                        }
                     }
-                    "expect" if value.to_ascii_lowercase().contains("100-continue") => {
-                        expect_continue = true;
-                    }
-                    _ => {}
+                } else if name.eq_ignore_ascii_case("expect")
+                    && contains_ignore_case(value, "100-continue")
+                {
+                    expect_continue = true;
                 }
             }
         }
@@ -396,18 +416,15 @@ fn handle_connection(
 
         // Garde DNS-rebinding : un navigateur qui parle au serveur envoie un
         // `Origin` ; par défaut on refuse, sauf origines explicitement permises.
-        if let Some(origin) = &origin {
-            let allowed = allow_origins.iter().any(|o| o.eq_ignore_ascii_case(origin));
-            if !allowed {
-                respond_error(&mut stream, "403 Forbidden", "origin refusée", "")?;
-                return Ok(());
-            }
+        if origin_seen && !origin_allowed {
+            respond_error(&mut stream, "403 Forbidden", "origin refusée", "")?;
+            return Ok(());
         }
 
         // RFC 9112 §3.2 : `Host` obligatoire — et unique — en HTTP/1.1.
         // HTTP/1.0 en est dispensé (le champ y est facultatif).
         if !http10 {
-            if host.is_none() {
+            if !host_seen {
                 respond_error(&mut stream, "400 Bad Request", "en-tête Host requis", "")?;
                 return Ok(());
             }
@@ -417,12 +434,12 @@ fn handle_connection(
             }
         }
 
-        if path != route {
+        if !route_matched {
             respond_error(&mut stream, "404 Not Found", "route inconnue", "")?;
             return Ok(());
         }
 
-        if verb != "POST" {
+        if !is_post {
             respond_error(
                 &mut stream,
                 "405 Method Not Allowed",
@@ -539,8 +556,7 @@ fn handle_connection(
         };
 
         // SSE request-scoped : le client ne veut qu'un flux d'événements.
-        let sse_only = accept.contains("text/event-stream") && !accept.contains("application/json");
-        if sse_only {
+        if accept_sse && !accept_json {
             let mut event = Vec::with_capacity(reply.len() + 8);
             event.extend_from_slice(b"data: ");
             event.extend_from_slice(&reply);
@@ -642,11 +658,25 @@ fn respond(
     keep_alive: bool,
 ) -> std::io::Result<()> {
     let connection = if keep_alive { "keep-alive" } else { "close" };
-    let head = format!(
+    // En-tête et corps assemblés dans un seul buffer → **un seul write** :
+    // avec nodelay, tête et corps partent dans le même segment TCP (deux
+    // syscalls et un paquet de gagnés par réponse).
+    let mut buf = Vec::with_capacity(
+        96 + status.len() + extra_headers.len() + content_type.len() + body.len(),
+    );
+    write!(
+        buf,
         "HTTP/1.1 {status}\r\n{extra_headers}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
         body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body)?;
+    )?;
+    buf.extend_from_slice(body);
+    stream.write_all(&buf)?;
     stream.flush()
+}
+
+/// `contains` insensible à la casse ASCII, sans allocation — pour les
+/// recherches de sous-chaînes dans les valeurs d'en-têtes.
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    !n.is_empty() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }

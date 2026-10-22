@@ -187,12 +187,23 @@ La valeur de retour d'un outil devient `structuredContent` — les objets JSON p
 
 **Décision tranchée par les chiffres** : la route maison reste le seul backend — plus rapide en régime keep-alive (le cas d'un agent qui parle à ses serveurs), plus légère en deps et en binaire. Le backend alternatif a été **retiré du dépôt** : le crate garde exactement deux dépendances (`serde`, `serde_json`).
 
+**Optimisations « léger & rapide »** (A/B dos à dos, même machine et même session, `examples/bench_backends`) :
+
+| Métrique | 0.3.0 | Lot perf en cours | Verdict |
+|---|---|---|---|
+| `tools/call` keep-alive (moyenne) | 0,097–0,111 ms | **0,065–0,070 ms** | **~35 % plus rapide** |
+| p50 / p99 keep-alive | 0,085–0,112 / 0,157–0,166 ms | **0,061 / 0,095–0,123 ms** | plus serré |
+| Binaire release stripped (hello) | 483 Ko | **385 Ko** | **−18,5 %** (LTO fat + `codegen-units = 1`) |
+| Mémoire de lecture par connexion | 8 Ko | **4 Ko** | 1 Mio au plafond de 256 connexions |
+
+Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** par réponse — avant : deux syscalls, deux paquets avec nodelay), parsing d'en-têtes **zéro allocation** (`Origin`/`Host`/`Accept`/`Connection` réduits à des verdicts, sans chaînes ni `Vec`), buffers de lecture réutilisés sur toute la connexion keep-alive, **zéro clone des arguments** dans le dispatch (`params` déplacé hors du JSON parsé, handler et validation travaillent par référence), `route`/`allow_origins` partagés par `Arc`. Dépendances inchangées : toujours exactement deux (`serde`, `serde_json`).
+
 **SLO (conditions : Windows 11, release, loopback — mesures Linux/`VmRSS` à la prochaine campagne) :**
 
 | Métrique | Cible | Mesuré |
 |---|---|---|
-| Binaire release stripped (hello) | < 1,5 Mo | **462 Ko** ✅ |
-| `tools/call` keep-alive (moyenne) | < 1 ms | **0,10 ms** ✅ |
+| Binaire release stripped (hello) | < 1,5 Mo | **385 Ko** ✅ |
+| `tools/call` keep-alive (moyenne) | < 1 ms | **0,065–0,070 ms** ✅ (p99 < 0,13 ms, bruit Windows ; campagne figée Linux à venir) |
 | RSS serveur hello (au repos) | < 2 Mo | 4,7 Mo (WorkingSet Windows, DLL partagées incluses — mesure `VmRSS` Linux à venir) |
 | Démarrage à froid | < 10 ms | ~130 ms via shell Windows (overhead de spawn inclus ; mesure in-process à venir) |
 
