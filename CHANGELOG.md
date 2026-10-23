@@ -46,13 +46,19 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 - 70 tests au total (19 unitaires JSON-RPC/zod/protocol, 42 HTTP sur vraies sockets, 5 smoke, 4 doctests).
 
-## [Unreleased]
+## [0.3.2] - 2026-10-22
 
 ### Ajout — anti-tampon SSE (réponse au problème des VPS derrière un proxy)
 
 - **En-têtes anti-tampon sur toute réponse SSE** (`SSE_ANTI_BUFFERING`) : `X-Accel-Buffering: no` — la directive **par réponse** que nginx honore même quand `proxy_buffering` est actif globalement — et `Cache-Control: no-cache, no-transform`. Le symptôme « les événements s'empilent jusqu'au seuil du buffer » ne peut de toute façon pas se produire (SSE request-scoped : un événement, `Connection: close`, `Content-Length` explicite — un proxy pousse toujours une réponse terminée) ; les en-têtes ferment le dossier pour les proxies les plus zélés. JSON non affecté (2 tests : présents en SSE, absents en JSON).
 - **Choix architectural documenté** : **pas de SSE longue durée** (progress, notifications serveur→client) — le mode stateless ne tient aucun flux ouvert ; documenté dans le code (contrat : tout écrivain SSE flush après chaque événement et porte `SSE_ANTI_BUFFERING`) et dans le README.
-- README : nouvelle section « Hébergement VPS & proxies » (explication du tamponnage, recette nginx, repli JSON officiel, choix architectural) + entrée FAQ.
+- README : nouvelle section « Hébergement VPS & proxies » (explication du tamponnage, recette nginx, repli JSON officiel, choix architectural), FAQ « Pourquoi pas de WebSocket ? » (choix architectural : ~1–2 % de gain au mieux, proxies hostiles, sessions), table Configuration avec la sonde `/health`.
+
+### Tests
+
+- 72 tests au total (19 unitaires JSON-RPC/zod/protocol, 44 HTTP sur vraies sockets, 5 smoke, 4 doctests).
+
+## [Unreleased]
 
 ### Prévu (cible 0.4)
 
@@ -166,7 +172,8 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - GitHub : dépôt [DeamonDev888/litemcp](https://github.com/DeamonDev888/litemcp), tag `v0.1.0`, release, CI verte (fmt / clippy / test / doc).
 - Token API crates.io stocké dans `~/.cargo/credentials.toml` (hors repo), garde `.cargo/` au `.gitignore`.
 
-[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/DeamonDev888/litemcp/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/DeamonDev888/litemcp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/DeamonDev888/litemcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/DeamonDev888/litemcp/compare/v0.1.0...v0.2.0

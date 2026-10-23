@@ -2,11 +2,11 @@
 
 # litemcp
 
-**Le serveur MCP le plus léger de l'écosystème Rust.**
+**La lib MCP la plus légère de l'écosystème Rust : votre serveur MCP en quelques lignes.**
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.3.1%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.3.2%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
 ![crates.io](https://img.shields.io/crates/v/litemcp.svg) ![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI) ![Docs](https://img.shields.io/docsrs/litemcp)
 
@@ -158,6 +158,7 @@ La valeur de retour d'un outil devient `structuredContent` — les objets JSON p
 | `.allow_origins(&[..])` | vide | origines `Origin` autorisées (clients navigateur) — toute requête avec `Origin` non listée est refusée (garde DNS-rebinding) ; les clients CLI n'en envoient pas |
 | `.read_timeout(duration)` | 30 s | timeout de lecture par opération (anti-slowloris) — un client trop lent est déconnecté sans réponse |
 | `.max_connections(n)` | 256 (par serveur) | plafond de connexions simultanées — au-delà, `503` immédiat, pas de spawn |
+| Sonde `GET /health` | `/health` (inclus) | `200` « ok » sans JSON-RPC — probes k8s/systemd/équilibreur |
 | Corps de requête | 1 Mio | au-delà → `413` |
 | En-têtes | 64 max, lignes 16 Kio max | au-delà → `431` |
 
@@ -286,13 +287,13 @@ Le détail — jalons, SLO, risques, journal : [docs/ROADMAP.md](docs/ROADMAP.md
 ## FAQ
 
 **Pourquoi un seul transport ?**
-Parce qu'un serveur lancé comme sous-processus d'un client meurt avec lui et n'accepte qu'un seul pair — c'est le modèle du client, pas du serveur. litemcp fait le choix inverse : **le serveur est un démon Streamable HTTP stateless**, bindé sur un socket TCP, que plusieurs agents peuvent joindre, qui survit aux clients et se déploie derrière nginx. Le MCP local en sous-processus est hors périmètre, par conception.
+Parce qu'un serveur lancé comme sous-processus d'un client meurt avec lui et n'accepte qu'un seul pair — c'est le modèle du client, pas de la lib. litemcp fait le choix inverse : **votre programme devient un démon Streamable HTTP stateless**, bindé sur un socket TCP, que plusieurs agents peuvent joindre, qui survit aux clients et se déploie derrière nginx. Le MCP local en sous-processus est hors périmètre, par conception.
 
 **Pourquoi un module de schémas intégré ?**
-Un serveur MCP sans schéma n'est qu'un routeur JSON : les clients ont besoin de l'`inputSchema` pour présenter vos outils, et vos handlers ont besoin d'arguments garantis. Le module `zod` couvre les deux — dérivation JSON Schema + validation runtime — sans dépendance de plus : il pèse moins que les bibliothèques de schémas génériques qu'on embarquerait sinon.
+Une lib MCP sans schéma n'est qu'un routeur JSON : les clients ont besoin de l'`inputSchema` pour présenter vos outils, et vos handlers ont besoin d'arguments garantis. Le module `zod` couvre les deux — dérivation JSON Schema + validation runtime — sans dépendance de plus : il pèse moins que les bibliothèques de schémas génériques qu'on embarquerait sinon.
 
 **Pourquoi pas de tokio ?**
-Un serveur MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des requêtes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions — et l'adaptateur tokio restera disponible pour les autres cas.
+Une lib MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des requêtes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions — et l'adaptateur tokio restera disponible pour les autres cas.
 
 **Pourquoi réécrire HTTP ?**
 Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE mono-événement. Pas de chunked entrant, pas de TLS, pas de compression. Ce choix est **tranché par les tests** : le bench maison contre le backend alternatif testé (tiny_http) montre la route maison ~1,85× plus rapide en keep-alive et 0 dépendance de plus (voir [Benchmarks](#benchmarks)) — et elle embarque son durcissement (timeouts, limites d'en-têtes, `Expect: 100-continue`).
