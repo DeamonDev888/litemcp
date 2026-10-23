@@ -22,7 +22,8 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
   - keep-alive : **0,09–0,10 ms** vs 1,43–1,73 ms (**~15–18× plus rapide**) ;
   - p99 : **0,18–0,22 ms** vs 5,4–5,9 ms ;
   - connexions neuves : **848–1257 conn/s** vs 354–498 conn/s ;
-  - réutilisation : **2000/2000** vs 0/2000 — ViteMCP répond en SSE encadré maintenu ouvert, le client doit rouvrir une connexion par appel séquentiel ; litemcp délimite par `Content-Length` et clôt le flux.
+  - réutilisation : **2000/2000** vs 0/2000 — ViteMCP répond en SSE encadré maintenu ouvert, le client doit rouvrir une connexion par appel séquentiel ; litemcp délimite par `Content-Length` et clôt le flux ;
+  - mémoire après 2 300 requêtes : **5,5 Mo** (0,9 Mo privé) vs ~417 Mo (chaîne de 3 processus Node : 47 + 63 + 306 Mo) — **~75× moins**.
 - Constat de fiabilité : `enableJsonResponse` est déclaré dans les types de `@vitemcp/server` mais sans implémentation dans le code — l'option est un no-op.
 - Banc reproduisible : `Desktop/vitemcp-bench` (serveur TS) + `Desktop/litemcp-it` (serveur démo Rust + client neutre).
 
