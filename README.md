@@ -210,7 +210,19 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 
 ## Comparatif — ViteMCP (TypeScript)
 
-[`@vitemcp/server`](https://github.com/vitemcp/server) est le framework TS qui cible la **même spec** stateless 2026-07-28 — le comparatif naturel. Même serveur démo (4 outils identiques) des deux côtés, **un seul client de bench neutre** (Rust, `litemcp-it/examples/bench_remote`), Windows 11, loopback, passes alternées (2026-10-22) :
+[`@vitemcp/server`](https://github.com/vitemcp/server) est le framework TS qui cible la **même spec** stateless 2026-07-28 — le comparatif naturel. Même serveur démo (4 outils identiques) des deux côtés, **un seul client de bench neutre** (Rust, `litemcp-it/examples/bench_remote`), Windows 11, loopback, passes alternées (2026-10-22).
+
+**Résumé express :**
+
+| | litemcp | ViteMCP (TS) |
+|---|---|---|
+| ⚡ Temps de réponse moyen | **0,09 ms** | 1,43 ms |
+| 😰 Le pire cas (p99) | **0,18 ms** | 5,4 ms |
+| 🔌 Connexions réutilisées | **2000/2000** | 0/2000 |
+| 📊 Nouvelles connexions par seconde | **~1000** | ~400 |
+| 🧠 Mémoire après 2300 requêtes | **5,5 Mo** | ~417 Mo |
+
+Détail complet (plages, passes alternées) :
 
 | Métrique | **litemcp** | @vitemcp/server | Verdict |
 |---|---|---|---|
