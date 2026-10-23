@@ -66,6 +66,11 @@ pub const REQUEST_DEADLINE: Duration = Duration::from_secs(60);
 /// immédiat (pas de spawn). Défaut 256.
 pub const MAX_CONNECTIONS: usize = 256;
 
+/// Chemin de la sonde de vie : `GET {HEALTH_ROUTE}` → `200` « ok » sans
+/// JSON-RPC (probes k8s/systemd/équilibreurs — point fort repris de
+/// ViteMCP). Toute autre méthode → `405`.
+pub const HEALTH_ROUTE: &str = "/health";
+
 /// Serveur HTTP attaché à un socket bindé
 /// (résultat de [`crate::ServerBuilder::bind`]).
 pub struct BoundServer {
@@ -270,7 +275,9 @@ fn handle_connection(
         // par la lecture des en-têtes, on ne garde que les booléens.
         let path = full_path.split('?').next().unwrap_or(full_path);
         let is_post = verb == "POST";
+        let is_get = verb == "GET";
         let route_matched = path == route;
+        let health_probe = path == HEALTH_ROUTE;
 
         let mut content_length: Option<usize> = None;
         let mut saw_content_length = false;
@@ -432,6 +439,26 @@ fn handle_connection(
                 respond_error(&mut stream, "400 Bad Request", "en-tête Host dupliqué", "")?;
                 return Ok(());
             }
+        }
+
+        // Sonde de vie (point fort repris de ViteMCP) : `GET /health` →
+        // `200` « ok » sans JSON-RPC, compatible keep-alive — pour les
+        // probes k8s/systemd et les équilibreurs de charge.
+        if health_probe {
+            if is_get {
+                respond(&mut stream, "200 OK", "", "text/plain", b"ok", !close)?;
+                if close {
+                    break;
+                }
+                continue;
+            }
+            respond_error(
+                &mut stream,
+                "405 Method Not Allowed",
+                "GET uniquement",
+                "Allow: GET\r\n",
+            )?;
+            return Ok(());
         }
 
         if !route_matched {

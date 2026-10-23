@@ -680,6 +680,45 @@ fn duplicate_content_length_is_rejected_400() {
 }
 
 #[test]
+fn health_probe_answers_200_ok() {
+    let addr = spawn_hardened();
+    let (status, body) = raw_request(
+        addr,
+        "GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, "ok", "corps de sonde attendu : {body:?}");
+}
+
+#[test]
+fn health_probe_post_is_405() {
+    let addr = spawn_hardened();
+    let (status, _) = raw_request(
+        addr,
+        "POST /health HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 405);
+}
+
+#[test]
+fn health_probe_keeps_connection_reusable() {
+    // La sonde ne casse pas le keep-alive : GET /health puis ping sur LA
+    // MÊME connexion (requêtes pipelinées).
+    let addr = spawn_hardened();
+    let ping_body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let pipeline = format!(
+        "GET /health HTTP/1.1\r\nHost: t\r\n\r\nPOST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{ping_body}",
+        ping_body.len()
+    );
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.write_all(pipeline.as_bytes()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    assert_eq!(raw.matches("HTTP/1.1 200 OK").count(), 2, "{raw:?}");
+    assert!(raw.contains("\"result\":{}"), "{raw:?}");
+}
+
+#[test]
 fn query_string_is_ignored_in_route_match() {
     let addr = spawn_hardened();
     let (status, body) = post(

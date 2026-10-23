@@ -166,7 +166,8 @@ La valeur de retour d'un outil devient `structuredContent` — les objets JSON p
 | `POST /mcp` valide | `200 application/json` — réponse JSON-RPC |
 | `POST` avec `Accept: text/event-stream` seul | `200 text/event-stream` — un événement `data:` (SSE request-scoped) |
 | Notification (sans `id`) | `202 Accepted` sans corps |
-| `GET` | `405 Method Not Allowed` (pas de listener SSE permanent en stateless) |
+| Sonde `GET /health` | `200` « ok » (sans JSON-RPC ; probes k8s/systemd) · autre méthode : `405` |
+| `GET` sur `/mcp` | `405 Method Not Allowed` (pas de listener SSE permanent en stateless) |
 | Version HTTP ≠ 1.0/1.1 · ligne de requête malformée | `505` · `400` |
 | HTTP/1.1 sans `Host` (ou `Host` dupliqué) · ligne obs-fold | `400` |
 | Route inconnue | `404` · `Content-Length` absent : `411` · malformé : `400` · corps > 1 Mio : `413` |
@@ -207,10 +208,29 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 | RSS serveur hello (au repos) | < 2 Mo | 4,7 Mo (WorkingSet Windows, DLL partagées incluses — mesure `VmRSS` Linux à venir) |
 | Démarrage à froid | < 10 ms | ~130 ms via shell Windows (overhead de spawn inclus ; mesure in-process à venir) |
 
+## Comparatif — ViteMCP (TypeScript)
+
+[`@vitemcp/server`](https://github.com/vitemcp/server) est le framework TS qui cible la **même spec** stateless 2026-07-28 — le comparatif naturel. Même serveur démo (4 outils identiques) des deux côtés, **un seul client de bench neutre** (Rust, `litemcp-it/examples/bench_remote`), Windows 11, loopback, passes alternées (2026-10-22) :
+
+| Métrique | **litemcp** | @vitemcp/server | Verdict |
+|---|---|---|---|
+| keep-alive (moyenne) | **0,09–0,10 ms** | 1,43–1,73 ms | **~15–18× plus rapide** |
+| p99 keep-alive | **0,18–0,22 ms** | 5,4–5,9 ms | ~25× plus resserré |
+| Connexions réutilisées | **2000/2000** | 0/2000 | flux SSE maintenu ouvert côté ViteMCP → reconnect à chaque appel |
+| Connexions neuves | **848–1257 conn/s** | 354–498 conn/s | ~2–3× plus rapide |
+
+L'écart structurel : litemcp délimite ses réponses par `Content-Length` et clôt le flux après l'événement — la connexion TCP reste proprement réutilisable ; ViteMCP répond en **SSE encadré** qu'il maintient ouvert, le client doit donc rouvrir une connexion par appel séquentiel. (Conditions : tsx/Node 24 côté TS ; les deux serveurs complétaient les mêmes requêtes JSON-RPC.)
+
+**Points forts de ViteMCP** — bilan :
+
+- **Adopté** : sonde `GET /health` (`200` « ok », compatible keep-alive) ;
+- **Candidat 0.4** : `outputSchema` (validation de la sortie structurée) ;
+- **Écartés volontairement** (hors périmètre minimaliste, réévalués si besoin) : OAuth 2.1 intégré, OpenAPI→outils, routes HTTP personnalisées, edge runtime, CLI dev/inspect, élaboration/sampling bidirectionnels.
+
 ## Tests
 
 ```bash
-cargo test                          # 67 tests : unitaires + intégration (vraies sockets) + doctests
+cargo test                          # 70 tests : unitaires + intégration (vraies sockets) + doctests
 cargo clippy -- -D warnings         # CI stricte
 ```
 
