@@ -9,3 +9,4 @@ Thumbs.db
 
 # Secrets / credentials crates.io — ne jamais committer
 .cargo/
+audit_target.rs
