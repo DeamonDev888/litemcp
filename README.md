@@ -297,6 +297,9 @@ Un serveur MCP mono-outil n'a pas besoin d'un runtime async complet pour lire de
 **Pourquoi réécrire HTTP ?**
 Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE mono-événement. Pas de chunked entrant, pas de TLS, pas de compression. Ce choix est **tranché par les tests** : le bench maison contre le backend alternatif testé (tiny_http) montre la route maison ~1,85× plus rapide en keep-alive et 0 dépendance de plus (voir [Benchmarks](#benchmarks)) — et elle embarque son durcissement (timeouts, limites d'en-têtes, `Expect: 100-continue`).
 
+**Pourquoi pas de WebSocket ?**
+Choix architectural, pas un oubli : WS n'économiserait que le re-parsing des en-têtes HTTP (~1–2 % du trajet — JSON, syscalls et noyau réseau dominent), ne passe pas bien derrière les proxies d'hébergement, et traînerait sessions et reconnexions — les trois choses que le mode stateless évite. La spec 2026-07-28 est HTTP-only ; le keep-alive one-write de litemcp est déjà au plancher de TCP.
+
 **Pourquoi pas de SSE longue durée ?**
 Le mode stateless n'a aucun flux ouvert : chaque POST est auto-suffisant (un événement `data:`, clôture). C'est ce choix qui immunise le transport contre le tamponnage des proxies de VPS et le rend trivial à déployer derrière nginx — voir [Hébergement VPS & proxies](#hébergement-vps--proxies-le-piège-du-tamponnage-sse). Un flux permanent (progress, notifications serveur→client) exigerait des sessions : hors périmètre, réévalué si un besoin concret l'exige.
 
