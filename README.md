@@ -18,12 +18,14 @@ Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro
 
 ## Pourquoi litemcp
 
-**litemcp traite le protocole MCP comme une bibliothèque, pas comme un service.** Le cœur est une pompe JSON-RPC sur des threads bloquants du `std` — pas de runtime async, pas de pile HTTP lourde : rien que `serde`.
+La plupart des serveurs MCP sont des **services** : un programme qui s'installe, charge un gros framework et tourne à côté de votre application. **litemcp fait l'inverse : c'est une bibliothèque Rust.** Vous écrivez quelques lignes, vous appelez `.serve()`, et un vrai serveur MCP tourne **dans** votre programme — avec les threads standards du langage, sans runtime async, sans framework HTTP. Seule dépendance pour le JSON : `serde`.
 
-- une CLI qui expose trois outils ;
-- un test unitaire qui veut un vrai serveur, sans runtime ;
-- un binaire embarqué (edge, IoT) où une pile HTTP complète, c'est non ;
-- un agent qui spawn cinquante serveurs et paie le coût à chaque fois.
+**Pour qui ?**
+
+- **Une CLI** qui veut exposer deux ou trois outils, sans embarquer un framework web ;
+- **Un test unitaire** qui a besoin d'un vrai serveur MCP qui écoute sur un port — sans installer tokio ;
+- **Un binaire embarqué** (edge, IoT), où chaque mégaoctet et chaque dépendance compte ;
+- **Un agent** qui lance cinquante serveurs MCP en même temps : chaque mégaoctet de RAM et chaque demi-seconde de démarrage se multiplie par cinquante.
 
 Les principes :
 
