@@ -237,6 +237,53 @@ fn sse_when_client_accepts_only_event_stream() {
     assert_eq!(v["result"]["structuredContent"]["somme"], 3);
 }
 
+#[test]
+fn sse_response_carries_anti_buffering_headers() {
+    // Contrat anti-tampon : tout événement SSE porte `X-Accel-Buffering: no`
+    // (honoré par nginx par réponse) et `Cache-Control: no-cache, no-transform`.
+    let addr = spawn_hardened();
+    let body = r#"{"jsonrpc":"2.0","id":8,"method":"ping"}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    assert!(raw.contains("HTTP/1.1 200 OK"), "{raw:?}");
+    assert!(raw.contains("Content-Type: text/event-stream"), "{raw:?}");
+    assert!(
+        raw.contains("X-Accel-Buffering: no"),
+        "en-tête anti-tampon nginx manquant : {raw:?}"
+    );
+    assert!(
+        raw.contains("Cache-Control: no-cache, no-transform"),
+        "{raw:?}"
+    );
+}
+
+#[test]
+fn json_response_has_no_anti_buffering_headers() {
+    // Le JSON n'a rien à tamponner : pas d'en-têtes SSE superflus.
+    let addr = spawn_hardened();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    assert!(raw.contains("HTTP/1.1 200 OK"), "{raw:?}");
+    assert!(
+        !raw.contains("X-Accel-Buffering"),
+        "en-têtes SSE sur une réponse JSON : {raw:?}"
+    );
+    assert!(!raw.contains("text/event-stream"), "{raw:?}");
+}
+
 // --- Outils typés : schéma dérivé + validation avant exécution ---
 
 fn spawn_typed_server() -> SocketAddr {

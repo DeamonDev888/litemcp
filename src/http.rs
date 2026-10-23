@@ -29,6 +29,10 @@
 //!   d'un RST côté client avant lecture de la réponse (compromis assumé) ;
 //! - `POST /mcp?query=…` accepté (la query est ignorée) ;
 //! - `HTTP/1.0` sans `Connection: keep-alive` → connexion fermée ;
+//! - réponses SSE avec **en-têtes anti-tampon** (`X-Accel-Buffering: no`,
+//!   `Cache-Control: no-cache, no-transform`) pour les hébergements derrière
+//!   un proxy qui tamponne les flux ; choix architectural : **pas de SSE
+//!   longue durée** — request-scoped, un événement puis clôture ;
 //! - panique d'un handler capturée (`catch_unwind`) → `-32603` JSON-RPC,
 //!   la connexion du client reste propre. NB : compiler avec
 //!   `panic = "abort"` neutralise `catch_unwind` — une panique de handler
@@ -70,6 +74,14 @@ pub const MAX_CONNECTIONS: usize = 256;
 /// JSON-RPC (probes k8s/systemd/équilibreurs — point fort repris de
 /// ViteMCP). Toute autre méthode → `405`.
 pub const HEALTH_ROUTE: &str = "/health";
+
+/// En-têtes anti-tampon émis sur toute réponse SSE. `X-Accel-Buffering:
+/// no` est la directive **par réponse** que nginx honore même quand
+/// `proxy_buffering` est actif globalement (le cas des VPS qu'on ne
+/// contrôle pas) ; `no-transform` interdit aux intermédiaires de
+/// retoucher le flux. Le JSON ne les porte pas : rien à tamponner.
+pub const SSE_ANTI_BUFFERING: &str =
+    "Cache-Control: no-cache, no-transform\r\nX-Accel-Buffering: no\r\n";
 
 /// Serveur HTTP attaché à un socket bindé
 /// (résultat de [`crate::ServerBuilder::bind`]).
@@ -583,6 +595,18 @@ fn handle_connection(
         };
 
         // SSE request-scoped : le client ne veut qu'un flux d'événements.
+        //
+        // Choix architectural assumé : **pas de SSE longue durée** (progress,
+        // notifications serveur→client). Le mode stateless ne tient aucun
+        // flux ouvert — un POST, un événement, clôture. C'est ce qui rend le
+        // transport immunisé contre les proxies de VPS qui tamponnent les
+        // flux en cours (empilement jusqu'au seuil de leur buffer) : une
+        // réponse terminée, avec `Connection: close` et un `Content-Length`
+        // explicite, est toujours poussée par le proxy.
+        //
+        // Contrat de transport pour tout futur écrivain SSE : flusher après
+        // CHAQUE événement (`respond` fait `write_all` + `flush`) et porter
+        // [`SSE_ANTI_BUFFERING`].
         if accept_sse && !accept_json {
             let mut event = Vec::with_capacity(reply.len() + 8);
             event.extend_from_slice(b"data: ");
@@ -591,7 +615,7 @@ fn handle_connection(
             respond(
                 &mut stream,
                 "200 OK",
-                "",
+                SSE_ANTI_BUFFERING,
                 "text/event-stream",
                 &event,
                 false,

@@ -166,7 +166,7 @@ La valeur de retour d'un outil devient `structuredContent` — les objets JSON p
 | Comportement | Réponse |
 |---|---|
 | `POST /mcp` valide | `200 application/json` — réponse JSON-RPC |
-| `POST` avec `Accept: text/event-stream` seul | `200 text/event-stream` — un événement `data:` (SSE request-scoped) |
+| `POST` avec `Accept: text/event-stream` seul | `200 text/event-stream` — un événement `data:` (SSE request-scoped) + en-têtes anti-tampon |
 | Notification (sans `id`) | `202 Accepted` sans corps |
 | Sonde `GET /health` | `200` « ok » (sans JSON-RPC ; probes k8s/systemd) · autre méthode : `405` |
 | `GET` sur `/mcp` | `405 Method Not Allowed` (pas de listener SSE permanent en stateless) |
@@ -242,10 +242,32 @@ L'écart structurel : litemcp délimite ses réponses par `Content-Length` et cl
 - **Candidat 0.4** : `outputSchema` (validation de la sortie structurée) ;
 - **Écartés volontairement** (hors périmètre minimaliste, réévalués si besoin) : OAuth 2.1 intégré, OpenAPI→outils, routes HTTP personnalisées, edge runtime, CLI dev/inspect, élaboration/sampling bidirectionnels.
 
+## Hébergement VPS & proxies (le piège du tamponnage SSE)
+
+Derrière beaucoup d'hébergements, un proxy (nginx, Cloudflare…) met les réponses en tampon et n'envoie les flux SSE que lorsqu'il a accumulé ~8 Ko — les événements « s'empilent ». Deux lignes de défense :
+
+- **litemcp est structuré pour ça** : son SSE est *request-scoped* — un événement, `Connection: close`, `Content-Length` explicite. Un proxy tamponne les flux *en cours* ; une réponse terminée est toujours poussée. Le symptôme ne peut pas se produire ;
+- **les réponses SSE portent les en-têtes anti-tampon** `X-Accel-Buffering: no` (honoré par nginx **par réponse**, même avec `proxy_buffering on` global) et `Cache-Control: no-cache, no-transform`.
+
+Si vous contrôlez le proxy, la configuration propre :
+
+```nginx
+location /mcp {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_buffering off;        # optionnel : X-Accel-Buffering: no suffit
+    proxy_read_timeout 3600s;
+}
+```
+
+**Repli officiel si l'hébergeur est hostile au SSE** : le client négocie `Accept: application/json` et reçoit une réponse JSON sèche — aucun flux, rien à tamponner. Les clients MCP gèrent cette négociation automatiquement.
+
+**Choix architectural : pas de SSE longue durée.** Le mode stateless ne tient aucun flux ouvert (pas de progress ni de notifications serveur→client) : un POST, un événement, clôture. C'est ce choix qui immunise le transport contre le tamponnage des proxies et le rend trivial à déployer derrière nginx. Un flux permanent exigerait des sessions — hors périmètre, réévalué seulement si un besoin concret l'exige.
+
 ## Tests
 
 ```bash
-cargo test                          # 70 tests : unitaires + intégration (vraies sockets) + doctests
+cargo test                          # 72 tests : unitaires + intégration (vraies sockets) + doctests
 cargo clippy -- -D warnings         # CI stricte
 ```
 
@@ -280,6 +302,9 @@ Un serveur MCP mono-outil n'a pas besoin d'un runtime async complet pour lire de
 
 **Pourquoi réécrire HTTP ?**
 Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE mono-événement. Pas de chunked entrant, pas de TLS, pas de compression. Ce choix est **tranché par les tests** : le bench maison contre le backend alternatif testé (tiny_http) montre la route maison ~1,85× plus rapide en keep-alive et 0 dépendance de plus (voir [Benchmarks](#benchmarks)) — et elle embarque son durcissement (timeouts, limites d'en-têtes, `Expect: 100-continue`).
+
+**Pourquoi pas de SSE longue durée ?**
+Le mode stateless n'a aucun flux ouvert : chaque POST est auto-suffisant (un événement `data:`, clôture). C'est ce choix qui immunise le transport contre le tamponnage des proxies de VPS et le rend trivial à déployer derrière nginx — voir [Hébergement VPS & proxies](#hébergement-vps--proxies-le-piège-du-tamponnage-sse). Un flux permanent (progress, notifications serveur→client) exigerait des sessions : hors périmètre, réévalué si un besoin concret l'exige.
 
 **Comment sont choisies les versions ?**
 Pacement volontaire : toute modification atterrit d'abord dans la section `[Unreleased]` du [CHANGELOG](CHANGELOG.md) ; une version n'est coupée que pour un lot cohérent (fonction, correctif, doc majeure). Le `0.x` court jusqu'à la conformance officielle MCP verte ; la mention « 1.0 » attend ce jalon.
