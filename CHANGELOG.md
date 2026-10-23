@@ -25,7 +25,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
   - réutilisation : **2000/2000** vs 0/2000 — ViteMCP répond en SSE encadré maintenu ouvert, le client doit rouvrir une connexion par appel séquentiel ; litemcp délimite par `Content-Length` et clôt le flux ;
   - mémoire après 2 300 requêtes : **5,5 Mo** (0,9 Mo privé) vs ~417 Mo (chaîne de 3 processus Node : 47 + 63 + 306 Mo) — **~75× moins**.
 - Constat de fiabilité : `enableJsonResponse` est déclaré dans les types de `@vitemcp/server` mais sans implémentation dans le code — l'option est un no-op.
-- Banc reproduisible : `Desktop/vitemcp-bench` (serveur TS) + `Desktop/litemcp-it` (serveur démo Rust + client neutre).
+- Banc reproduisible, hors dépôt : un projet TypeScript (`@vitemcp/server` + tsx) d'un côté, le banc externe d'intégration de l'autre (serveur démo 4 outils + client de bench neutre `bench_remote`).
 
 ### Performance — lot « le plus léger, le plus rapide »
 
