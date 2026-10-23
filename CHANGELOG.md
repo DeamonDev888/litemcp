@@ -10,7 +10,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - **0.x** jusqu'à la conformance officielle MCP verte (suite 2026-07-28, mode serveur, 0 FAILURE) ; la mention **1.0** attend ce jalon.
 - Chaque version publiée est taguée `vX.Y.Z` sur le commit exact dont elle est issue (`.cargo_vcs_info.json` vérifié avant `cargo publish`).
 
-## [Unreleased]
+## [0.3.1] - 2026-10-22
 
 ### Ajout — point fort repris de ViteMCP
 
@@ -40,11 +40,19 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - **Mémoire de lecture par connexion divisée par deux** : buffer `BufReader` 4 Ko (1 Mio au plafond de 256 connexions) — un corps plus grand que la capacité est lu directement depuis la socket.
 - Bench `examples/bench_backends` : warmup déduit et percentiles **p50/p99** en plus de la moyenne — passes comparables d'une campagne à l'autre.
 - **Confirmation indépendante côté consommateur** : banc externe (`litemcp-it`, serveur démo de 4 outils important le crate depuis crates.io vs `path` local) — keep-alive 0,102–0,108 ms (0.3.0 publié) → **0,087–0,091 ms** (lot en cours), plages sans chevauchement, **~13 % plus rapide** sur ce serveur plus riche ; les 12 tests d'intégration du banc passent à l'identique dans les deux modes.
+- Docs : section « Pourquoi litemcp » réécrite (bibliothèque vs service expliqué simplement, cas d'usage introduits).
+
+### Tests
+
+- 70 tests au total (19 unitaires JSON-RPC/zod/protocol, 42 HTTP sur vraies sockets, 5 smoke, 4 doctests).
+
+## [Unreleased]
 
 ### Prévu (cible 0.4)
 
 - Macros `#[tool]` / `#[resource]` / `#[prompt]` dérivant le schéma du type Rust (workspace split `litemcp-macros`) — finira de supprimer la double déclaration schéma/struct.
 - Fuzz du parseur HTTP (proptest/corpus) et tests clients réels (MCP Inspector, Claude, Cursor).
+- `outputSchema` (validation de la sortie structurée avant envoi — point fort ViteMCP à reprendre).
 - Ressources et prompts dans le noyau (aujourd'hui : `tools` seulement).
 - Mesures SLO Linux (`VmRSS`, démarrage in-process) et publication des conditions figées.
 
@@ -152,7 +160,8 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - GitHub : dépôt [DeamonDev888/litemcp](https://github.com/DeamonDev888/litemcp), tag `v0.1.0`, release, CI verte (fmt / clippy / test / doc).
 - Token API crates.io stocké dans `~/.cargo/credentials.toml` (hors repo), garde `.cargo/` au `.gitignore`.
 
-[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/DeamonDev888/litemcp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/DeamonDev888/litemcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/DeamonDev888/litemcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/DeamonDev888/litemcp/releases/tag/v0.1.0
