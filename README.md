@@ -236,12 +236,6 @@ Détail complet (plages, passes alternées) :
 
 L'écart structurel : litemcp délimite ses réponses par `Content-Length` et clôt le flux après l'événement — la connexion TCP reste proprement réutilisable ; ViteMCP répond en **SSE encadré** qu'il maintient ouvert, le client doit donc rouvrir une connexion par appel séquentiel. (Conditions : tsx/Node 24 côté TS ; les deux serveurs complétaient les mêmes requêtes JSON-RPC.)
 
-**Points forts de ViteMCP** — bilan :
-
-- **Adopté** : sonde `GET /health` (`200` « ok », compatible keep-alive) ;
-- **Candidat 0.4** : `outputSchema` (validation de la sortie structurée) ;
-- **Écartés volontairement** (hors périmètre minimaliste, réévalués si besoin) : OAuth 2.1 intégré, OpenAPI→outils, routes HTTP personnalisées, edge runtime, CLI dev/inspect, élaboration/sampling bidirectionnels.
-
 ## Hébergement VPS & proxies (le piège du tamponnage SSE)
 
 Derrière beaucoup d'hébergements, un proxy (nginx, Cloudflare…) met les réponses en tampon et n'envoie les flux SSE que lorsqu'il a accumulé ~8 Ko — les événements « s'empilent ». Deux lignes de défense :
