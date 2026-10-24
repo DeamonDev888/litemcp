@@ -3,7 +3,7 @@ members = [".", "litemcp-macros"]
 
 [package]
 name = "litemcp"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.85"
 description = "La lib MCP (Model Context Protocol) la plus légère pour Rust : votre serveur MCP en quelques lignes. Streamable HTTP stateless uniquement (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement."
@@ -23,7 +23,7 @@ macros = ["dep:litemcp-macros"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-litemcp-macros = { path = "litemcp-macros", version = "0.1.0", optional = true }
+litemcp-macros = { path = "litemcp-macros", version = "0.2.0", optional = true }
 
 [dev-dependencies]
 # Fuzz du transport HTTP (tests/fuzz_http.rs) — dev uniquement, le cœur du

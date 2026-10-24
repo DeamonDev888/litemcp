@@ -60,6 +60,12 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
+### Prévu (suite)
+
+- Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur.
+
+## [0.4.1] - 2026-10-24
+
 ### Ajout — suite de la feuille de route
 
 - **Macros `#[resource]` et `#[prompt]`** (feature `macros`) : même mécanique de dérivation que `#[tool]`. `#[resource]` prend une fonction sans paramètre (attributs `uri` requise, `name`, `description` requise) et génère l'enregistrement `.resource(…)` ; `#[prompt]` dérive le schéma des types des paramètres et valide les `arguments` d'un `prompts/get` **avant** l'exécution du handler.
@@ -82,10 +88,6 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 - Workflow : groupe `concurrency` (les runs supplantés d'une même branche/PR sont annulés) ; les jobs `test`/`msrv`/`advisories` se déclenchent automatiquement sur **tout push et toute pull request**.
 - Protection de branche `main` : les trois checks CI sont **requis**, une **approbation** est exigée avant merge (reviews périmées rejetées sur nouveau push), histoire linéaire requise — les admins conservent l'accès direct.
-
-### Prévu (suite)
-
-- Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur.
 
 ## [0.4.0] - 2026-10-24
 
@@ -260,7 +262,8 @@ Audit statique (code intégral) + revue indépendante croisée + **vérification
 - GitHub : dépôt [DeamonDev888/litemcp](https://github.com/DeamonDev888/litemcp), tag `v0.1.0`, release, CI verte (fmt / clippy / test / doc).
 - Token API crates.io stocké dans `~/.cargo/credentials.toml` (hors repo), garde `.cargo/` au `.gitignore`.
 
-[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/DeamonDev888/litemcp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/DeamonDev888/litemcp/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/DeamonDev888/litemcp/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/DeamonDev888/litemcp/compare/v0.3.1...v0.3.2
