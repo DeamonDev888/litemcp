@@ -59,12 +59,12 @@ Rust natif (détection multi-machines par scan et SSH, boutique, démarrage auto
 
 ```toml
 [dependencies]
-litemcp = "0.4"
+litemcp = "0.5"
 
 # pour la macro #[tool] (deps de compilation seulement) :
-# litemcp = { version = "0.4", features = ["macros"] }
+# litemcp = { version = "0.5", features = ["macros"] }
 # pour l'adaptateur schemars (#[derive(JsonSchema)] en schéma exécuteur) :
-# litemcp = { version = "0.4", features = ["schemars"] }
+# litemcp = { version = "0.5", features = ["schemars"] }
 ```
 
 Ou directement depuis GitHub :
