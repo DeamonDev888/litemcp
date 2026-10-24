@@ -58,6 +58,30 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 - 72 tests au total (19 unitaires JSON-RPC/zod/protocol, 44 HTTP sur vraies sockets, 5 smoke, 4 doctests).
 
+## [0.5.1] - 2026-10-24
+
+### Correctifs — audit complet 2026-10-24
+
+- **`outputSchema` réellement atteignable** (P2, conformité MCP) : l'enveloppe invariante `{ "result": … }` rendait le `structuredContent` **non conforme au schéma publié** dès que le schéma n'était pas un objet — un `outputSchema` scalaire ou tableau ne pouvait donc **jamais** réussir (l'outil renvoyait toujours `isError`). Le noyau choisit désormais la forme selon le schéma publié : objet → valeur brute ou enveloppe ; racine non-objet → valeur brute (la spec `2026-07-28` / SEP-2106 autorise toute valeur JSON dans `structuredContent`). **Comportement observable modifié** : un outil à `outputSchema` scalaire/tableau reçoit maintenant `structuredContent: 42` au lieu de `{"result": 42}` ;
+- **`format` appliqué par l'adaptateur `schemars`** (P2, promesse « schéma exécuteur ») : `format` est une simple annotation en JSON Schema 2020-12 — le validateur l'**ignorait**, donc un `format: "email"` publié par `schemars` n'était **jamais vérifié**. Le validateur est désormais compilé avec `should_validate_formats(true)` : `email`, `uuid`, `date-time`, `uri`… sont appliqués comme dans le module `zod` ;
+- **Ré-enregistrement d'un outil ne perd plus ses métadonnées** (P3) : `.tool("x", …).tool("x", …)` effaçait silencieusement l'`outputSchema` et les annotations déjà déclarés — le `tools/list` publié ne décrivait alors plus l'outil réellement servi. Les déclarations en attente **et** celles de l'outil précédent sont désormais conservées ;
+- **Notifications d'action refusées explicitement** (P3, écart JSON-RPC 2.0 §4) : une notification `tools/call` / `resources/read` / `prompts/get` (sans `id`) ne peut **pas** être traitée en mode stateless (le résultat serait invisible) — le noyau refuse désormais explicitement (`-32600`, « notification refusée : … ») au lieu du `202` silencieux qui laissait croire à une exécution. Les notifications de protocole (`notifications/*`) restent acceptées et ignorées (202 sans corps) ;
+- **`Box<S>` / `Arc<S>` / `&S` implémentent `Schema`** (API additive) : impossible de stocker des schémas **hétérogènes** sans wrapper manuel — `Box<dyn zod::Schema>` ne satisfait pas `S: Schema`. Les schémas dynamiques (issus d'une config, d'une base, d'un registre) sont désormais utilisables directement ;
+- **`CallToolResult::from_structured`** (API) : constructeur public pour un résultat de succès à partir d'un contenu structuré donné (le texte reflète la valeur réellement envoyée) ;
+- **Forme du `structuredContent` précalculée** (performance) : le schéma de sortie était re-sérialisé à **chaque** appel d'outil pour déterminer la forme de la sortie — le calcul est désormais fait **une fois** à l'enregistrement (`ToolDef::output_object_rooted`) ;
+- **Compte de tests du README** (P3) : « 109 tests » / « 134 tests » → **154** ;
+- **Chiffres du README re-mesurés pour 0.5.1** (P3) : la taille de binaire annoncée (385 Ko) et la latence ne correspondaient plus au code courant — remesuré sur la machine de release : binaire **minimal 148 Kio** (151 552 o), démo `hello` **596 Kio** (610 816 o), keep-alive **0,077–0,086 ms** (3 passes), p50 0,062–0,065 ms, connexions neuves **1 576–1 759 conn/s**, démarrage in-process **5,4 ms**. Les campagnes Linux du 2026-10-24 restent citées à part (serveur dédié) ;
+- **Exemple `curl` du README rendu exact** (P3) : la réponse montrait une forme abrégée (sans `resultType` ni `_meta`) — désormais identique à la sortie réelle ;
+- **Lien `docs/ROADMAP.md` pointé sur GitHub** (P3) : `docs/` est exclu du paquet crates.io (`exclude = [".github", "docs"]`) — le lien relatif était mort sur crates.io et docs.rs ;
+- **Command Center déplacé en fin de README** (P3) : c'est un **client** consommateur de la lib, pas un composant — la section le présentait au milieu du document, comme une intégration de la lib ;
+- **Suite de tests** : 10 tests de régression dédiés (`tests/audit_2026_10_24.rs`) couvrant les cinq correctifs ci-dessus.
+
+### Constatés documentés (choix assumés)
+
+- **`Content-Length` avec zéros initiaux** (`0002`) accepté (P3, conformité RFC 9112 §6.3 : la valeur est un entier, `0002` == 2) ; `+2` est refusé (`400`) ;
+- **Pas de plafond sur la taille d'une réponse** (Info) : une sortie d'outil de 4 Mio est servie en entier (`Content-Length` explicite, mémoire proportionnelle) — le plafond de 1 Mio porte sur le corps **de requête** ;
+- **`output_schema` exige un schéma `'static`** (Info) : un schéma construit à partir d'une configuration runtime (durée de vie courte) doit être possédé (`Box`/`Arc`) pour être attaché — les implémentations `Box`/`Arc`/`&S` facilitent cette possession.
+
 ## [Unreleased]
 
 ### Prévu (suite)
@@ -81,7 +105,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - **Feature opt-in `schemars`** : l'adaptateur `from_schemars::<T>()` rend n'importe quel type `#[derive(JsonSchema)]` utilisable partout où l'API attend `impl zod::Schema` — le schéma publié est celui de schemars, la validation applique **le même document** via le validateur `jsonschema` (erreurs mappées en issues bornées, chemins lisibles). Deux deps de plus (`schemars`, `jsonschema`), uniquement si activée ; le cœur reste à `serde` + `serde_json`.
 
 ### Documentation
-- Lien réciproque vers le [MCP Command Center](https://github.com/DeamonDev888/mcp-command-center) — client qui détecte les serveurs litemcp par fingerprint (badge dédié) — nouvelle section « Supervisé par MCP Command Center ».
+- Lien réciproque vers le [MCP Command Center](https://github.com/DeamonDev888/mcp-command-center) — client qui détecte les serveurs litemcp par fingerprint (badge dédié) — section « Client — MCP Command Center », **placée en fin de README** (c'est un client consommateur, pas un composant de la lib).
 
 ## [0.4.1] - 2026-10-24
 

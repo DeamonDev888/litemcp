@@ -42,6 +42,34 @@ pub mod method {
     pub const PROMPTS_GET: &str = "prompts/get";
 }
 
+/// Cette méthode **exécute du code côté serveur** (effet de bord ou
+/// accès à une ressource).
+///
+/// Une notification (requête sans `id`) sur une telle méthode est
+/// inexploitable : JSON-RPC 2.0 §4 impose de la traiter, mais le
+/// mode stateless de MCP ne peut **pas** en livrer le résultat au
+/// client (aucune réponse) — l'effet de bord serait invisible et
+/// invérifiable. Le noyau refuse donc explicitement ces
+/// notifications (`-32600`) : le client sait que **rien n'a été
+/// exécuté**.
+#[must_use]
+pub fn is_action(method: &str) -> bool {
+    matches!(
+        method,
+        method::TOOLS_CALL | method::RESOURCES_READ | method::PROMPTS_GET
+    )
+}
+
+/// Cette méthode est-elle une **notification de protocole** ?
+///
+/// Les notifications `notifications/*` (`initialized`, `cancelled`,
+/// `progress`…) sont des messages de contrôle : le serveur n'a rien à
+/// en faire en mode stateless — il les accepte et les ignore.
+#[must_use]
+pub fn is_protocol_notification(method: &str) -> bool {
+    method.starts_with("notifications/")
+}
+
 /// Type de résultat — champ **obligatoire** dans chaque `result` (SEP-2322).
 ///
 /// * `"complete"` : résultat ordinaire, terminal ;
@@ -190,11 +218,46 @@ pub struct CallToolResult {
     pub content: Vec<TextContent>,
     #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
+    /// Contenu structuré du résultat — la valeur **exactement** envoyée.
+    ///
+    /// forme : objet JSON (invariant de l'API) — sauf quand l'outil porte
+    /// un `outputSchema` de racine non-objet : la valeur brute est alors
+    /// envoyée (la spec `2026-07-28` / SEP-2106 autorise toute valeur JSON
+    /// dans `structuredContent`, et l'enveloppe `{ "result": … }` serait
+    /// elle-même non conforme au schéma publié).
     #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
     /// Identité du serveur (SEP-2575 : SHOULD dans chaque résultat).
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+}
+
+impl CallToolResult {
+    /// Construit un résultat de **succès** à partir du contenu structuré
+    /// tel qu'il sera **effectivement envoyé**.
+    ///
+    /// Le contenu texte reflète la sérialisation exacte du
+    /// `structuredContent` (compatibilité : un client qui ne lit que le
+    /// texte voit la même valeur que celui qui lit le contenu structuré).
+    ///
+    /// Le `structuredContent` doit **conformer** au `outputSchema` publié
+    /// (spec MCP `2026-07-28` : « Servers **MUST** provide structured
+    /// results that conform to this schema ») — c'est au noyau
+    /// ([`crate::server::ServerCore`]) que la forme est choisie, en
+    /// fonction du schéma publié.
+    #[must_use]
+    pub fn from_structured(structured: Value) -> Self {
+        Self {
+            result_type: ResultType::Complete,
+            content: vec![TextContent {
+                kind: "text",
+                text: structured.to_string(),
+            }],
+            is_error: None,
+            structured_content: Some(structured),
+            meta: None,
+        }
+    }
 }
 
 impl From<Result<Value, String>> for CallToolResult {
@@ -207,21 +270,19 @@ impl From<Result<Value, String>> for CallToolResult {
                 // simple pour les clients : toute valeur non-objet est
                 // enveloppée dans `{ "result": … }`, et le contenu texte
                 // reflète la valeur structurée réellement envoyée.
+                //
+                // **Exception** : quand un `outputSchema` de racine
+                // non-objet est attaché à l'outil, l'enveloppe serait
+                // elle-même non conforme au schéma publié — le noyau
+                // ([`crate::server::ServerCore`]) construit alors le
+                // résultat par [`CallToolResult::from_structured`] avec la
+                // valeur brute.
                 let structured = if value.is_object() {
                     value
                 } else {
                     serde_json::json!({ "result": value })
                 };
-                Self {
-                    result_type: ResultType::Complete,
-                    content: vec![TextContent {
-                        kind: "text",
-                        text: structured.to_string(),
-                    }],
-                    is_error: None,
-                    structured_content: Some(structured),
-                    meta: None,
-                }
+                Self::from_structured(structured)
             }
             Err(message) => Self {
                 result_type: ResultType::Complete,

@@ -165,6 +165,43 @@ pub trait Schema: Send + Sync {
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues);
 }
 
+/// Un schéma encapsulé (`Box`, `Arc`) est un schéma.
+///
+/// Sans ces implémentations, impossible de stocker des schémas
+/// **hétérogènes** (usage dynamique : schémas issus d'une configuration,
+/// d'une base, d'un registre…) — `Box<dyn Schema>` ne satisfait pas
+/// `S: Schema` et il fallait un wrapper manuel.
+impl<S: Schema + ?Sized> Schema for Box<S> {
+    fn json(&self) -> Value {
+        (**self).json()
+    }
+    fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
+        (**self).validate(path, value, issues);
+    }
+}
+
+/// Idem [`Box`] — un schéma partagé (`Arc<dyn Schema>`) reste un schéma.
+impl<S: Schema + ?Sized> Schema for Arc<S> {
+    fn json(&self) -> Value {
+        (**self).json()
+    }
+    fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
+        (**self).validate(path, value, issues);
+    }
+}
+
+/// Une **référence** vers un schéma est un schéma — indispensable pour
+/// passer `&dyn Schema` aux API qui attendent `impl Schema` sans
+/// consommer le schéma.
+impl<S: Schema + ?Sized> Schema for &S {
+    fn json(&self) -> Value {
+        (**self).json()
+    }
+    fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
+        (**self).validate(path, value, issues);
+    }
+}
+
 /// Vérifie un couple de bornes cohérent — erreur de programmation, panique
 /// au démarrage (même contrat que le doublon de champ) : un schéma
 /// insatisfaisable (`min > max`) serait publié en silence et toute valeur

@@ -16,7 +16,7 @@ const N_KEEPALIVE: usize = 2_000;
 const N_FRESH: usize = 300;
 
 fn build() -> ServerBuilder {
-    ServerBuilder::new("bench", "0.3.0").tool("add", "Additionne deux entiers", |args| {
+    ServerBuilder::new("bench", "0.5.1").tool("add", "Additionne deux entiers", |args| {
         let a = args["a"].as_i64().unwrap_or(0);
         let b = args["b"].as_i64().unwrap_or(0);
         Ok(serde_json::json!({ "somme": a + b }))

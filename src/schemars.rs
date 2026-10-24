@@ -13,6 +13,10 @@
 //!   [`jsonschema`](https://crates.io/crates/jsonschema) et appliqué avant
 //!   l'exécution du handler — hors schéma → `-32602` avec les problèmes
 //!   dans `error.data.issues`, bornés par [`crate::zod::MAX_ISSUES`].
+//!   Les `format` (`email`, `uuid`, `date-time`, `uri`…) sont **appliqués**
+//!   (le validateur est compilé avec `should_validate_formats(true)` — par
+//!   défaut `format` n'est qu'une annotation JSON Schema 2020-12 et
+//!   serait ignoré).
 //!
 //! La promesse tient donc aussi ici : ce qui est publié est exactement ce
 //! qui est validé. Notez que les **sémantiques** sont celles de JSON Schema
@@ -58,8 +62,11 @@ pub struct FromSchemars<T: ?Sized> {
     _type: PhantomData<fn() -> T>,
     /// Schéma JSON dérivé par schemars — calculé une fois.
     document: OnceLock<Value>,
-    /// Validateur compilé depuis le même document — calculé une fois.
-    validator: OnceLock<Validator>,
+    /// Validateur compilé **avec les `format` activés** — calculé une fois.
+    /// `format` est une annotation en JSON Schema 2020-12 : sans
+    /// activation explicite, le validateur l'ignore et le schéma
+    /// publié ne serait pas appliqué (promesse « exécuteur » rompue).
+    validator_with_formats: OnceLock<Validator>,
 }
 
 /// Validateur compilé — ou le diagnostic d'échec de compilation (un schéma
@@ -88,7 +95,7 @@ impl<T: ::schemars::JsonSchema + 'static> FromSchemars<T> {
         Self {
             _type: PhantomData,
             document: OnceLock::new(),
-            validator: OnceLock::new(),
+            validator_with_formats: OnceLock::new(),
         }
     }
 
@@ -99,12 +106,32 @@ impl<T: ::schemars::JsonSchema + 'static> FromSchemars<T> {
         })
     }
 
-    fn validator(&self) -> &Validator {
-        self.validator
-            .get_or_init(|| match ::jsonschema::validator_for(self.document()) {
+    /// Recompile le validateur avec l'**activation des `format`**.
+    ///
+    /// Par défaut, `jsonschema` **ignore** les `format` (annotation
+    /// JSON Schema 2020-12) : un `format: "email"` publié par `schemars`
+    /// serait donc publié mais **jamais appliqué** — le schéma cesserait
+    /// d'être exécuteur, contrairement à la promesse de litemcp et du
+    /// module [`crate::zod`] (où `.email()` publie **et** applique).
+    ///
+    /// `should_validate_formats(true)` rend le validateur conforme au
+    /// mot-clé : `email`, `uuid`, `date-time`, `uri`… sont alors vérifiés
+    /// comme ils le sont dans [`crate::zod`].
+    ///
+    /// Les `format` **inconnus** restent ignorés (`should_ignore_unknown_formats`
+    /// par défaut à `true`) : un format exotique ne rend pas un schéma
+    /// inutilisable, il est simplement non vérifié.
+    fn validator_with_formats(&self) -> &Validator {
+        self.validator_with_formats.get_or_init(|| {
+            let document = self.document();
+            match ::jsonschema::options()
+                .should_validate_formats(true)
+                .build(document)
+            {
                 Ok(validator) => Validator::Compiled(validator),
                 Err(error) => Validator::Broken(error.to_string()),
-            })
+            }
+        })
     }
 }
 
@@ -120,7 +147,12 @@ impl<T: ::schemars::JsonSchema + 'static> Schema for FromSchemars<T> {
     }
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
-        match self.validator() {
+        // Le validateur **avec `format` activé** : la promesse de litemcp
+        // est que le schéma publié est exécuté — or `format` est une
+        // simple annotation en JSON Schema 2020-12, ignorée par défaut
+        // par le validateur. Sans cette activation, un `format: "email"`
+        // serait publié mais jamais appliqué (le schéma mentirait).
+        match self.validator_with_formats() {
             Validator::Broken(message) => issues.push(format!(
                 "`{}` : schéma interne incompilable ({message})",
                 path.as_str()

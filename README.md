@@ -6,11 +6,11 @@
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.5.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.5.1%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
 ![crates.io](https://img.shields.io/crates/v/litemcp.svg) ![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI) ![Docs](https://img.shields.io/docsrs/litemcp)
 
-[Installation](#installation) · [Démarrage rapide](#démarrage-rapide) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/) · [Concepts](#concepts) · [Configuration](#configuration) · [Sécurité](#sécurité) · [Protocole](#protocole) · [FAQ](#faq)
+[Installation](#installation) · [Démarrage rapide](#démarrage-rapide) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/) · [Concepts](#concepts) · [Configuration](#configuration) · [Sécurité](#sécurité) · [Protocole](#protocole) · [FAQ](#faq) · [Client](#client--mcp-command-center)
 
 </div>
 
@@ -30,15 +30,15 @@ La plupart des serveurs MCP sont des **services** : un programme qui s'installe,
 Les principes :
 
 1. **Streamable HTTP uniquement.** Un seul transport : un socket TCP bindé ; chaque message est un `POST /mcp` auto-suffisant, la réponse arrive en `application/json` ou en flux SSE (`text/event-stream`, request-scoped). Pas de session, pas d'`initialize` obligatoire, pas de flux permanent. C'est la spec 2026-07-28, à la lettre.
-2. **Zéro runtime async au cœur.** `std::net::TcpListener`, un thread par connexion. Un adaptateur tokio existera un jour — en feature optionnelle, jamais par défaut.
-3. **Deux dépendances, pas une de plus.** `serde` et `serde_json` — la dérivation JSON Schema et la validation sont faites maison, dans le module [`zod`](#outils--schémas-à-la-zod).
-4. **Mesuré ou rien.** Chaque release publie RSS, taille de binaire et latence p99. Jamais d'adjectif sans chiffre.
+2. **Zéro runtime async au cœur.** `std::net::TcpListener`, un thread par connexion. Aucun adaptateur tokio n'est prévu : le périmètre de la lib est volontairement minimal.
+3. **Deux dépendances, pas une de plus.** `serde` et `serde_json` — la dérivation JSON Schema et la validation sont faites maison, dans le module [`zod`](#outils--schémas-à-la-zod). Les features `macros` et `schemars` en ajoutent d'autres, mais **uniquement** si vous les activez.
+4. **Mesuré ou rien.** Chaque release publie taille de binaire, latence et mémoire, avec les conditions de mesure. Jamais d'adjectif sans chiffre.
 
 ## Fonctions phares
 
 | | |
 |---|---|
-| ⚡ **Minuscule** | 2 dépendances, binaire minimal, démarrage instantané |
+| ⚡ **Minuscule** | 2 dépendances, binaire minimal **148 Kio** (mesuré, release strippé), démarrage en quelques ms |
 | 🚀 **Sans runtime** | threads `std`, un par connexion — pas de tokio au cœur |
 | 🧩 **Schémas à la Zod** | `inputSchema` dérivé du schéma, publié dans `tools/list` ; `outputSchema` **exécuteur** (sortie validée avant envoi) |
 | ✅ **Validation avant exécution** | un appel hors schéma ne touche jamais votre handler |
@@ -48,23 +48,16 @@ Les principes :
 | 🛑 **Arrêt propre** | `bound.handle()` puis `handle.shutdown()` : `serve()` rend `Ok(())`, les connexions ferment entre deux requêtes |
 | 🛡️ **Sûr par défaut** | `#![forbid(unsafe_code)]`, garde DNS-rebinding, corps limité |
 
-## Supervisé par MCP Command Center
-
-Le [**MCP Command Center**](https://github.com/DeamonDev888/mcp-command-center) — superviseur de serveurs MCP en
-Rust natif (détection multi-machines par scan et SSH, boutique, démarrage auto) — reconnaît les serveurs litemcp
-**par fingerprint** : `initialize` répondu en 2026-07-28 sans négocier la version demandée + sonde `GET /health`
-« ok ». Il affiche alors un badge dédié et supervise vos serveurs (état, tools, latence) sans rien ajouter à la lib.
-
 ## Installation
 
 ```toml
 [dependencies]
-litemcp = "0.5"
+litemcp = "0.5.1"
 
 # pour la macro #[tool] (deps de compilation seulement) :
-# litemcp = { version = "0.5", features = ["macros"] }
+# litemcp = { version = "0.5.1", features = ["macros"] }
 # pour l'adaptateur schemars (#[derive(JsonSchema)] en schéma exécuteur) :
-# litemcp = { version = "0.5", features = ["schemars"] }
+# litemcp = { version = "0.5.1", features = ["schemars"] }
 ```
 
 Ou directement depuis GitHub :
@@ -105,7 +98,7 @@ curl -s http://127.0.0.1:8080/mcp \
 ```
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"somme\":12}"}],"structuredContent":{"somme":12}}}
+{"jsonrpc":"2.0","id":1,"result":{"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"calc","version":"1.0.0"}},"content":[{"text":"{\"somme\":12}","type":"text"}],"resultType":"complete","structuredContent":{"somme":12}}}
 ```
 
 Ou avec MCP Inspector en mode URL : `npx @modelcontextprotocol/inspector` → `http://127.0.0.1:8080/mcp`.
@@ -154,6 +147,8 @@ Trois registres, du plus direct au plus confortable :
 | `tool_parse` | struct `Deserialize` | dérivé du schéma | automatique |
 
 Schémas disponibles : `object().field(..)/.opt(..)/.strict()`, `string().min/.max` **et formats exécutés** `.email()/.uuid()/.url()/.datetime()`, `integer().min/.max`, `number().min/.max`, `boolean()`, `enumeration(&[..])`, `array(s).min/.max`, plus `nullable(schéma)` (accepte `null`, publié `anyOf`) et `describe("…", schéma)` (description publiée). Les contraintes deviennent `minLength`/`maxLength`/`minimum`/`maximum`/`minItems`/`maxItems`/`enum`/`format` dans le JSON Schema publié à `tools/list` — **appliquées** à l'identique par la validation. Des bornes incohérentes (`min > max`), non finies (`NaN`/±∞) ou une `enumeration` vide/doublonnée paniquent au démarrage (erreur de programmation, jamais publiées).
+
+`Box<S>`, `Arc<S>` et `&S` implémentent `Schema` : un **registre de schémas hétérogènes** (issus d'une config, d'une base, d'un registre dynamique) s'utilise directement, sans wrapper manuel.
 
 ### Macros `#[tool]` · `#[resource]` · `#[prompt]` (feature `macros`)
 
@@ -211,7 +206,7 @@ ServerBuilder::new("recherche", "1.0.0")
     .serve()?;
 ```
 
-Utilisable partout où l'API attend `impl zod::Schema` (`tool_typed`, `tool_parse`, `prompt_typed`, `output_schema`). Sémantiques JSON Schema de bout en bout (le validateur officiel accepte par ex. `3.0` pour `integer` — pour la garantie `as_i64()` stricte, restez sur `zod::integer()`). Deux deps de plus, uniquement si la feature est activée.
+Utilisable partout où l'API attend `impl zod::Schema` (`tool_typed`, `tool_parse`, `prompt_typed`, `output_schema`). Sémantiques JSON Schema de bout en bout (le validateur officiel accepte par ex. `3.0` pour `integer` — pour la garantie `as_i64()` stricte, restez sur `zod::integer()`). Les `format` (`email`, `uuid`, `date-time`, `uri`…) sont **appliqués**, comme dans `zod`. Deux deps de plus, uniquement si la feature est activée.
 
 ### Resources & Prompts
 
@@ -248,7 +243,7 @@ Métadonnées de la spec 2026-07-28, publiées dans `tools/list` : `.title()`, `
 - **Erreur d'outil** (le handler a tourné et a échoué) → `CallToolResult::isError` — le client affiche le message ;
 - **Erreur de protocole** (mauvaise requête, outil inconnu, JSON invalide) → erreur JSON-RPC typée (-32700, -32602, -32601…), rendue de façon opaque.
 
-La valeur de retour d'un outil devient `structuredContent` — les objets JSON passent tels quels, toute autre valeur (scalaire, tableau, `null`) est enveloppée dans `{"result": …}` (**choix d'API** : `structuredContent` toujours objet, contrat simple pour les clients) ; une `Err(msg)` devient `isError: true` avec le message en contenu texte. Un `outputSchema` attaché via `.output_schema("outil", schéma)` valide cette sortie **avant envoi** : non conforme → résultat `isError`.
+La valeur de retour d'un outil devient `structuredContent` — un objet JSON passe tel quel ; toute autre valeur (scalaire, tableau, `null`) est enveloppée dans `{"result": …}` (**choix d'API** : `structuredContent` toujours objet, contrat simple pour les clients) — **sauf** si un `outputSchema` de racine non-objet est attaché à l'outil : la valeur brute est alors envoyée telle quelle (la spec MCP 2026-07-28 autorise toute valeur JSON dans `structuredContent`, et l'enveloppe serait elle-même non conforme au schéma publié). Une `Err(msg)` devient `isError: true` avec le message en contenu texte. Un `outputSchema` attaché via `.output_schema("outil", schéma)` valide cette sortie **avant envoi** : non conforme → résultat `isError`.
 
 ## Configuration
 
@@ -284,7 +279,8 @@ Le durcissement transport est intégré et vérifié par la suite de tests : lim
 |---|---|
 | `POST /mcp` valide | `200 application/json` — réponse JSON-RPC |
 | `POST` avec `Accept: text/event-stream` seul | `200 text/event-stream` — un événement `data:` (SSE request-scoped) + en-têtes anti-tampon |
-| Notification (sans `id`) | `202 Accepted` sans corps |
+| Notification de protocole (`notifications/*`, sans `id`) | `202 Accepted` sans corps (acceptée et ignorée) |
+| Notification d'action (`tools/call`, `resources/read`, `prompts/get` sans `id`) | `-32600` **« notification refusée »** — le mode stateless ne peut pas livrer le résultat : le handler **ne tourne pas** et le client le sait |
 | `server/discover` (SEP-2575) | `200` — versions supportées, capacités, `serverInfo` dans `_meta` |
 | Version de protocole dans `_meta` | `2026-07-28` acceptée · version inconnue : `-32022` (`UnsupportedProtocolVersionError`) · **absence tolérée** (compatibilité `2025-11-25`) |
 | `resultType` (SEP-2322) | présent dans **chaque** résultat (`"complete"`) |
@@ -309,9 +305,33 @@ Le durcissement transport est intégré et vérifié par la suite de tests : lim
 
 ## Benchmarks
 
-> Règle du projet : **jamais d'adjectif sans chiffre.** Deux campagnes mesurées et figées (Windows 11 et Ubuntu 26.04, release, loopback) — republiées à chaque release.
+> Règle du projet : **jamais d'adjectif sans chiffre.** Toute mesure est
+> reproductible via `cargo run --release --example bench_backends` et
+> `cargo run --release --example slo` (release, loopback).
 
-**Route maison vs backend alternatif `tiny_http`** (bench A/B exécuté le 2026-10-22, `examples/bench_backends`) :
+### Mesures 0.5.1 — Windows 11 (rustc 1.99.1, release LTO fat/strip, loopback)
+
+Trois passes consécutives, même machine, même session :
+
+| Métrique | Valeur | Détail |
+|---|---|---|
+| `tools/call` keep-alive (moyenne) | **0,077–0,086 ms/req** | 2 000 appels, warmup 200 déduit |
+| p50 / p99 keep-alive | 0,062–0,065 / **0,297–0,442 ms** | 2 000 appels |
+| Connexions neuves | **1 576–1 759 conn/s** | 300 connexions |
+| Binaire release strippé — **minimal** (1 outil) | **148 Kio** (151 552 o) | LTO fat + `codegen-units = 1` |
+| Binaire release strippé — **démo `hello`** (3 registres + annotations) | **596 Kio** (610 816 o) | idem |
+| Démarrage in-process (bind + 1ʳᵉ réponse) | **5,4 ms** | `examples/slo` |
+| Mémoire après 2 300 requêtes | n/a hors Linux | `VmRSS` via `/proc/self/status` |
+
+> Le p99 de 0,3–0,44 ms reflète les micro-pics du scheduler Windows en
+> environnement bureautique ; les campagnes Linux du 2026-10-24 (0,031–0,033 ms
+> en moyenne, p99 0,048–0,065 ms) restent la référence pour un serveur
+> dédié — voir la [feuille de route](https://github.com/DeamonDev888/litemcp/blob/main/docs/ROADMAP.md) pour le détail des conditions figées.
+
+### Décisions prises sur mesures
+
+**Route maison vs backend alternatif `tiny_http`** (bench A/B du 2026-10-22,
+`examples/bench_backends`) :
 
 | Métrique | Route maison | tiny_http | Verdict |
 |---|---|---|---|
@@ -322,36 +342,32 @@ Le durcissement transport est intégré et vérifié par la suite de tests : lim
 
 **Décision tranchée par les chiffres** : la route maison reste le seul backend — plus rapide en régime keep-alive (le cas d'un agent qui parle à ses serveurs), plus légère en deps et en binaire. Le backend alternatif a été **retiré du dépôt** : le crate garde exactement deux dépendances (`serde`, `serde_json`).
 
-**Optimisations « léger & rapide »** (A/B dos à dos, même machine et même session, `examples/bench_backends`) :
+**Optimisations « léger & rapide »** (A/B dos à dos, même machine et même session) :
 
-| Métrique | 0.3.0 | Lot perf en cours | Verdict |
+| Métrique | 0.3.0 | Après optimisation | Verdict |
 |---|---|---|---|
 | `tools/call` keep-alive (moyenne) | 0,097–0,111 ms | **0,065–0,070 ms** | **~35 % plus rapide** |
 | p50 / p99 keep-alive | 0,085–0,112 / 0,157–0,166 ms | **0,061 / 0,095–0,123 ms** | plus serré |
-| Binaire release stripped (hello) | 483 Ko | **385 Ko** | **−18,5 %** (LTO fat + `codegen-units = 1`) |
 | Mémoire de lecture par connexion | 8 Ko | **4 Ko** | 1 Mio au plafond de 256 connexions |
 
 Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** par réponse — avant : deux syscalls, deux paquets avec nodelay), parsing d'en-têtes **zéro allocation** (`Origin`/`Host`/`Accept`/`Connection` réduits à des verdicts, sans chaînes ni `Vec`), buffers de lecture réutilisés sur toute la connexion keep-alive, **zéro clone des arguments** dans le dispatch (`params` déplacé hors du JSON parsé, handler et validation travaillent par référence), `route`/`allow_origins` partagés par `Arc`. Dépendances inchangées : toujours exactement deux (`serde`, `serde_json`).
 
-**SLO — deux campagnes, conditions figées :**
+### SLO — cibles et campagnes figées
 
-- **Windows 11** (release, loopback, build `x86_64-pc-windows-msvc`).
-- **Linux** (Ubuntu 26.04 LTS, kernel 7.0.0-38-generic, 8 cœurs, 15 Gio, rustc 1.99.1, release LTO fat/strip, loopback — campagnes du 2026-10-24, reproductibles via `cargo run --release --example bench_backends` et `cargo run --release --example slo`).
+| Métrique | Cible | Linux (Ubuntu 26.04, 2026-10-24) |
+|---|---|---|
+| Binaire release stripped | < 1,5 Mo | **687 Ko** ✅ |
+| `tools/call` keep-alive (moyenne) | < 1 ms | **0,031–0,033 ms** ✅ |
+| p99 keep-alive | < 2 ms | **0,048–0,065 ms** ✅ |
+| Connexions neuves | — | **4 400–5 041 conn/s** |
+| Mémoire après 2 300 requêtes | < 10 Mo | **2,7 Mio `VmRSS`, +4 Kio pendant la charge** ✅ |
+| Démarrage in-process | < 10 ms | **~0,4 ms** ✅ |
 
-| Métrique | Cible | Windows 11 | Linux (Ubuntu 26.04) |
-|---|---|---|---|
-| Binaire release stripped (hello) | < 1,5 Mo | **385 Ko** ✅ | **687 Ko** ✅ |
-| `tools/call` keep-alive (moyenne) | < 1 ms | 0,065–0,070 ms ✅ | **0,031–0,033 ms** ✅ |
-| p99 keep-alive | < 2 ms | 0,095–0,123 ms ✅ | **0,048–0,065 ms** ✅ |
-| Connexions neuves | — | 848–1 257 conn/s | **4 400–5 041 conn/s** |
-| Mémoire après 2 300 requêtes (processus complet : serveur + client) | < 10 Mo | 5,5 Mo (WorkingSet, DLL partagées incluses) | **2,7 Mio `VmRSS`, +4 Kio pendant la charge** ✅ |
-| Démarrage in-process (bind + 1ʳᵉ réponse) | < 10 ms | ~130 ms via shell (spawn inclus) | **~0,4 ms** ✅ |
-
-`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **134 tests** (dont fuzz proptest) est vérifiée sur les deux OS.
+`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **154 tests** (dont fuzz proptest) est vérifiée sur les deux OS.
 
 ## Comparatif — ViteMCP (TypeScript)
 
-[`@vitemcp/server`](https://github.com/vitemcp/server) est le framework TS qui cible la **même spec** stateless 2026-07-28 — le comparatif naturel. Même serveur démo (4 outils identiques) des deux côtés, **un seul client de bench neutre** (Rust, `litemcp-it/examples/bench_remote`), Windows 11, loopback, passes alternées (2026-10-22).
+[`@vitemcp/server`](https://github.com/vitemcp/server) est le framework TS qui cible la **même spec** stateless 2026-07-28 — le comparatif naturel. Même serveur démo (4 outils identiques) des deux côtés, **un seul client de bench neutre** (Rust, `litemcp-it/examples/bench_remote`), Windows 11, loopback, passes alternées (campagne du 2026-10-22).
 
 **Résumé express :**
 
@@ -400,8 +416,9 @@ location /mcp {
 ## Tests
 
 ```bash
-cargo test                          # 109 tests : unitaires + intégration (vraies sockets) + doctests
-cargo clippy -- -D warnings         # CI stricte
+cargo test --workspace --all-features   # 154 tests : unitaires + intégration (vraies sockets) + doctests
+cargo clippy --workspace --all-targets --all-features -- -D warnings   # CI stricte
+cargo fmt --check                       # formatage
 ```
 
 ## Journal des versions
@@ -420,7 +437,7 @@ L'historique complet et détaillé vit dans [CHANGELOG.md](CHANGELOG.md) — sec
 | 5 | Publication crates.io | ✅ |
 | 6 | Conformance officielle + benchmarks → 1.0 | ⏳ |
 
-Le détail — jalons, SLO, risques, journal : [docs/ROADMAP.md](docs/ROADMAP.md). Pour apprendre la lib pas à pas : le [tutoriel officiel](https://deamondev888.github.io/litemcp-tuto/).
+Le détail — jalons, SLO, risques, journal : [docs/ROADMAP.md](https://github.com/DeamonDev888/litemcp/blob/main/docs/ROADMAP.md). Pour apprendre la lib pas à pas : le [tutoriel officiel](https://deamondev888.github.io/litemcp-tuto/).
 
 ## FAQ
 
@@ -434,7 +451,7 @@ Parce qu'un serveur lancé comme sous-processus d'un client meurt avec lui et n'
 Une lib MCP sans schéma n'est qu'un routeur JSON : les clients ont besoin de l'`inputSchema` pour présenter vos outils, et vos handlers ont besoin d'arguments garantis. Le module `zod` couvre les deux — dérivation JSON Schema + validation runtime — sans dépendance de plus : il pèse moins que les bibliothèques de schémas génériques qu'on embarquerait sinon.
 
 **Pourquoi pas de tokio ?**
-Une lib MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des requêtes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions — et l'adaptateur tokio restera disponible pour les autres cas.
+Une lib MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des requêtes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions (plafond par défaut : 256). Si votre application est déjà dans un runtime async, l'avez-vous simplement dans le même processus — litemcp reste un serveur réseau, appelable en HTTP.
 
 **Pourquoi réécrire HTTP ?**
 Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE mono-événement. Pas de chunked entrant, pas de TLS, pas de compression. Ce choix est **tranché par les tests** : le bench maison contre le backend alternatif testé (tiny_http) montre la route maison ~1,85× plus rapide en keep-alive et 0 dépendance de plus (voir [Benchmarks](#benchmarks)) — et elle embarque son durcissement (timeouts, limites d'en-têtes, `Expect: 100-continue`).
@@ -447,6 +464,17 @@ Le mode stateless n'a aucun flux ouvert : chaque POST est auto-suffisant (un év
 
 **Comment sont choisies les versions ?**
 Pacement volontaire : toute modification atterrit d'abord dans la section `[Unreleased]` du [CHANGELOG](CHANGELOG.md) ; une version n'est coupée que pour un lot cohérent (fonction, correctif, doc majeure). Le `0.x` court jusqu'à la conformance officielle MCP verte ; la mention « 1.0 » attend ce jalon.
+
+## Client — MCP Command Center
+
+Le [**MCP Command Center**](https://github.com/DeamonDev888/mcp-command-center) est un **client** : superviseur
+de serveurs MCP en Rust natif (détection multi-machines par scan et SSH, boutique, démarrage auto). Il reconnaît
+les serveurs litemcp **par fingerprint** — `initialize` répondu en 2026-07-28 sans négocier la version demandée
++ sonde `GET /health` « ok » — affiche alors un badge dédié et supervise vos serveurs (état, outils, latence).
+
+C'est un projet **sibling** : il consomme litemcp, il n'en fait pas partie. La lib n'ajoute **aucune** dépendance
+ni code pour cette intégration — la reconnaissance repose uniquement sur des comportements déjà publics
+(`initialize`, `/health`).
 
 ## Licence
 

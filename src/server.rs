@@ -98,8 +98,27 @@ struct ToolDef {
     description: Option<String>,
     schema: Option<Arc<dyn Schema>>,
     output_schema: Option<Arc<dyn Schema>>,
+    /// Le schéma de sortie attend-il un **objet** à la racine ?
+    ///
+    /// Calculé **une fois** à l'enregistrement : le savoir est ce qui
+    /// décide si le `structuredContent` est envoyé brut ou enveloppé
+    /// (`{ "result": … }`) — l'enveloppe doit rester conforme au schéma
+    /// publié (spec MCP `2026-07-28` : « Servers MUST provide structured
+    /// results that conform to this schema »).
+    output_object_rooted: bool,
     annotations: Option<ToolAnnotations>,
     f: Arc<ToolFn>,
+}
+
+impl ToolDef {
+    /// Recalcule [`Self::output_object_rooted`] après un changement de
+    /// `output_schema`.
+    fn sync_output_shape(&mut self) {
+        self.output_object_rooted = self
+            .output_schema
+            .as_ref()
+            .is_some_and(|schema| output_is_object_rooted(schema.as_ref()));
+    }
 }
 
 /// Définition d'une ressource (clé : `uri`).
@@ -197,6 +216,31 @@ impl ServerCore {
             }
         };
         if incoming.is_notification() {
+            // **Notification d'action** (`tools/call`, `resources/read`,
+            // `prompts/get` sans `id`) : JSON-RPC 2.0 §4 impose de traiter
+            // la notification, mais le mode stateless ne peut pas livrer
+            // le résultat (aucune réponse) — l'effet de bord serait
+            // invisible. Refus **explicite** (`-32600`) : le client sait
+            // que rien n'a été exécuté (un `202` silencieux le laisserait
+            // croire à une exécution).
+            if protocol::is_action(&incoming.method) {
+                return Some(
+                    Outgoing::failure(
+                        Value::Null,
+                        ErrorObject::new(
+                            ErrorObject::INVALID_REQUEST,
+                            format!(
+                                "notification refusée : `{}` exécute du code côté serveur — \
+                                 une requête (avec `id`) est requise pour obtenir le résultat",
+                                incoming.method
+                            ),
+                        ),
+                    )
+                    .to_vec(),
+                );
+            }
+            // Notification de protocole (`notifications/*`) : message de
+            // contrôle sans effet en mode stateless — acceptée et ignorée.
             return None;
         }
         // id réel, ou null explicite : les deux exigent une réponse ; l'id
@@ -674,25 +718,50 @@ impl ServerCore {
         };
         let mut result = match execution {
             Ok(value) => {
-                let mut call = CallToolResult::from(Ok::<Value, String>(value));
                 // `outputSchema` est exécuteur comme l'input : la valeur
                 // `structuredContent` réellement envoyée est validée avant
                 // de partir — non conforme → résultat `isError` (le handler
                 // a exécuté, c'est sa sortie qui viole le contrat publié).
-                if let (Some(output), Some(structured)) =
-                    (&tool.output_schema, &call.structured_content)
-                {
-                    let mut issues = Issues::new();
-                    let mut path = Path::root("output");
-                    output.validate(&mut path, structured, &mut issues);
-                    if !issues.is_empty() {
-                        let rendered = issues.render().join(" ; ");
-                        call = CallToolResult::from(Err::<Value, String>(format!(
-                            "sortie non conforme au outputSchema : {rendered}"
-                        )));
+                //
+                // **Forme de la sortie** : le `structuredContent` doit
+                // conformer au schéma **publié**. L'enveloppe
+                // `{ "result": … }` (choix d'API : `structuredContent`
+                // toujours objet) n'est applicable que si le schéma
+                // l'autorise — sinon elle.renderait *elle-même* non
+                // conforme et aucun outil à `outputSchema` de racine
+                // non-objet ne pourrait jamais réussir.
+                match &tool.output_schema {
+                    None => CallToolResult::from(Ok::<Value, String>(value)),
+                    Some(output) => {
+                        // Le schéma est-il d'objet à la racine ? Alors
+                        // l'enveloppe invariante est candidate ; sinon la
+                        // valeur brute est envoyée telle quelle (la spec
+                        // 2026-07-28 / SEP-2106 autorise toute valeur JSON
+                        // dans `structuredContent`).
+                        //
+                        // Le drapeau est **précalculé** à l'enregistrement
+                        // (`ToolDef::output_object_rooted`) : le schéma
+                        // n'est donc pas re-sérialisé à chaque appel.
+                        let structured = if tool.output_object_rooted && value.is_object() {
+                            value
+                        } else if tool.output_object_rooted {
+                            serde_json::json!({ "result": value })
+                        } else {
+                            value
+                        };
+                        let mut issues = Issues::new();
+                        let mut path = Path::root("output");
+                        output.validate(&mut path, &structured, &mut issues);
+                        if issues.is_empty() {
+                            CallToolResult::from_structured(structured)
+                        } else {
+                            let rendered = issues.render().join(" ; ");
+                            CallToolResult::from(Err::<Value, String>(format!(
+                                "sortie non conforme au outputSchema : {rendered}"
+                            )))
+                        }
                     }
                 }
-                call
             }
             Err(ToolFailure::Tool(message)) => CallToolResult::from(Err::<Value, String>(message)),
             Err(ToolFailure::Protocol(code, message)) => {
@@ -706,6 +775,28 @@ impl ServerCore {
             id.clone(),
             serde_json::to_value(result).unwrap_or(Value::Null),
         )
+    }
+}
+
+/// Le schéma de sortie est-il **d'objet à la racine** ?
+///
+/// Décrit le `structuredContent` publié : s'il attend un objet, l'enveloppe
+/// invariante `{ "result": … }` reste applicable ; s'il attend autre chose
+/// (un scalaire, un tableau, un `anyOf`), la valeur brute doit être
+/// envoyée telle quelle — l'enveloppe serait elle-même non conforme au
+/// schéma publié (la spec `2026-07-28` / SEP-2106 autorise toute valeur
+/// JSON dans `structuredContent`).
+fn output_is_object_rooted(schema: &dyn Schema) -> bool {
+    let json = schema.json();
+    let Some(object) = json.as_object() else {
+        return false;
+    };
+    match object.get("type") {
+        Some(Value::String(kind)) => kind == "object",
+        // Pas de `type` explicite : un objet reste le cas par défaut
+        // (convention JSON Schema pour un schéma de propriétés).
+        None => object.contains_key("properties") || object.contains_key("required"),
+        Some(_) => false,
     }
 }
 
@@ -841,11 +932,14 @@ impl ServerBuilder {
     /// Comme [`Self::annotate`], l'ordre d'appel n'a pas d'importance.
     #[must_use]
     pub fn output_schema<S: Schema + 'static>(mut self, tool: &str, schema: S) -> Self {
+        let schema = Arc::new(schema);
         if let Some(def) = self.tools.get_mut(tool) {
-            def.output_schema = Some(Arc::new(schema));
+            def.output_schema = Some(schema);
+            // La forme du `structuredContent` dépend du schéma de sortie :
+            // elle change avec lui.
+            def.sync_output_shape();
         } else {
-            self.output_schemas
-                .insert(tool.to_string(), Arc::new(schema));
+            self.output_schemas.insert(tool.to_string(), schema);
         }
         self
     }
@@ -929,28 +1023,54 @@ impl ServerBuilder {
         register(self)
     }
 
+    /// Récupère le schéma de sortie et les annotations d'un outil.
+    ///
+    /// Les déclarations **en attente** (`.output_schema()` / `.annotate()`
+    /// appelées avant l'enregistrement de l'outil) priment ; à défaut, ce
+    /// sont ceux de l'outil **déjà enregistré** qui sont repris.
+    ///
+    /// Sans cette conservation, un ré-enregistrement
+    /// (`.tool("x", …).tool("x", …)`) perdait silencieusement les
+    /// annotations et l'`outputSchema` déjà déclarés — le `tools/list`
+    /// publié ne décrivait alors plus l'outil réellement servi.
+    fn take_output_and_annotations(
+        &mut self,
+        name: &str,
+    ) -> (Option<Arc<dyn Schema>>, Option<ToolAnnotations>) {
+        let previous_output = self
+            .tools
+            .get(name)
+            .and_then(|def| def.output_schema.clone());
+        let previous_annotations = self.tools.get(name).and_then(|def| def.annotations.clone());
+        let output_schema = self.output_schemas.remove(name).or(previous_output);
+        let annotations = self.annotations.remove(name).or(previous_annotations);
+        (output_schema, annotations)
+    }
+
     /// Enregistre un outil.
     ///
     /// La closure reçoit `arguments` (objet JSON — un `arguments` non-objet
     /// est refusé en `-32602` avant tout appel du handler) et renvoie la
     /// valeur structurée, ou un message d'erreur lisible par le client.
-    /// Réenregistrer un nom existant remplace silencieusement l'outil
-    /// précédent (le dernier enregistré gagne).
+    /// Réenregistrer un nom existant remplace l'outil précédent (le
+    /// dernier enregistré gagne) — **les annotations et l'`outputSchema`
+    /// déjà déclarés sont conservés**.
     pub fn tool<F>(mut self, name: &str, description: &str, f: F) -> Self
     where
         F: Fn(&Value) -> ToolResult + Send + Sync + 'static,
     {
         let wrapped = move |args: &Value| f(args).map_err(ToolFailure::Tool);
-        self.tools.insert(
-            name.to_string(),
-            ToolDef {
-                description: Some(description.to_string()),
-                schema: None,
-                output_schema: self.output_schemas.remove(name),
-                annotations: self.annotations.remove(name),
-                f: Arc::new(wrapped),
-            },
-        );
+        let (output_schema, annotations) = self.take_output_and_annotations(name);
+        let mut def = ToolDef {
+            description: Some(description.to_string()),
+            schema: None,
+            output_schema,
+            output_object_rooted: false,
+            annotations,
+            f: Arc::new(wrapped),
+        };
+        def.sync_output_shape();
+        self.tools.insert(name.to_string(), def);
         self
     }
 
@@ -968,16 +1088,17 @@ impl ServerBuilder {
         F: Fn(&Value) -> ToolResult + Send + Sync + 'static,
     {
         let wrapped = move |args: &Value| f(args).map_err(ToolFailure::Tool);
-        self.tools.insert(
-            name.to_string(),
-            ToolDef {
-                description: Some(description.to_string()),
-                schema: Some(Arc::new(schema)),
-                output_schema: self.output_schemas.remove(name),
-                annotations: self.annotations.remove(name),
-                f: Arc::new(wrapped),
-            },
-        );
+        let (output_schema, annotations) = self.take_output_and_annotations(name);
+        let mut def = ToolDef {
+            description: Some(description.to_string()),
+            schema: Some(Arc::new(schema)),
+            output_schema,
+            output_object_rooted: false,
+            annotations,
+            f: Arc::new(wrapped),
+        };
+        def.sync_output_shape();
+        self.tools.insert(name.to_string(), def);
         self
     }
 
@@ -1031,16 +1152,17 @@ impl ServerBuilder {
                 )),
             },
         });
-        self.tools.insert(
-            name.to_string(),
-            ToolDef {
-                description: Some(description.to_string()),
-                schema: Some(Arc::new(schema)),
-                output_schema: self.output_schemas.remove(name),
-                annotations: self.annotations.remove(name),
-                f: handler,
-            },
-        );
+        let (output_schema, annotations) = self.take_output_and_annotations(name);
+        let mut def = ToolDef {
+            description: Some(description.to_string()),
+            schema: Some(Arc::new(schema)),
+            output_schema,
+            output_object_rooted: false,
+            annotations,
+            f: handler,
+        };
+        def.sync_output_shape();
+        self.tools.insert(name.to_string(), def);
         self
     }
 
@@ -1083,6 +1205,9 @@ impl ServerBuilder {
             if let Some(output) = self.output_schemas.get(name) {
                 def.output_schema = Some(Arc::clone(output));
             }
+            // La forme du `structuredContent` dépend du schéma de sortie :
+            // elle doit être recalculée après la fusion tardive.
+            def.sync_output_shape();
         }
         ServerCore {
             name: self.name.clone(),
@@ -1132,6 +1257,9 @@ impl ServerBuilder {
             if let Some(output) = self.output_schemas.get(name) {
                 def.output_schema = Some(Arc::clone(output));
             }
+            // La forme du `structuredContent` dépend du schéma de sortie :
+            // elle doit être recalculée après la fusion tardive.
+            def.sync_output_shape();
         }
         let core = Arc::new(ServerCore {
             name: self.name,
