@@ -49,6 +49,9 @@
 //!   (SEP-2243) ;
 //! - `initialize` et `ping` : tolérés (méthodes legacy `2025-11-25`).
 //!
+//! Tutoriel officiel pas à pas (du premier outil aux schémas, ressources
+//! et prompts) : <https://deamondev888.github.io/litemcp-tuto/>.
+//!
 //! ```no_run
 //! use litemcp::prelude::*;
 //!

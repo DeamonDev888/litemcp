@@ -420,9 +420,12 @@ L'historique complet et détaillé vit dans [CHANGELOG.md](CHANGELOG.md) — sec
 | 5 | Publication crates.io | ✅ |
 | 6 | Conformance officielle + benchmarks → 1.0 | ⏳ |
 
-Le détail — jalons, SLO, risques, journal : [docs/ROADMAP.md](docs/ROADMAP.md).
+Le détail — jalons, SLO, risques, journal : [docs/ROADMAP.md](docs/ROADMAP.md). Pour apprendre la lib pas à pas : le [tutoriel officiel](https://deamondev888.github.io/litemcp-tuto/).
 
 ## FAQ
+
+**Par où commencer ?**
+Par le [tutoriel pas à pas](https://deamondev888.github.io/litemcp-tuto/) — il construit un serveur MCP complet avec litemcp, du premier `#[tool]` aux schémas, ressources et prompts. Le [Démarrage rapide](#démarrage-rapide) ci-dessus suffit pour un premier serveur en dix lignes ; les [Concepts](#concepts) détaillent chaque surface ; la [doc du crate](https://docs.rs/litemcp) (docs.rs) référence aussi le tutoriel.
 
 **Pourquoi un seul transport ?**
 Parce qu'un serveur lancé comme sous-processus d'un client meurt avec lui et n'accepte qu'un seul pair — c'est le modèle du client, pas de la lib. litemcp fait le choix inverse : **votre programme devient un démon Streamable HTTP stateless**, bindé sur un socket TCP, que plusieurs agents peuvent joindre, qui survit aux clients et se déploie derrière nginx. Le MCP local en sous-processus est hors périmètre, par conception.
