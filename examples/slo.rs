@@ -83,10 +83,11 @@ fn main() -> std::io::Result<()> {
     let first = request(r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#);
     stream.write_all(first.as_bytes())?;
     let mut buf = [0u8; 8192];
-    stream.read(&mut buf)?;
+    let read = stream.read(&mut buf)?;
     assert!(
-        buf.starts_with(b"HTTP/1.1 200"),
-        "première réponse : {buf:?}"
+        buf[..read].starts_with(b"HTTP/1.1 200"),
+        "première réponse : {:?}",
+        &buf[..read]
     );
     let startup_us = started.elapsed().as_micros();
 
