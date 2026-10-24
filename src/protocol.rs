@@ -36,6 +36,10 @@ pub mod method {
     pub const PING: &str = "ping";
     pub const TOOLS_CALL: &str = "tools/call";
     pub const TOOLS_LIST: &str = "tools/list";
+    pub const RESOURCES_LIST: &str = "resources/list";
+    pub const RESOURCES_READ: &str = "resources/read";
+    pub const PROMPTS_LIST: &str = "prompts/list";
+    pub const PROMPTS_GET: &str = "prompts/get";
 }
 
 /// Type de résultat — champ **obligatoire** dans chaque `result` (SEP-2322).
@@ -73,6 +77,10 @@ pub struct Tool {
     pub description: Option<String>,
     #[serde(rename = "inputSchema", skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
+    /// Schéma de sortie : publié tel quel et **appliqué** — un résultat
+    /// `structuredContent` non conforme devient un résultat `isError`.
+    #[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
 }
@@ -142,7 +150,8 @@ impl ToolAnnotations {
 /// Résultat de `tools/list`.
 ///
 /// Conformité `2026-07-28` : porte `resultType`, `ttlMs` (indice de
-/// fraîcheur) et `cacheScope` (SEP-2549).
+/// fraîcheur) et `cacheScope` (SEP-2549), et identifie le serveur sous
+/// `_meta` (SEP-2575).
 #[derive(Debug, Serialize)]
 pub struct ToolsListResult {
     /// Type de résultat — **obligatoire** (SEP-2322).
@@ -155,6 +164,9 @@ pub struct ToolsListResult {
     #[serde(rename = "cacheScope")]
     pub cache_scope: CacheScope,
     pub tools: Vec<Tool>,
+    /// Identité du serveur (SEP-2575 : SHOULD dans chaque résultat).
+    #[serde(rename = "_meta")]
+    pub meta: Value,
 }
 
 /// Bloc de contenu texte d'un résultat d'outil.
@@ -167,7 +179,9 @@ pub struct TextContent {
 
 /// Résultat de `tools/call` (MCP : `content` + `isError` + `structuredContent`).
 ///
-/// Conformité `2026-07-28` : porte `resultType` (SEP-2322).
+/// Conformité `2026-07-28` : porte `resultType` (SEP-2322) et s'identifie
+/// sous `_meta` (SEP-2575) — le champ est posé par le noyau après
+/// construction, [`CallToolResult::from`] le laisse à `None`.
 #[derive(Debug, Serialize)]
 pub struct CallToolResult {
     /// Type de résultat — **obligatoire** (SEP-2322).
@@ -178,16 +192,21 @@ pub struct CallToolResult {
     pub is_error: Option<bool>,
     #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
+    /// Identité du serveur (SEP-2575 : SHOULD dans chaque résultat).
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl From<Result<Value, String>> for CallToolResult {
     fn from(result: Result<Value, String>) -> Self {
         match result {
             Ok(value) => {
-                // La spec MCP exige un objet dans `structuredContent` : toute
-                // valeur non-objet (scalaire, tableau, null) est enveloppée
-                // dans `{ "result": … }`, et le contenu texte reflète la
-                // valeur structurée réellement envoyée.
+                // Choix d'API : `structuredContent` est toujours un objet.
+                // La spec `2026-07-28` (SEP-2106) autorise désormais toute
+                // valeur JSON, mais un objet invariant garde le contrat
+                // simple pour les clients : toute valeur non-objet est
+                // enveloppée dans `{ "result": … }`, et le contenu texte
+                // reflète la valeur structurée réellement envoyée.
                 let structured = if value.is_object() {
                     value
                 } else {
@@ -201,6 +220,7 @@ impl From<Result<Value, String>> for CallToolResult {
                     }],
                     is_error: None,
                     structured_content: Some(structured),
+                    meta: None,
                 }
             }
             Err(message) => Self {
@@ -211,9 +231,138 @@ impl From<Result<Value, String>> for CallToolResult {
                 }],
                 is_error: Some(true),
                 structured_content: None,
+                meta: None,
             },
         }
     }
+}
+
+// --- Resources (SEP-2549 : les résultats de liste/lecture portent les
+// --- indices de cache comme tools/list) ---
+
+/// Entrée du catalogue `resources/list`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Resource {
+    pub uri: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+/// Résultat de `resources/list`.
+#[derive(Debug, Serialize)]
+pub struct ResourcesListResult {
+    #[serde(rename = "resultType")]
+    pub result_type: ResultType,
+    #[serde(rename = "ttlMs")]
+    pub ttl_ms: u64,
+    #[serde(rename = "cacheScope")]
+    pub cache_scope: CacheScope,
+    pub resources: Vec<Resource>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+/// Contenu texte d'une ressource lue (`contents[]` de `resources/read`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceContents {
+    pub uri: String,
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    pub text: String,
+}
+
+/// Résultat de `resources/read`.
+#[derive(Debug, Serialize)]
+pub struct ReadResourceResult {
+    #[serde(rename = "resultType")]
+    pub result_type: ResultType,
+    #[serde(rename = "ttlMs")]
+    pub ttl_ms: u64,
+    #[serde(rename = "cacheScope")]
+    pub cache_scope: CacheScope,
+    pub contents: Vec<ResourceContents>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+// --- Prompts ---
+
+/// Entrée du catalogue `prompts/list`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Prompt {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Résultat de `prompts/list`.
+#[derive(Debug, Serialize)]
+pub struct PromptsListResult {
+    #[serde(rename = "resultType")]
+    pub result_type: ResultType,
+    #[serde(rename = "ttlMs")]
+    pub ttl_ms: u64,
+    #[serde(rename = "cacheScope")]
+    pub cache_scope: CacheScope,
+    pub prompts: Vec<Prompt>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+/// Bloc de contenu texte d'un message de prompt.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptContent {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub text: String,
+}
+
+/// Message d'un prompt (`role` : `"user"` ou `"assistant"`).
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptMessage {
+    pub role: &'static str,
+    pub content: PromptContent,
+}
+
+impl PromptMessage {
+    /// Message au rôle `user`.
+    #[must_use]
+    pub fn user(text: impl Into<String>) -> Self {
+        Self {
+            role: "user",
+            content: PromptContent {
+                kind: "text",
+                text: text.into(),
+            },
+        }
+    }
+
+    /// Message au rôle `assistant`.
+    #[must_use]
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self {
+            role: "assistant",
+            content: PromptContent {
+                kind: "text",
+                text: text.into(),
+            },
+        }
+    }
+}
+
+/// Résultat de `prompts/get`.
+#[derive(Debug, Serialize)]
+pub struct GetPromptResult {
+    #[serde(rename = "resultType")]
+    pub result_type: ResultType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub messages: Vec<PromptMessage>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Informations serveur renvoyées par `server/discover` et `initialize`

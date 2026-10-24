@@ -1,6 +1,9 @@
+[workspace]
+members = [".", "litemcp-macros"]
+
 [package]
 name = "litemcp"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "La lib MCP (Model Context Protocol) la plus légère pour Rust : votre serveur MCP en quelques lignes. Streamable HTTP stateless uniquement (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement."
@@ -11,9 +14,16 @@ keywords = ["mcp", "mcp-server", "llm", "json-rpc", "http"]
 categories = ["api-bindings", "network-programming", "web-programming::http-server"]
 exclude = [".github", "docs"]
 
+[features]
+# Macros procédurales #[tool] — opt-in : le cœur du crate garde exactement
+# serde + serde_json ; syn/quote ne sont que des dépendances de compilation
+# des consommateurs qui activent la feature.
+macros = ["dep:litemcp-macros"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+litemcp-macros = { path = "litemcp-macros", version = "0.1.0", optional = true }
 
 [profile.release]
 strip = true

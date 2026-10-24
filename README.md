@@ -40,16 +40,22 @@ Les principes :
 |---|---|
 | ⚡ **Minuscule** | 2 dépendances, binaire minimal, démarrage instantané |
 | 🚀 **Sans runtime** | threads `std`, un par connexion — pas de tokio au cœur |
-| 🧩 **Schémas à la Zod** | `inputSchema` dérivé du schéma, publié dans `tools/list` |
+| 🧩 **Schémas à la Zod** | `inputSchema` dérivé du schéma, publié dans `tools/list` ; `outputSchema` **exécuteur** (sortie validée avant envoi) |
 | ✅ **Validation avant exécution** | un appel hors schéma ne touche jamais votre handler |
-| 🦀 **Handlers typés** | arguments désérialisés dans vos structs `Deserialize` |
+| 🦀 **Handlers typés** | arguments désérialisés dans vos structs `Deserialize` ; macro `#[tool]` (feature `macros`) qui dérive le schéma des types des paramètres |
+| 📚 **Resources & Prompts** | `resources/list`·`read`, `prompts/list`·`get` — mêmes indices de cache que `tools/list` (SEP-2549) |
+| ⏱️ **Handlers bornés** | `.tool_timeout(duration)` : un handler qui dépasse rend une erreur, la connexion n'est plus retenue indéfiniment |
+| 🛑 **Arrêt propre** | `bound.handle()` puis `handle.shutdown()` : `serve()` rend `Ok(())`, les connexions ferment entre deux requêtes |
 | 🛡️ **Sûr par défaut** | `#![forbid(unsafe_code)]`, garde DNS-rebinding, corps limité |
 
 ## Installation
 
 ```toml
 [dependencies]
-litemcp = "0.3"
+litemcp = "0.4"
+
+# pour la macro #[tool] (deps de compilation seulement) :
+# litemcp = { version = "0.3", features = ["macros"] }
 ```
 
 Ou directement depuis GitHub :
@@ -138,6 +144,52 @@ Trois registres, du plus direct au plus confortable :
 
 Schémas disponibles : `object().field(..)/.opt(..)/.strict()`, `string().min/.max`, `integer().min/.max`, `number().min/.max`, `boolean()`, `enumeration(&[..])`, `array(s).min/.max`. Les contraintes deviennent `minLength`/`maxLength`/`minimum`/`maximum`/`minItems`/`maxItems`/`enum` dans le JSON Schema publié à `tools/list`.
 
+### Macro `#[tool]` (feature `macros`)
+
+Le schéma est **dérivé des types des paramètres** d'une fonction ordinaire — plus de double déclaration schéma/struct. La macro génère `register_<fonction>`, à enchaîner avec `.with_tool(…)` :
+
+```rust
+use litemcp::macros::tool; // features = ["macros"]
+
+#[tool(name = "add", description = "Additionne deux entiers")]
+fn add(a: i64, b: i64) -> litemcp::ToolResult {
+    Ok(serde_json::json!({ "somme": a + b }))
+}
+// `name` est optionnel (défaut : nom de la fonction).
+
+ServerBuilder::new("calc", "1.0.0")
+    .with_tool(register_add)
+    .bind("127.0.0.1:8080")?
+    .serve()?;
+```
+
+Types supportés : entiers, `f32`/`f64`, `bool`, `String`, `Option<T>` (champ optionnel), `Vec<T>`. Le cœur du crate reste à **2 dépendances** — `syn`/`quote` ne sont que des deps de compilation, activées seulement par la feature.
+
+### Resources & Prompts
+
+Mêmes registres que les outils, mêmes indices de cache (`ttlMs`/`cacheScope`, SEP-2549) :
+
+```rust
+use litemcp::prelude::*;
+
+ServerBuilder::new("doc", "1.0.0")
+    .resource("mem://readme", "README", "La documentation du service", || {
+        Ok(litemcp::protocol::ResourceContents {
+            uri: "mem://readme".into(),
+            mime_type: Some("text/markdown".into()),
+            text: include_str!("../README.md").into(),
+        })
+    })
+    .prompt("revue", "Demande une revue de code", |args| {
+        let fichier = args.get("fichier").and_then(|v| v.as_str()).unwrap_or("src/main.rs");
+        Ok(vec![PromptMessage::user(format!("Relis {fichier} et liste les risques."))])
+    })
+    .bind("127.0.0.1:8080")?
+    .serve()?;
+```
+
+`resources/read` prend `{"uri": …}` ; `prompts/get` prend `{"name": …, "arguments": {…}}` (objet exigé, sinon `-32602`). Les capacités `resources`/`prompts` sont annoncées dans `server/discover` seulement quand les registres ne sont pas vides.
+
 ### Annotations
 
 Métadonnées de la spec 2026-07-28, publiées dans `tools/list` : `.title()`, `.read_only()`, `.destructive()`, `.idempotent()`, `.open_world()`. Un client sait ainsi qu'un outil ne modifie rien avant de l'appeler.
@@ -148,17 +200,19 @@ Métadonnées de la spec 2026-07-28, publiées dans `tools/list` : `.title()`, `
 - **Erreur d'outil** (le handler a tourné et a échoué) → `CallToolResult::isError` — le client affiche le message ;
 - **Erreur de protocole** (mauvaise requête, outil inconnu, JSON invalide) → erreur JSON-RPC typée (-32700, -32602, -32601…), rendue de façon opaque.
 
-La valeur de retour d'un outil devient `structuredContent` — les objets JSON passent tels quels, toute autre valeur (scalaire, tableau, `null`) est enveloppée dans `{"result": …}` pour rester conforme à la spec ; une `Err(msg)` devient `isError: true` avec le message en contenu texte.
+La valeur de retour d'un outil devient `structuredContent` — les objets JSON passent tels quels, toute autre valeur (scalaire, tableau, `null`) est enveloppée dans `{"result": …}` (**choix d'API** : `structuredContent` toujours objet, contrat simple pour les clients) ; une `Err(msg)` devient `isError: true` avec le message en contenu texte. Un `outputSchema` attaché via `.output_schema("outil", schéma)` valide cette sortie **avant envoi** : non conforme → résultat `isError`.
 
 ## Configuration
 
 | Méthode | Défaut | Rôle |
 |---|---|---|
-| `.route(path)` | `/mcp` | chemin unique du serveur |
+| `.route(path)` | `/mcp` | chemin unique du serveur — **validé au bind** : doit commencer par `/`, sans query, et ne pas masquer `/health` (sinon erreur `InvalidInput`, pas de serveur silencieusement injoignable) |
 | `.allow_origins(&[..])` | vide | origines `Origin` autorisées (clients navigateur) — toute requête avec `Origin` non listée est refusée (garde DNS-rebinding) ; les clients CLI n'en envoient pas. Format : l'origine **normalisée navigateur** — schéma + hôte en minuscules, **sans port par défaut** (un navigateur écrit `https://a.example`, jamais `https://a.example:443`) ; comparaison exacte insensible à la casse |
 | `.read_timeout(duration)` | 30 s | timeout de lecture par opération (anti-slowloris) — un client trop lent est déconnecté sans réponse |
 | `.max_connections(n)` | 256 (par serveur) | plafond de connexions simultanées — au-delà, `503` immédiat, pas de spawn |
 | `.connection_ttl(duration)` | 5 min | durée de vie maximale d'une connexion keep-alive — borne le temps d'occupation d'un slot (sans elle, un client qui drip-feed des requêtes valides retient son slot indéfiniment) ; `0` désactive le TTL |
+| `.tool_timeout(duration)` | illimité | délai maximal d'exécution des handlers (outils, ressources, prompts) — au-delà : résultat `isError` pour un outil, `-32000` pour une ressource/prompt ; les arguments d'un `tools/call` sont clonés une fois par appel quand il est actif |
+| `bound.handle()` → `ServerHandle` | — | poignée d'arrêt cloneable : `handle.shutdown()` rend `serve()` → `Ok(())`, les connexions ferment entre deux requêtes (une lecture bloquée en cours ferme au `read_timeout`) |
 | Sonde `GET /health` | `/health` (inclus) | `200` « ok » sans JSON-RPC — probes k8s/systemd/équilibreur (`HEAD` accepté, sans corps) |
 | Corps de requête | 1 Mio | au-delà → `413` — lu **par tranches** (buffer 64 Ko) : la mémoire engagée est proportionnelle aux octets réellement reçus |
 | En-têtes | 64 max, lignes 16 Kio max | au-delà → `431` |
@@ -169,10 +223,10 @@ La valeur de retour d'un outil devient `structuredContent` — les objets JSON p
 
 - **Liaison** : bind `127.0.0.1:8080` (comme dans tous les exemples) si le serveur ne parle qu'à des processus locaux ; sinon, exposez derrière un **reverse proxy** qui apporte TLS, authentification (par ex. OAuth 2.1) et rate-limiting **par IP** — le plafond de connexions de litemcp est **global au serveur** (256 par défaut) : 256 clients lents peuvent l'occuper et renvoyer `503` aux autres, c'est à ça que sert le quota par IP du proxy (le TTL de connexion de 5 min borne par ailleurs la durée d'occupation d'un slot) ;
 - **Navigateurs** : garde DNS-rebinding intégrée — toute requête portant un `Origin` non listé dans `.allow_origins` est refusée (`403`), et les préflights CORS échouent par défaut (`OPTIONS` → `405`) ;
-- **Handlers bloquants** : il n'y a pas de timeout d'exécution des outils — un handler qui bloque retient son thread et son slot de connexion. Encadrez vos appels lents (thread + canal avec délai, ou futures bloquantes bornées) ;
+- **Handlers bloquants** : par défaut il n'y a pas de timeout d'exécution — un handler qui bloque retient son thread et son slot de connexion. `.tool_timeout(duration)` borne la **réponse** (résultat `isError`/`-32000` passé le délai) mais ne peut pas tuer le thread du handler (Rust n'a pas d'annulation de thread) : il termine en arrière-plan et son résultat est ignoré. Pour des effets de bord annulables, encadrez vos appels lents vous-même ;
 - **Validation** : privilégiez `tool_typed`/`tool_parse` (schéma appliqué **avant** votre code) ; `tool` brut vous laisse la validation des arguments — c'est là que naissent les bugs d'injection côté handler, pas dans le transport. Le schéma publié est **exécuteur** : ce qu'il annonce est exactement ce que la validation applique.
 
-Le durcissement transport est intégré et vérifié par la suite de tests : limites (corps 1 Mio, 64 en-têtes, lignes 16 Kio, 256 connexions, TTL 5 min), timeouts (lecture 30 s, deadline 60 s — slowloris coupé), anti request-smuggling (`Transfer-Encoding` ou `Content-Length` dupliqué → `400` sur **toutes** les routes, corps consommé partout pour éviter toute désynchronisation de file), parsing strict (ligne d'en-tête sans `:` ou espace avant `:` → `400`, séparateurs SP uniquement, CRLF strict, version sensible à la casse, `Accept`/`Expect` comparés par jeton exact), `Host` requis, obs-fold refusé, `Content-Type` vérifié (`415`), paniques de handlers contenues (`-32603` **avec l'`id` de la requête**, le serveur continue). Le transport a fait l'objet d'un audit complet (statique + dynamique sur serveur réel) ; les correctifs qui en découlent sont consignés dans le [CHANGELOG](CHANGELOG.md).
+Le durcissement transport est intégré et vérifié par la suite de tests : limites (corps 1 Mio, 64 en-têtes, lignes 16 Kio, 256 connexions, TTL 5 min), timeouts (lecture 30 s, deadline 60 s — slowloris coupé), anti request-smuggling (`Transfer-Encoding` ou `Content-Length` dupliqué → `400` sur **toutes** les routes, corps consommé partout pour éviter toute désynchronisation de file), parsing strict (ligne d'en-tête sans `:` ou espace avant `:` → `400`, séparateurs SP uniquement, CRLF strict, version sensible à la casse, `Accept`/`Expect` comparés par jeton exact), `Host` requis, obs-fold refusé, en-têtes à valeur unique **dupliqués** (`Origin`, `Content-Type`, `Mcp-Method`, `Mcp-Name`) refusés (`400` — le verdict ne doit pas dépendre de l'ordre), `Content-Type` vérifié (`415`), paniques de handlers contenues (`-32603` **avec l'`id` de la requête**, le serveur continue). Le transport a fait l'objet d'un audit complet (statique + dynamique sur serveur réel) ; les correctifs qui en découlent sont consignés dans le [CHANGELOG](CHANGELOG.md).
 
 ## Protocole
 
@@ -186,7 +240,12 @@ Le durcissement transport est intégré et vérifié par la suite de tests : lim
 | `server/discover` (SEP-2575) | `200` — versions supportées, capacités, `serverInfo` dans `_meta` |
 | Version de protocole dans `_meta` | `2026-07-28` acceptée · version inconnue : `-32022` (`UnsupportedProtocolVersionError`) · **absence tolérée** (compatibilité `2025-11-25`) |
 | `resultType` (SEP-2322) | présent dans **chaque** résultat (`"complete"`) |
+| `serverInfo` (SEP-2575) | le serveur s'identifie sous `_meta` de **chaque** résultat |
 | `tools/list` — `ttlMs` / `cacheScope` (SEP-2549) | `60000` / `"private"` |
+| `outputSchema` | publié dans `tools/list` **et exécuteur** : une sortie `structuredContent` non conforme devient un résultat `isError` (`.output_schema("outil", schéma)`) |
+| `resources/list` / `resources/read` | `200` — catalogue et lecture, `ttlMs`/`cacheScope` comme `tools/list` (SEP-2549) ; uri inconnue/manquante : `-32602` ; handler en échec : `-32000` |
+| `prompts/list` / `prompts/get` | `200` — catalogue et rendu (messages `user`/`assistant`) ; nom inconnu : `-32602` ; `arguments` non-objet : `-32602` |
+| Capacités `resources` / `prompts` | annoncées dans `server/discover`/`initialize` **seulement** quand leur registre n'est pas vide |
 | `Mcp-Method` / `Mcp-Name` (SEP-2243) | acceptés ; **incohérents avec le corps** → `-32020` (`HeaderMismatch`) |
 | `initialize` / `ping` | tolérés (méthodes legacy `2025-11-25`, retirées de la spec `2026-07-28`) |
 | Sonde `GET /health` | `200` « ok » (sans JSON-RPC ; probes k8s/systemd) · `HEAD /health` : mêmes en-têtes, sans corps · **un corps annoncé est refusé** (`400`, la sonde n'en accepte aucun) · autre méthode : `405` (`Allow: GET, HEAD`) |
@@ -196,6 +255,7 @@ Le durcissement transport est intégré et vérifié par la suite de tests : lim
 | Route inconnue | `404` · `Content-Length` absent (POST) : `411` · malformé : `400` · corps > 1 Mio : `413` |
 | `Content-Type` ≠ `application/json` | `415 Unsupported Media Type` (absent : accepté) |
 | `Transfer-Encoding` présent (toute route) · `Content-Length` dupliqué | `400` (anti request-smuggling) |
+| `Content-Type` / `Mcp-Method` / `Mcp-Name` dupliqués | `400` (en-têtes à valeur unique — un proxy combine ou retient la première valeur : le verdict ne doit pas dépendre de l'ordre) |
 | En-tête `Origin` non autorisé | `403` (garde DNS-rebinding ; CLI sans `Origin` : libre) |
 | Toute erreur JSON-RPC | l'`id` de la requête est **repris** dans la réponse (JSON-RPC 2.0 §5) |
 

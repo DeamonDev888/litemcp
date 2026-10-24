@@ -12,16 +12,31 @@
 //! Schémas à la Zod ([`crate::zod`]) : dérivation de l'`inputSchema` et
 //! validation des arguments avant exécution, handlers typés disponibles.
 //! Le schéma publié est **exécuteur** : ce qu'il annonce est exactement ce
-//! que la validation applique (pas de dérogation possible).
+//! que la validation applique (pas de dérogation possible) — y compris le
+//! [`outputSchema`](crate::server::ServerBuilder::output_schema), qui
+//! valide la **sortie** structurée avant envoi.
+//!
+//! Trois surfaces MCP : **outils** (`tools/*`), **ressources**
+//! (`resources/*`) et **prompts** (`prompts/*`) — chaque handler peut être
+//! borné dans le temps ([`tool_timeout`](crate::server::ServerBuilder::tool_timeout)),
+//! et le serveur s'arrête proprement
+//! ([`handle`](crate::http::BoundServer::handle)/[`ServerHandle::shutdown`]).
+//! La feature `macros` ajoute `#[tool]` : le schéma d'entrée est dérivé
+//! des types des paramètres d'une fonction ordinaire.
 //!
 //! Spec cible : MCP **2026-07-28** — protocole **stateless**, sans handshake :
 //! chaque message est un `POST /mcp`, la réponse arrive en `application/json`
 //! (ou en `text/event-stream` si le client ne demande que du SSE).
 //!
 //! - `server/discover` : implémentée (SEP-2575) — annonce les versions
-//!   supportées, les capacités et l'identité du serveur ;
+//!   supportées, les capacités (tools, resources, prompts — selon les
+//!   registres) et l'identité du serveur ;
 //! - `resultType` : présent dans **chaque** résultat (SEP-2322) ;
-//! - `ttlMs` / `cacheScope` : présents sur `tools/list` (SEP-2549) ;
+//! - `serverInfo` : le serveur s'identifie sous `_meta` de **chaque**
+//!   résultat (SEP-2575) ;
+//! - `ttlMs` / `cacheScope` : présents sur les résultats de liste et de
+//!   lecture — `tools/list`, `resources/list`, `resources/read`,
+//!   `prompts/list` (SEP-2549) ;
 //! - version de protocole : lue dans `_meta`, refusée en `-32022` si
 //!   inconnue ; son absence est tolérée (compatibilité `2025-11-25`) ;
 //! - `Mcp-Method` / `Mcp-Name` : acceptés et vérifiés contre le corps
@@ -44,11 +59,16 @@
 
 pub mod http;
 pub mod jsonrpc;
+/// Macro `#[tool]` (feature `macros`) — voir [`litemcp_macros::tool`].
+#[cfg(feature = "macros")]
+pub mod macros {
+    pub use litemcp_macros::tool;
+}
 pub mod protocol;
 pub mod server;
 pub mod zod;
 
-pub use server::{ServerBuilder, ServerCore};
+pub use server::{ServerBuilder, ServerCore, ToolResult};
 
 /// Version du crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -56,8 +76,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Tout ce qu'il faut pour écrire un serveur en quelques lignes.
 pub mod prelude {
     pub use crate::VERSION;
+    pub use crate::http::ServerHandle;
+    #[cfg(feature = "macros")]
+    pub use crate::macros::tool;
     pub use crate::protocol::{
-        CacheScope, PROTOCOL_VERSION, ResultType, SUPPORTED_VERSIONS, ToolAnnotations,
+        CacheScope, PROTOCOL_VERSION, PromptMessage, ResultType, SUPPORTED_VERSIONS,
+        ToolAnnotations,
     };
     pub use crate::server::{McpHeaders, ServerBuilder, ToolResult};
     pub use crate::zod;

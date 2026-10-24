@@ -16,15 +16,27 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --workspace --all-features
       - name: Doc
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --all-features
+
+  msrv:
+    # MSRV déclaré dans Cargo.toml (rust-version = "1.85") : vérifié à part
+    # pour ne pas bloquer le job principal sur la toolchain stable.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: Check MSRV
+        run: cargo check --workspace --all-targets --all-features
 
   advisories:
-    # Chaîne d'approvisionnement : échoue si une dépendance verrouillée
-    # (Cargo.lock) a un advisory RustSec connu.
+    # Chaîne d'approvisionnement : échoue sur tout advisory RustSec connu.
+    # Cargo.lock n'est pas versionné (convention lib) : les dépendances sont
+    # résolues à la volée — la vérification porte donc sur les versions
+    # compatibles les plus récentes, ce qui est le but ici.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -128,7 +128,7 @@ fn unknown_method_is_method_not_found() {
     let addr = spawn_server();
     let (status, body) = post(
         addr,
-        r#"{"jsonrpc":"2.0","id":6,"method":"resources/list"}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"sampling/createMessage"}"#,
         "application/json",
         None,
     );
@@ -138,7 +138,10 @@ fn unknown_method_is_method_not_found() {
 }
 
 #[test]
-fn ping_returns_empty_object() {
+fn ping_result_is_identified_and_typed() {
+    // `ping` est legacy (retirée de la spec 2026-07-28) mais son résultat
+    // porte `resultType` (SEP-2322) et l'identité du serveur (SEP-2575),
+    // comme tous les autres — la promesse « chaque résultat » sans exception.
     let addr = spawn_server();
     let (status, body) = post(
         addr,
@@ -148,7 +151,11 @@ fn ping_returns_empty_object() {
     );
     assert_eq!(status, 200);
     let v: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["result"], serde_json::json!({}));
+    assert_eq!(v["result"]["resultType"], "complete", "{body}");
+    assert!(
+        v["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"].is_string(),
+        "serverInfo attendu même sur ping : {body}"
+    );
 }
 
 #[test]
@@ -503,7 +510,7 @@ fn expect_100_continue_receives_interim_then_final_response() {
     let mut raw = String::new();
     stream.read_to_string(&mut raw).unwrap();
     assert!(raw.contains("HTTP/1.1 200 OK"), "réponse finale : {raw:?}");
-    assert!(raw.contains("\"result\":{}"));
+    assert!(raw.contains("\"resultType\":\"complete\""));
 }
 
 #[test]
@@ -647,7 +654,10 @@ fn http10_without_host_is_served() {
     );
     let (status, resp_body) = raw_request(addr, &request);
     assert_eq!(status, 200);
-    assert!(resp_body.contains("\"result\":{}"), "{resp_body:?}");
+    assert!(
+        resp_body.contains("\"resultType\":\"complete\""),
+        "{resp_body:?}"
+    );
 }
 
 #[test]
@@ -762,7 +772,7 @@ fn health_probe_keeps_connection_reusable() {
     let mut raw = String::new();
     stream.read_to_string(&mut raw).unwrap();
     assert_eq!(raw.matches("HTTP/1.1 200 OK").count(), 2, "{raw:?}");
-    assert!(raw.contains("\"result\":{}"), "{raw:?}");
+    assert!(raw.contains("\"resultType\":\"complete\""), "{raw:?}");
 }
 
 #[test]
@@ -775,7 +785,7 @@ fn query_string_is_ignored_in_route_match() {
         None,
     );
     assert_eq!(status, 200);
-    assert!(body.contains("\"result\":{}"));
+    assert!(body.contains("\"resultType\":\"complete\""));
 }
 
 #[test]
@@ -805,7 +815,7 @@ fn explicit_null_id_gets_a_response_with_null_id() {
     assert_eq!(status, 200, "id:null explicite = requête, pas notification");
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["id"], Value::Null);
-    assert_eq!(v["result"], serde_json::json!({}));
+    assert_eq!(v["result"]["resultType"], "complete", "{body}");
 }
 
 #[test]
@@ -944,7 +954,7 @@ fn head_health_is_200_without_body_and_keeps_alive() {
         "la réponse HEAD porte un corps : {:?}",
         &raw[head_end..head_end + 20]
     );
-    assert!(raw.contains("\"result\":{}"), "{raw:?}");
+    assert!(raw.contains("\"resultType\":\"complete\""), "{raw:?}");
 }
 
 #[test]
@@ -1613,4 +1623,250 @@ fn connection_ttl_cuts_a_drip_fed_connection() {
         start.elapsed() < std::time::Duration::from_secs(4),
         "la coupure doit venir du TTL (800 ms), pas du read_timeout (30 s)"
     );
+}
+
+// --- Correctifs de l'audit du 2026-10-24 (N1, N3, N4, N5) ---
+
+#[test]
+fn tool_results_identify_the_server_in_meta() {
+    // N1 : SEP-2575 — les serveurs SHOULD s'identifier dans le `_meta` de
+    // chaque résultat, pas seulement dans `server/discover`/`initialize`.
+    let addr = spawn_hardened();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "durci",
+        "serverInfo attendu sur tools/list : {body}"
+    );
+
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ok","arguments":{}}}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "durci",
+        "serverInfo attendu sur tools/call : {body}"
+    );
+
+    // Un échec d'exécution (`isError: true`) reste un `result` : identifié
+    // lui aussi.
+    let bound = ServerBuilder::new("durci", "0.2.0")
+        .tool("echoue", "échoue exprès", |_args| Err("échec".to_string()))
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echoue","arguments":{}}}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["result"]["isError"], true);
+    assert!(
+        v["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"].is_string(),
+        "serverInfo attendu même sur un résultat en erreur : {body}"
+    );
+}
+
+#[test]
+fn duplicate_content_type_is_rejected_regardless_of_order() {
+    // N3 : le verdict ne doit pas dépendre de l'ordre — avant le correctif,
+    // `application/json` puis `text/plain` était refusé (415) et l'ordre
+    // inverse accepté (200), divergent d'un proxy qui combine les valeurs.
+    let addr = spawn_hardened();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    for headers in [
+        "Content-Type: application/json\r\nContent-Type: text/plain",
+        "Content-Type: text/plain\r\nContent-Type: application/json",
+        "Content-Type: application/json\r\nContent-Type: application/json",
+    ] {
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: t\r\n{headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, _) = raw_exchange(addr, &request, std::time::Duration::from_secs(2));
+        assert_eq!(status, 400, "Content-Type dupliqué → 400 : {headers}");
+    }
+}
+
+#[test]
+fn duplicate_mcp_routing_headers_are_rejected() {
+    // N4 : un `Mcp-Method`/`Mcp-Name` dupliqué rend le routage ambigu (un
+    // gateway qui route sur la première valeur diverge du contrôle fait sur
+    // la dernière). Avant le correctif : dernier-gagne, silencieux.
+    let addr = spawn_hardened();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    for headers in [
+        "Mcp-Method: ping\r\nMcp-Method: tools/list",
+        "Mcp-Method: tools/list\r\nMcp-Method: ping",
+        "Mcp-Name: ok\r\nMcp-Name: autre",
+    ] {
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n{headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, _) = raw_exchange(addr, &request, std::time::Duration::from_secs(2));
+        assert_eq!(status, 400, "{headers} → 400");
+    }
+
+    // Un en-tête unique cohérent avec le corps reste accepté.
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nMcp-Method: ping\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, _) = raw_exchange(addr, &request, std::time::Duration::from_secs(2));
+    assert_eq!(status, 200, "Mcp-Method unique et cohérent → 200");
+}
+
+#[test]
+fn bind_rejects_routes_that_cannot_match_or_mask_health() {
+    // N5 : une route sans '/' initial ou avec une query ne peut jamais
+    // matcher ; `/health` masque la sonde de vie. Avant le correctif, le
+    // serveur démarrait et était silencieusement injoignable (405/404).
+    fn base() -> ServerBuilder {
+        ServerBuilder::new("r", "0.1.0").tool("ok", "ok", |_args| Ok(serde_json::json!({})))
+    }
+    for route in ["mcp", "", "/mcp?x=1", "/health"] {
+        let err = match base().route(route).bind("127.0.0.1:0") {
+            Err(err) => err,
+            Ok(_) => panic!("route {route:?} doit être refusée au bind"),
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "route {route:?} doit être refusée au bind : {err}"
+        );
+    }
+    // Route valide : bind OK.
+    assert!(base().route("/api/mcp").bind("127.0.0.1:0").is_ok());
+}
+
+// --- Arrêt propre (ServerHandle) et nouvelles surfaces sur le transport ---
+
+#[test]
+fn shutdown_stops_serve_and_closes_an_idle_connection() {
+    let bound = ServerBuilder::new("stop", "0.1.0")
+        .tool("ok", "ok", |_args| Ok(serde_json::json!({})))
+        .read_timeout(std::time::Duration::from_millis(300))
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let handle = bound.handle();
+    let addr = bound.local_addr().unwrap();
+    let server = std::thread::spawn(move || bound.serve());
+
+    // Connexion idle (aucune requête) : elle occupe un thread bloqué en
+    // lecture jusqu'au read_timeout.
+    let mut client = TcpStream::connect(addr).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    handle.shutdown();
+    let started = std::time::Instant::now();
+    server
+        .join()
+        .expect("le thread serve ne doit pas paniquer")
+        .expect("serve() doit rendre Ok(()) sur shutdown");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "serve() doit rendre promptement après shutdown()"
+    );
+
+    // La connexion idle est fermée au plus tard à son read_timeout (300 ms).
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = [0u8; 16];
+    let n = client.read(&mut buf).expect("EOF attendu, pas d'erreur");
+    assert_eq!(n, 0, "la connexion doit être fermée proprement (EOF)");
+}
+
+#[test]
+fn shutdown_is_idempotent_and_refuses_new_connections() {
+    let bound = ServerBuilder::new("stop", "0.1.0")
+        .tool("ok", "ok", |_args| Ok(serde_json::json!({})))
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let handle = bound.handle();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _ = bound.serve();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // Double appel : le second est un no-op (pas de panique, pas d'erreur).
+    handle.shutdown();
+    handle.shutdown();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)).is_err(),
+        "après shutdown, le listener est fermé : plus de connexion possible"
+    );
+}
+
+#[test]
+fn resources_and_prompts_are_served_over_http() {
+    let bound = ServerBuilder::new("full", "0.1.0")
+        .tool("ok", "ok", |_args| Ok(serde_json::json!({})))
+        .resource("mem://doc", "Doc", "La doc", || {
+            Ok(litemcp::protocol::ResourceContents {
+                uri: "mem://doc".to_string(),
+                mime_type: Some("text/markdown".to_string()),
+                text: "# Bonjour".to_string(),
+            })
+        })
+        .prompt("salut", "Salue", |args| {
+            let nom = args.get("nom").and_then(Value::as_str).unwrap_or("monde");
+            Ok(vec![litemcp::protocol::PromptMessage::user(format!(
+                "Bonjour {nom}"
+            ))])
+        })
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+
+    // Les quatre surfaces répondent en JSON-RPC sur le transport.
+    for (id, body) in [
+        (1, r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#),
+        (
+            2,
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"mem://doc"}}"#,
+        ),
+        (3, r#"{"jsonrpc":"2.0","id":3,"method":"prompts/list"}"#),
+        (
+            4,
+            r#"{"jsonrpc":"2.0","id":4,"method":"prompts/get","params":{"name":"salut","arguments":{"nom":"Léa"}}}"#,
+        ),
+    ] {
+        let (status, resp_body) = post(addr, body, "application/json", None);
+        assert_eq!(status, 200, "requête {id}");
+        let v: Value = serde_json::from_str(&resp_body).unwrap();
+        assert!(v["result"].is_object(), "un résultat est attendu : {v}");
+    }
+
+    // Et l'annonce de capacités suit les registres.
+    let (status, resp_body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":5,"method":"server/discover"}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&resp_body).unwrap();
+    let capabilities = &v["result"]["capabilities"];
+    assert!(capabilities["tools"].is_object(), "{v}");
+    assert!(capabilities["resources"].is_object(), "{v}");
+    assert!(capabilities["prompts"].is_object(), "{v}");
 }

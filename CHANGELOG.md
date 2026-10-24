@@ -60,13 +60,41 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
-### Prévu (cible 0.4)
+### Prévu (suite)
 
-- Macros `#[tool]` / `#[resource]` / `#[prompt]` dérivant le schéma du type Rust (workspace split `litemcp-macros`) — finira de supprimer la double déclaration schéma/struct.
+- Macros `#[resource]` / `#[prompt]` (même mécanique de dérivation que `#[tool]`).
 - Fuzz du parseur HTTP (proptest/corpus) et tests clients réels (MCP Inspector, Claude, Cursor).
-- `outputSchema` (validation de la sortie structurée avant envoi — point fort ViteMCP à reprendre).
-- Ressources et prompts dans le noyau (aujourd'hui : `tools` seulement).
 - Mesures SLO Linux (`VmRSS`, démarrage in-process) et publication des conditions figées.
+
+## [0.4.0] - 2026-10-24
+
+### Ajout — le lot « gros ROI » de la feuille de route
+
+- **Arrêt propre de `serve()`** (ferme le point B16 des audits) : `bound.handle()` rend une `ServerHandle` cloneable ; `handle.shutdown()` (idempotent) réveille la boucle d'`accept` par une socket factice → `serve()` rend `Ok(())`, et chaque connexion vivante se ferme **entre deux requêtes** (une lecture bloquée en cours ferme au `read_timeout`). La requête en cours termine toujours proprement — les threads ne sont pas tués.
+- **Timeout d'exécution des handlers** (`.tool_timeout(duration)`, défaut illimité) : un handler d'outil qui dépasse rend un résultat `isError` (le résultat timeout reste un `result` complet : `resultType`, `_meta`), un handler de ressource/prompt une erreur `-32000` (plage implementation-defined). **Limite assumée et documentée** : le thread du handler n'est pas tué (Rust n'a pas d'annulation de thread) — il termine en arrière-plan, résultat ignoré ; en mode borné, une panique de handler est rendue en `-32603` et les arguments d'un `tools/call` sont clonés une fois par appel.
+- **`outputSchema`** (`.output_schema("outil", schéma)`) : publié dans `tools/list` et **exécuteur** comme l'input — la valeur `structuredContent` réellement envoyée est validée avant de partir ; non conforme → résultat `isError` qui cite le `outputSchema`. Ordre d'appel indépendant (même mécanique que `.annotate()`).
+- **Resources** : `.resource(uri, name, description, handler)` — `resources/list` et `resources/read` implémentées avec les indices SEP-2549 (`ttlMs`/`cacheScope`) et l'identification SEP-2575 (`_meta` serverInfo) ; uri inconnue → `-32602`, handler en échec → `-32000`.
+- **Prompts** : `.prompt(name, description, handler)` — `prompts/list` et `prompts/get` (messages `user`/`assistant` via `PromptMessage::user`/`::assistant`), `arguments` objet exigé (même contrat que `tools/call`).
+- Les **capacités** `resources`/`prompts` sont annoncées dans `server/discover` et `initialize` seulement quand leur registre n'est pas vide (une capacité annoncée est une capacité servie).
+- **Macro `#[tool]`** — nouvelle crate `litemcp-macros` (workspace), feature opt-in `macros` : le schéma d'entrée est **dérivé des types des paramètres** d'une fonction ordinaire (`i64`→integer, `f64`→number, `String`→string, `Option<T>`→champ optionnel, `Vec<T>`→array), la macro génère `register_<fonction>` à enchaîner via `.with_tool(…)`. Le cœur garde exactement **2 dépendances** : `syn`/`quote` ne sont que des deps de compilation activées par la feature. Aucune exigence nouvelle pour le consommateur (pas besoin de `serde` direct : l'extraction est générée, pas désérialisée).
+- `ToolResult` ré-exporté à la racine (`litemcp::ToolResult`) — le type de retour documenté de la macro.
+- CI alignée : `--workspace --all-features` sur clippy/test, job MSRV sur le workspace.
+
+### Sécurité & conformité — audit du 2026-10-24
+
+Audit complet (statique + sondes dynamiques + vérification du changelog officiel MCP `2026-07-28` en ligne). **Aucune vulnérabilité critique ou haute** ; les correctifs de l'audit du 2026-10-23 sont vérifiés présents et couverts. Rapport : `docs/AUDIT-LITEMCP-2026-10-24.md`. Les 6 nouveaux constats (P3/Info) sont corrigés :
+
+- **[P3] `serverInfo` dans chaque résultat** (SEP-2575 : les serveurs *SHOULD* s'identifier dans le `_meta` de chaque résultat) : `tools/list` et `tools/call` — succès **et** `isError` — portent désormais `_meta["io.modelcontextprotocol/serverInfo"]`, comme `server/discover` et `initialize` ;
+- **[P3] `ping` porte `resultType` + `_meta`** : la promesse « `resultType` dans chaque résultat » devient vraie sans exception (méthode legacy, résultat enrichi — additif pour les clients `2025-11-25`) ;
+- **[P3] En-têtes à valeur unique dupliqués refusés** (`Content-Type`, `Mcp-Method`, `Mcp-Name` → `400`) : le verdict dépendait de **l'ordre** (prouvé : `Content-Type: application/json` puis `text/plain` → `415`, ordre inverse → `200` ; `Mcp-Method: tools/list` + `Mcp-Method: ping` accepté silencieusement) — dernier-gagne divergent d'un proxy qui combine les valeurs ou retient la première. Même traitement que `Origin`/`Host` ;
+- **[P3] Route validée au bind** : `.route()` doit commencer par `/`, ne pas contenir de `?` et ne pas masquer `/health` — sinon `InvalidInput` au `bind` au lieu de démarrer un serveur **silencieusement injoignable** (prouvé : route `/health` → tout `POST` prenait le `405` de la sonde) ;
+- **[P3] `structuredContent` : justification périmée corrigée** — l'enveloppe objet (`{ "result": … }` pour les non-objets) est désormais documentée comme un **choix d'API** ; la spec `2026-07-28` (SEP-2106) autorise en effet toute valeur JSON, l'exigence d'objet date d'avant. Comportement inchangé, promesse honnête ;
+- **[Info] CI** : `cargo clippy --all-targets -- -D warnings` (les tests et exemples sont désormais lintés en CI, comme localement) + job `msrv` sur la toolchain 1.85 déclarée dans `Cargo.toml`. Au passage, le commentaire du job `advisories` est rendu exact : `Cargo.lock` n'étant pas versionné (convention lib), `cargo-deny` résout les dépendances à la volée — la vérification porte sur les versions compatibles les plus récentes, pas sur un lockfile committé ;
+
+### Tests
+
+- Avec le lot « gros ROI » ci-dessus : **128 tests au total** (27 unitaires, 8 features, 80 HTTP sur vraies sockets, 3 macros, 5 smoke, 5 doctests) — 15 nouveaux pour verrouiller les cinq fonctionnalités (timeout, outputSchema, resources, prompts, arrêt propre, macro).
+
 
 ## [0.3.3] - 2026-10-23
 
@@ -211,7 +239,9 @@ Audit statique (code intégral) + revue indépendante croisée + **vérification
 - GitHub : dépôt [DeamonDev888/litemcp](https://github.com/DeamonDev888/litemcp), tag `v0.1.0`, release, CI verte (fmt / clippy / test / doc).
 - Token API crates.io stocké dans `~/.cargo/credentials.toml` (hors repo), garde `.cargo/` au `.gitignore`.
 
-[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/DeamonDev888/litemcp/compare/v0.3.3...v0.4.0
+[0.3.3]: https://github.com/DeamonDev888/litemcp/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/DeamonDev888/litemcp/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/DeamonDev888/litemcp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/DeamonDev888/litemcp/compare/v0.2.0...v0.3.0

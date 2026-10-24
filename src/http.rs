@@ -32,6 +32,10 @@
 //! - en-tête `Host` requis et unique en HTTP/1.1 (`400` sinon, RFC 9112
 //!   §3.2), lignes obs-fold rejetées (`400`), ligne d'en-tête sans
 //!   `:` ou avec une espace avant `:` rejetée (`400`, RFC 9112 §5.1) ;
+//! - en-têtes à valeur unique **dupliqués** (`Origin`, `Content-Type`,
+//!   `Mcp-Method`, `Mcp-Name`) → `400` : retenir la dernière valeur rendait
+//!   le verdict dépendant de l'ordre, divergent d'un proxy qui combine les
+//!   valeurs (RFC 9110 §5.3) ou retient la première ;
 //! - ligne de requête stricte : trois jetons séparés par des **espaces
 //!   ASCII** seulement (RFC 9112 §3), version exacte `HTTP/1.0`/`HTTP/1.1`
 //!   sensible à la casse → `505` sinon ; ligne malformée → `400` ;
@@ -138,9 +142,12 @@ pub struct BoundServer {
     /// Connexions vivantes de **cette** instance — le plafond est par
     /// serveur, pas global au processus.
     pub(crate) live_connections: Arc<AtomicUsize>,
-    /// Refus en cours d'écriture (503) — borné, pour que la boucle d'`accept`
+    /// Refus en cours d'écriture (503) — borné, pour que la boucle d'accept
     /// ne soit jamais bloquée par les refus.
     pub(crate) refusals_in_flight: Arc<AtomicUsize>,
+    /// Demande d'arrêt (voir [`BoundServer::handle`]) — la boucle d'accept
+    /// et les boucles keep-alive la consultent entre deux requêtes.
+    pub(crate) shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BoundServer {
@@ -149,10 +156,58 @@ impl BoundServer {
         self.listener.local_addr()
     }
 
+    /// Poignée d'arrêt — cloneable, à prendre **avant** [`BoundServer::serve`].
+    ///
+    /// [`ServerHandle::shutdown`] est idempotente : la boucle d'accept
+    /// cesse immédiatement (une socket de réveil la débloque), `serve()`
+    /// rend `Ok(())`, et chaque connexion vivante se ferme **entre deux
+    /// requêtes** — la requête en cours termine proprement. Une connexion
+    /// idle (bloquée en lecture sans requête) se ferme à son
+    /// [`crate::server::ServerBuilder::read_timeout`] : un arrêt ne peut
+    /// pas interrompre une lecture bloquante en cours.
+    ///
+    /// ```no_run
+    /// use litemcp::prelude::*;
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let bound = ServerBuilder::new("calc", "1.0.0")
+    ///     .tool("add", "Additionne", |_args| Ok(serde_json::json!({})))
+    ///     .bind("127.0.0.1:8080")?;
+    /// let handle = bound.handle();
+    /// std::thread::spawn(move || {
+    ///     let _ = bound.serve();
+    /// });
+    /// // … plus tard :
+    /// handle.shutdown();
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn handle(&self) -> ServerHandle {
+        let addr = self
+            .listener
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
+        ServerHandle {
+            shutdown: Arc::clone(&self.shutdown),
+            addr,
+        }
+    }
+
     /// Bloque et sert les connexions — un thread par connexion, dans la
     /// limite de `max_connections` (défaut [`MAX_CONNECTIONS`]).
+    ///
+    /// Rend `Ok(())` quand [`BoundServer::handle`]/`ServerHandle::shutdown`
+    /// est appelé — c'est le seul retour anticipé volontaire.
     pub fn serve(self) -> std::io::Result<()> {
         for stream in self.listener.incoming() {
+            // Arrêt demandé : la socket de réveil (ou une connexion en
+            // attente) est abandonnée ici — le listener se ferme au retour,
+            // les threads de connexion vivotent jusqu'à leur prochaine
+            // itération (voir `handle_connection`).
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let Ok(mut stream) = stream else {
                 // Échec d'accept (ex. descripteurs épuisés) : pause brève —
                 // sans elle, une erreur persistante transforme la boucle
@@ -243,6 +298,7 @@ impl BoundServer {
             let route = Arc::clone(&self.route);
             let allow_origins = Arc::clone(&self.allow_origins);
             let live = Arc::clone(&self.live_connections);
+            let shutdown = Arc::clone(&self.shutdown);
             // Clone pour le chemin d'erreur ci-dessous : la closure appartient
             // au spawn — si la création du thread échoue, elle est abandonnée
             // avec le flux qu'elle capture, et la réponse 503 part sur le flux
@@ -267,6 +323,7 @@ impl BoundServer {
                         &route,
                         &allow_origins,
                         self.connection_ttl,
+                        &shutdown,
                     );
                 });
             if spawned.is_err() {
@@ -289,6 +346,30 @@ impl BoundServer {
             }
         }
         Ok(())
+    }
+}
+
+/// Poignée d'arrêt d'un serveur lié — voir [`BoundServer::handle`].
+#[derive(Clone)]
+pub struct ServerHandle {
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    addr: SocketAddr,
+}
+
+impl ServerHandle {
+    /// Demande l'arrêt du serveur — idempotent.
+    ///
+    /// La boucle d'accept est réveillée par une socket factice : `serve()`
+    /// rend `Ok(())` promptement. Les connexions vivantes ferment entre
+    /// deux requêtes ; une connexion bloquée en lecture ferme à son
+    /// `read_timeout`. Les threads déjà lancés ne sont **pas** tués — la
+    /// requête en cours termine.
+    pub fn shutdown(&self) {
+        if !self.shutdown.swap(true, Ordering::Relaxed) {
+            // Premier appel uniquement : réveil de l'accept (connect non
+            // bloquant pour ne pas pendre si le listener meurt entre-temps).
+            let _ = std::net::TcpStream::connect_timeout(&self.addr, Duration::from_millis(250));
+        }
     }
 }
 
@@ -419,6 +500,7 @@ fn handle_connection(
     route: &str,
     allow_origins: &[String],
     connection_ttl: Duration,
+    shutdown: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
     // Buffer de lecture 4 Ko (et non les 8 Ko par défaut) : les en-têtes
     // tiennent largement dedans, et un corps plus grand que la capacité est
@@ -434,6 +516,11 @@ fn handle_connection(
     // Instant d'ouverture de la connexion : borne sa durée de vie totale.
     let connection_started = Instant::now();
     loop {
+        // Arrêt demandé : la connexion se ferme **entre deux requêtes** —
+        // celle en cours a terminé proprement, la suivante ne démarre pas.
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         // TTL de connexion : au-delà, la connexion est fermée même si le
         // client est actif. Sans cette borne, un client qui drip-feed des
         // requêtes valides (sous le read_timeout) retient son slot de
@@ -561,10 +648,16 @@ fn handle_connection(
         let mut expect_continue = false;
         // `Content-Type` de la requête — vérifié sur les routes POST.
         let mut content_type: Option<String> = None;
+        // En-têtes à valeur unique vus une première fois (pour refuser les
+        // doublons : un proxy combine ou retient la première valeur, nous la
+        // dernière — le verdict ne doit pas dépendre de l'ordre).
+        let mut content_type_duplicate = false;
         // En-têtes de routage MCP 2026-07-28 (SEP-2243) — optionnels chez
         // nous (compatibilité), mais vérifiés s'ils sont présents.
         let mut mcp_method: Option<String> = None;
         let mut mcp_name: Option<String> = None;
+        let mut mcp_method_duplicate = false;
+        let mut mcp_name_duplicate = false;
         // `Connection: close` a-t-il été vu ? (HTTP/1.0 : la connexion est
         // fermée par défaut, `keep-alive` doit pouvoir la maintenir ouverte,
         // mais `close` reste ABSORBANT s'il apparaît).
@@ -691,11 +784,23 @@ fn handle_connection(
                     accept_json |= header_has_media_type(value, "application/json");
                     accept_sse |= header_has_media_type(value, "text/event-stream");
                 } else if name.eq_ignore_ascii_case("content-type") {
-                    content_type = Some(value.to_string());
+                    if content_type.is_some() {
+                        content_type_duplicate = true;
+                    } else {
+                        content_type = Some(value.to_string());
+                    }
                 } else if name.eq_ignore_ascii_case("mcp-method") {
-                    mcp_method = Some(value.to_string());
+                    if mcp_method.is_some() {
+                        mcp_method_duplicate = true;
+                    } else {
+                        mcp_method = Some(value.to_string());
+                    }
                 } else if name.eq_ignore_ascii_case("mcp-name") {
-                    mcp_name = Some(value.to_string());
+                    if mcp_name.is_some() {
+                        mcp_name_duplicate = true;
+                    } else {
+                        mcp_name = Some(value.to_string());
+                    }
                 } else if name.eq_ignore_ascii_case("connection") {
                     let mut has_close = false;
                     let mut has_keep_alive = false;
@@ -750,6 +855,24 @@ fn handle_connection(
                 &mut stream,
                 "400 Bad Request",
                 "en-tete Origin duplique",
+                "",
+                is_head,
+            )?;
+            return Ok(());
+        }
+
+        // En-têtes à valeur unique dupliqués (`Content-Type`, `Mcp-Method`,
+        // `Mcp-Name`) : requête ambiguë — nous retenions la DERNIÈRE valeur,
+        // un proxy qui combine ou retient la première lirait autrement.
+        // `Content-Type: application/json` puis `text/plain` était refusé
+        // (415) dans un ordre et accepté dans l'autre ; un gateway qui route
+        // sur le PREMIER `Mcp-Method` divergeait du contrôle fait sur le
+        // dernier. Refus net, comme `Origin` et `Host`.
+        if content_type_duplicate || mcp_method_duplicate || mcp_name_duplicate {
+            respond_error(
+                &mut stream,
+                "400 Bad Request",
+                "en-tête à valeur unique dupliqué",
                 "",
                 is_head,
             )?;
