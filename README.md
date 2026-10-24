@@ -144,26 +144,41 @@ Trois registres, du plus direct au plus confortable :
 
 Schémas disponibles : `object().field(..)/.opt(..)/.strict()`, `string().min/.max`, `integer().min/.max`, `number().min/.max`, `boolean()`, `enumeration(&[..])`, `array(s).min/.max`. Les contraintes deviennent `minLength`/`maxLength`/`minimum`/`maximum`/`minItems`/`maxItems`/`enum` dans le JSON Schema publié à `tools/list`.
 
-### Macro `#[tool]` (feature `macros`)
+### Macros `#[tool]` · `#[resource]` · `#[prompt]` (feature `macros`)
 
-Le schéma est **dérivé des types des paramètres** d'une fonction ordinaire — plus de double déclaration schéma/struct. La macro génère `register_<fonction>`, à enchaîner avec `.with_tool(…)` :
+Le schéma est **dérivé des types des paramètres** d'une fonction ordinaire — plus de double déclaration schéma/struct. Chaque macro génère `register_<fonction>`, à enchaîner avec `.with_tool(…)` :
 
 ```rust
-use litemcp::macros::tool; // features = ["macros"]
+use litemcp::macros::{prompt, resource, tool}; // features = ["macros"]
 
 #[tool(name = "add", description = "Additionne deux entiers")]
 fn add(a: i64, b: i64) -> litemcp::ToolResult {
     Ok(serde_json::json!({ "somme": a + b }))
 }
-// `name` est optionnel (défaut : nom de la fonction).
+
+#[resource(uri = "mem://doc", name = "Doc", description = "La documentation")]
+fn doc() -> Result<litemcp::protocol::ResourceContents, String> {
+    Ok(litemcp::protocol::ResourceContents {
+        uri: "mem://doc".into(),
+        mime_type: Some("text/markdown".into()),
+        text: include_str!("../README.md").into(),
+    })
+}
+
+#[prompt(description = "Demande une revue de code")] // `name` optionnel (défaut : nom de la fonction)
+fn revue(fichier: String, severite: Option<String>) -> Result<Vec<litemcp::protocol::PromptMessage>, String> {
+    Ok(vec![litemcp::protocol::PromptMessage::user(format!("Relis {fichier}"))])
+}
 
 ServerBuilder::new("calc", "1.0.0")
     .with_tool(register_add)
+    .with_tool(register_doc)
+    .with_tool(register_revue)
     .bind("127.0.0.1:8080")?
     .serve()?;
 ```
 
-Types supportés : entiers, `f32`/`f64`, `bool`, `String`, `Option<T>` (champ optionnel), `Vec<T>`. Le cœur du crate reste à **2 dépendances** — `syn`/`quote` ne sont que des deps de compilation, activées seulement par la feature.
+`#[tool]` et `#[prompt]` valident les arguments via le schéma dérivé (`#[prompt]` passe par `.prompt_typed(…)`, la variante validée de `.prompt()`) ; `#[resource]` prend une fonction **sans paramètre** (`uri` requise). Types supportés : entiers, `f32`/`f64`, `bool`, `String`, `Option<T>` (champ optionnel), `Vec<T>`. Le cœur du crate reste à **2 dépendances** — `syn`/`quote` ne sont que des deps de compilation, activées seulement par la feature.
 
 ### Resources & Prompts
 

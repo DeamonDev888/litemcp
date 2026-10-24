@@ -362,3 +362,47 @@ fn prompts_list_and_get_work() {
         "{v}"
     );
 }
+
+// --- prompt_typed : validation avant exécution ---
+
+#[test]
+fn prompt_typed_validates_arguments_before_running_the_handler() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let ran = std::sync::Arc::new(AtomicBool::new(false));
+    let probe = std::sync::Arc::clone(&ran);
+    let core = ServerBuilder::new("t", "0.1.0")
+        .prompt_typed(
+            "salut",
+            "Salue",
+            zod::object().field("nom", zod::string().min(1)),
+            move |_args| {
+                probe.store(true, Ordering::Relaxed);
+                Ok(vec![PromptMessage::user("salut")])
+            },
+        )
+        .core();
+
+    // Invalide (nom absent) : -32602 avec issues, handler jamais exécuté.
+    let v = call(
+        &core,
+        r#"{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"salut","arguments":{}}}"#,
+    );
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert!(v["error"]["data"]["issues"].as_array().is_some(), "{v}");
+    assert!(
+        !ran.load(Ordering::Relaxed),
+        "le handler n'a pas dû tourner"
+    );
+
+    // Valide : messages rendus, handler exécuté.
+    let v = call(
+        &core,
+        r#"{"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":"salut","arguments":{"nom":"Léa"}}}"#,
+    );
+    assert_eq!(
+        v["result"]["messages"][0]["content"]["text"], "salut",
+        "{v}"
+    );
+    assert!(ran.load(Ordering::Relaxed), "le handler a dû tourner");
+}

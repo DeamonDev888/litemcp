@@ -114,6 +114,7 @@ struct ResourceDef {
 #[derive(Clone)]
 struct PromptDef {
     description: Option<String>,
+    schema: Option<Arc<dyn Schema>>,
     f: Arc<PromptFn>,
 }
 
@@ -520,6 +521,23 @@ impl ServerCore {
                 );
             }
         };
+        // Schéma exécuteur : hors schéma → -32602 avec les issues, le
+        // handler ne tourne jamais (même contrat que `tool_typed`).
+        if let Some(schema) = &def.schema {
+            let mut issues = Issues::new();
+            schema.validate("arguments", arguments, &mut issues);
+            if !issues.is_empty() {
+                let rendered = issues.render();
+                return Outgoing::failure(
+                    id.clone(),
+                    ErrorObject::with_data(
+                        ErrorObject::INVALID_PARAMS,
+                        format!("Arguments invalides : {}", rendered.join(" ; ")),
+                        json!({ "issues": rendered }),
+                    ),
+                );
+            }
+        }
         let handler = Arc::clone(&def.f);
         let arguments = arguments.clone();
         let messages = match self.run_bounded(move || handler(&arguments)) {
@@ -858,15 +876,39 @@ impl ServerBuilder {
             name.to_string(),
             PromptDef {
                 description: Some(description.to_string()),
+                schema: None,
                 f: Arc::new(f),
             },
         );
         self
     }
 
-    /// Enchaîne un enregistrement généré par la macro `#[tool]` (feature
-    /// `macros`) — `builder.with_tool(register_add)` où `register_add` est
-    /// la fonction générée à côté de votre fonction annotée.
+    /// Comme [`ServerBuilder::prompt`], avec un **schéma à la Zod** (module
+    /// [`crate::zod`]) : les `arguments` d'un `prompts/get` sont validés
+    /// **avant** l'exécution du handler — hors schéma → `-32602` avec la
+    /// liste des problèmes dans `error.data.issues`, le handler ne tourne
+    /// jamais. C'est la variante utilisée par la macro `#[prompt]` (feature
+    /// `macros`).
+    pub fn prompt_typed<S, F>(mut self, name: &str, description: &str, schema: S, f: F) -> Self
+    where
+        S: Schema + 'static,
+        F: Fn(&Value) -> Result<Vec<PromptMessage>, String> + Send + Sync + 'static,
+    {
+        self.prompts.insert(
+            name.to_string(),
+            PromptDef {
+                description: Some(description.to_string()),
+                schema: Some(Arc::new(schema)),
+                f: Arc::new(f),
+            },
+        );
+        self
+    }
+
+    /// Enchaîne un enregistrement généré par une macro (`#[tool]`,
+    /// `#[resource]`, `#[prompt]` — feature `macros`) :
+    /// `builder.with_tool(register_add)` où `register_add` est la fonction
+    /// générée à côté de votre fonction annotée.
     #[must_use]
     pub fn with_tool(self, register: impl FnOnce(Self) -> Self) -> Self {
         register(self)

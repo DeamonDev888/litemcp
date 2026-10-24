@@ -60,10 +60,15 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
+### Ajout — suite de la feuille de route
+
+- **Macros `#[resource]` et `#[prompt]`** (feature `macros`) : même mécanique de dérivation que `#[tool]`. `#[resource]` prend une fonction sans paramètre (attributs `uri` requise, `name`, `description` requise) et génère l'enregistrement `.resource(…)` ; `#[prompt]` dérive le schéma des types des paramètres et valide les `arguments` d'un `prompts/get` **avant** l'exécution du handler.
+- **`.prompt_typed(name, description, schéma, handler)`** : la variante validée de `.prompt()` — hors schéma → `-32602` avec `error.data.issues`, le handler ne tourne jamais (même contrat que `tool_typed`).
+- **Fuzz du transport HTTP (proptest, dev-dépendance uniquement)** : trois propriétés sur serveur réel — (1) des octets arbitraires ne produisent que des réponses HTTP **complètes et correctement cadrées** (status line, en-têtes terminés, `Content-Length` exact) ou rien ; (2) des requêtes « réalistes » (verbes/chemins plausibles, en-têtes piégeux : duplications, obs-fold, `Transfer-Encoding`, `Content-Length` menteurs, séparateurs TAB) respectent le même invariant et le serveur **survit** à chaque cas ; (3) toute requête JSON-RPC valide reçoit exactement une enveloppe bien formée (`jsonrpc: "2.0"` + `result`|`error`, code numérique). 144 cas générés par exécution de la suite.
+
 ### Prévu (suite)
 
-- Macros `#[resource]` / `#[prompt]` (même mécanique de dérivation que `#[tool]`).
-- Fuzz du parseur HTTP (proptest/corpus) et tests clients réels (MCP Inspector, Claude, Cursor).
+- Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur.
 - Mesures SLO Linux (`VmRSS`, démarrage in-process) et publication des conditions figées.
 
 ## [0.4.0] - 2026-10-24

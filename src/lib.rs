@@ -20,7 +20,8 @@
 //! (`resources/*`) et **prompts** (`prompts/*`) — chaque handler peut être
 //! borné dans le temps ([`tool_timeout`](crate::server::ServerBuilder::tool_timeout)),
 //! et le serveur s'arrête proprement
-//! ([`handle`](crate::http::BoundServer::handle)/[`ServerHandle::shutdown`]).
+//! ([`handle`](crate::http::BoundServer::handle)/
+//! [`shutdown`](crate::http::ServerHandle::shutdown)).
 //! La feature `macros` ajoute `#[tool]` : le schéma d'entrée est dérivé
 //! des types des paramètres d'une fonction ordinaire.
 //!
@@ -59,10 +60,11 @@
 
 pub mod http;
 pub mod jsonrpc;
-/// Macro `#[tool]` (feature `macros`) — voir [`litemcp_macros::tool`].
+/// Macros `#[tool]`/`#[resource]`/`#[prompt]` (feature `macros`) — voir
+/// [`litemcp_macros`].
 #[cfg(feature = "macros")]
 pub mod macros {
-    pub use litemcp_macros::tool;
+    pub use litemcp_macros::{prompt, resource, tool};
 }
 pub mod protocol;
 pub mod server;
@@ -78,7 +80,7 @@ pub mod prelude {
     pub use crate::VERSION;
     pub use crate::http::ServerHandle;
     #[cfg(feature = "macros")]
-    pub use crate::macros::tool;
+    pub use crate::macros::{prompt, resource, tool};
     pub use crate::protocol::{
         CacheScope, PROTOCOL_VERSION, PromptMessage, ResultType, SUPPORTED_VERSIONS,
         ToolAnnotations,

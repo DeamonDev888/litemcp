@@ -25,6 +25,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 litemcp-macros = { path = "litemcp-macros", version = "0.1.0", optional = true }
 
+[dev-dependencies]
+# Fuzz du transport HTTP (tests/fuzz_http.rs) — dev uniquement, le cœur du
+# crate garde exactement serde + serde_json.
+proptest = "1"
+
 [profile.release]
 strip = true
 lto = "fat"
