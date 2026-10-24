@@ -14,10 +14,18 @@
 //! Le schéma publié est **exécuteur** : ce qu'il annonce est exactement ce
 //! que la validation applique (pas de dérogation possible) — y compris les
 //! **formats** (`.email()`, `.uuid()`, `.url()`, `.datetime()` : publiés
-//! `format` et **appliqués**), [`nullable`](crate::zod::nullable),
+//! `format` et **appliqués**), les **valeurs par défaut**
+//! ([`.default()`](crate::zod::Defaulted) : publiées **et** injectées),
+//! les **dictionnaires** ([`record`](crate::zod::record)),
+//! [`nullable`](crate::zod::nullable),
 //! [`describe`](crate::zod::describe) et le
 //! [`outputSchema`](crate::server::ServerBuilder::output_schema), qui
-//! valide la **sortie** structurée avant envoi. La feature `schemars`
+//! valide la **sortie** structurée avant envoi.
+//!
+//! Pour les schémas que le DSL n'exprime pas (`oneOf`, `not`,
+//! `patternProperties`…), la feature `schemars` fournit
+//! [`from_json_schema`](crate::schemars::from_json_schema) : un document
+//! JSON Schema écrit à la main, publié tel quel **et** appliqué. La feature `schemars`
 //! adapte en plus n'importe quel type `#[derive(JsonSchema)]`
 //! ([`crate::schemars`]) avec les sémantiques JSON Schema de bout en bout.
 //!
@@ -97,7 +105,7 @@ pub mod prelude {
         ToolAnnotations,
     };
     #[cfg(feature = "schemars")]
-    pub use crate::schemars::from_schemars;
+    pub use crate::schemars::{from_json_schema, from_schemars};
     pub use crate::server::{McpHeaders, ServerBuilder, ToolResult};
     pub use crate::zod;
 }

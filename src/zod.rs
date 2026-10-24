@@ -13,6 +13,13 @@
 //! que la validation applique — y compris les formats (`format` est une
 //! simple annotation en JSON Schema 2020-12 ; ici il est **appliqué**).
 //!
+//! Les **valeurs par défaut** ([`Defaulted`]) sont publiées **et**
+//! appliquées : un champ absent dont le schéma porte un défaut est valide,
+//! et la valeur est injectée dans les arguments avant l'exécution.
+//!
+//! [`record`] valide les **valeurs** d'un objet (dictionnaire) et
+//! [`integer_enumeration`] publie une énumération d'entiers.
+//!
 //! Les problèmes sont accumulés dans un collecteur borné ([`Issues`]) :
 //! au-delà de [`MAX_ISSUES`], ils sont comptés sans être stockés — un
 //! tableau géant d'éléments invalides ne peut pas faire grossir la mémoire
@@ -163,6 +170,32 @@ pub trait Schema: Send + Sync {
     /// Valide `value` au chemin `path` et accumule les problèmes dans
     /// `issues`.
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues);
+
+    /// Valeur par défaut de ce schéma, s'il en a une.
+    ///
+    /// Le défaut est **publié** dans le JSON Schema (mot-clé `default`)
+    /// **et appliqué** : un champ absent dont le schéma porte un défaut
+    /// est considéré valide, et la valeur par défaut est **injectée** dans
+    /// les arguments avant l'exécution du handler (comme le fait Zod).
+    fn default_value(&self) -> Option<&Value> {
+        None
+    }
+
+    /// Injecte les valeurs par défaut manquantes, **récursivement**.
+    ///
+    /// Appelé sur la racine des arguments : pour chaque champ absent
+    /// dont le schéma porte un défaut, la valeur est insérée ; les
+    /// valeurs présentes sont parcourues (un objet imbriqué peut porter
+    /// ses propres défauts).
+    fn apply_defaults(&self, _value: &mut Value) {}
+
+    /// Ce schéma (ou l'un de ses descendants) porte-t-il un défaut ?
+    ///
+    /// Permet d'éviter toute copie des arguments quand aucune valeur
+    /// par défaut n'est à injecter.
+    fn has_defaults(&self) -> bool {
+        false
+    }
 }
 
 /// Un schéma encapsulé (`Box`, `Arc`) est un schéma.
@@ -178,6 +211,15 @@ impl<S: Schema + ?Sized> Schema for Box<S> {
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         (**self).validate(path, value, issues);
     }
+    fn default_value(&self) -> Option<&Value> {
+        (**self).default_value()
+    }
+    fn apply_defaults(&self, value: &mut Value) {
+        (**self).apply_defaults(value);
+    }
+    fn has_defaults(&self) -> bool {
+        (**self).has_defaults()
+    }
 }
 
 /// Idem [`Box`] — un schéma partagé (`Arc<dyn Schema>`) reste un schéma.
@@ -187,6 +229,15 @@ impl<S: Schema + ?Sized> Schema for Arc<S> {
     }
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         (**self).validate(path, value, issues);
+    }
+    fn default_value(&self) -> Option<&Value> {
+        (**self).default_value()
+    }
+    fn apply_defaults(&self, value: &mut Value) {
+        (**self).apply_defaults(value);
+    }
+    fn has_defaults(&self) -> bool {
+        (**self).has_defaults()
     }
 }
 
@@ -200,6 +251,15 @@ impl<S: Schema + ?Sized> Schema for &S {
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         (**self).validate(path, value, issues);
     }
+    fn default_value(&self) -> Option<&Value> {
+        (**self).default_value()
+    }
+    fn apply_defaults(&self, value: &mut Value) {
+        (**self).apply_defaults(value);
+    }
+    fn has_defaults(&self) -> bool {
+        (**self).has_defaults()
+    }
 }
 
 /// Vérifie un couple de bornes cohérent — erreur de programmation, panique
@@ -212,6 +272,60 @@ fn assert_ordered<T: PartialOrd + std::fmt::Debug>(min: &T, max: &T, quoi: &str)
         "litemcp/zod : bornes incohérentes ({min:?} > {max:?}) sur {quoi} — \
          le schéma serait insatisfaisable"
     );
+}
+
+/// Un schéma porteur d'une **valeur par défaut**.
+///
+/// Le défaut est **publié** (mot-clé `default` du JSON Schema) **et
+/// appliqué** : un champ absent portant un défaut est valide, et la
+/// valeur est **injectée** dans les arguments avant l'exécution du
+/// handler — exactement comme le fait Zod.
+///
+/// ```rust
+/// # use litemcp::zod;
+/// let schema = zod::object()
+///     .field("query", zod::string())
+///     .opt("limit", zod::integer().default(10));
+/// // "limit" est publié avec `default: 10` et injecté si absent.
+/// ```
+#[derive(Clone)]
+pub struct Defaulted<S> {
+    inner: S,
+    default: Value,
+}
+
+impl<S> Defaulted<S> {
+    /// Attache une valeur par défaut à un schéma.
+    #[must_use]
+    pub fn new(inner: S, default: Value) -> Self {
+        Self { inner, default }
+    }
+}
+
+impl<S: Schema> Schema for Defaulted<S> {
+    fn json(&self) -> Value {
+        let mut schema = self.inner.json();
+        if let Some(object) = schema.as_object_mut() {
+            object.insert("default".to_string(), self.default.clone());
+        }
+        schema
+    }
+
+    fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
+        self.inner.validate(path, value, issues);
+    }
+
+    fn default_value(&self) -> Option<&Value> {
+        Some(&self.default)
+    }
+
+    fn apply_defaults(&self, value: &mut Value) {
+        self.inner.apply_defaults(value);
+    }
+
+    fn has_defaults(&self) -> bool {
+        true || self.inner.has_defaults()
+    }
 }
 
 /// Champ de [`Obj`] : requis ([`.field`](Obj::field)) ou optionnel ([`.opt`](Obj::opt)).
@@ -240,7 +354,7 @@ pub struct Obj {
 
 /// `z.object({ ... })`
 pub fn object() -> Obj {
-    Obj::default()
+    Default::default()
 }
 
 impl Obj {
@@ -289,6 +403,13 @@ impl Obj {
         self.strict = true;
         self
     }
+
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
+    }
 }
 
 impl Schema for Obj {
@@ -297,7 +418,10 @@ impl Schema for Obj {
         let mut required = Vec::new();
         for field in &self.fields {
             properties.insert(field.name.clone(), field.schema.json());
-            if field.required {
+            // Un champ **avec valeur par défaut** n'est pas `required` :
+            // son absence est couverte par le défaut (publié dans le
+            // `default` du schéma de la propriété).
+            if field.required && field.schema.default_value().is_none() {
                 required.push(json!(field.name));
             }
         }
@@ -337,6 +461,19 @@ impl Schema for Obj {
                     field.schema.validate(path, child, issues);
                     path.truncate(mark);
                 }
+                // Champ absent **avec valeur par défaut** : pas une
+                // erreur — le défaut sera injecté (voir
+                // [`Schema::apply_defaults`]). Le défaut lui-même est
+                // validé : un défaut incohérent avec le schéma est une
+                // erreur de programmation.
+                None if field.schema.default_value().is_some() => {
+                    let mark = path.mark();
+                    path.push_field(&field.name);
+                    if let Some(default) = field.schema.default_value() {
+                        field.schema.validate(path, default, issues);
+                    }
+                    path.truncate(mark);
+                }
                 None if field.required => {
                     let mark = path.mark();
                     path.push_field(&field.name);
@@ -346,6 +483,27 @@ impl Schema for Obj {
                 None => {}
             }
         }
+    }
+
+    fn apply_defaults(&self, value: &mut Value) {
+        let Some(map) = value.as_object_mut() else {
+            return;
+        };
+        for field in &self.fields {
+            match map.get_mut(&field.name) {
+                Some(child) => field.schema.apply_defaults(child),
+                None => {
+                    // Champ absent : on injecte le défaut s'il y en a un.
+                    if let Some(default) = field.schema.default_value() {
+                        map.insert(field.name.clone(), default.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn has_defaults(&self) -> bool {
+        self.fields.iter().any(|field| field.schema.has_defaults())
     }
 }
 
@@ -539,7 +697,7 @@ pub struct Str {
 
 /// `z.string()`
 pub fn string() -> Str {
-    Str::default()
+    Default::default()
 }
 
 impl Str {
@@ -584,6 +742,13 @@ impl Str {
     pub fn url(mut self) -> Self {
         self.format = Some(Format::Url);
         self
+    }
+
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
     }
 
     /// Exige un date-time ISO 8601 (publié `format: "date-time"`, appliqué).
@@ -658,7 +823,7 @@ pub struct Int {
 
 /// `z.number().int()`
 pub fn integer() -> Int {
-    Int::default()
+    Default::default()
 }
 
 impl Int {
@@ -682,6 +847,13 @@ impl Int {
         if let (Some(min), Some(max)) = (self.min, self.max) {
             assert_ordered(&min, &max, "integer()");
         }
+    }
+
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
     }
 }
 
@@ -728,7 +900,7 @@ pub struct Num {
 
 /// `z.number()`
 pub fn number() -> Num {
-    Num::default()
+    Default::default()
 }
 
 impl Num {
@@ -765,6 +937,13 @@ impl Num {
         if let (Some(min), Some(max)) = (self.min, self.max) {
             assert_ordered(&min, &max, "number()");
         }
+    }
+
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
     }
 }
 
@@ -808,6 +987,15 @@ pub fn boolean() -> Bool {
     Bool
 }
 
+impl Bool {
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
+    }
+}
+
 impl Schema for Bool {
     fn json(&self) -> Value {
         json!({ "type": "boolean" })
@@ -823,10 +1011,13 @@ impl Schema for Bool {
 /// `z.enum([...])` — chaîne parmi un ensemble fermé.
 #[derive(Clone)]
 pub struct Enum {
-    values: Vec<String>,
+    /// Les valeurs autorisées — chaînes ou entiers.
+    values: Vec<Value>,
+    /// Le type JSON publié (`"string"` ou `"integer"`).
+    kind: &'static str,
 }
 
-/// `z.enum(["a", "b", ...])`
+/// `z.enum(["a", "b", ...])` — énumération de **chaînes**.
 ///
 /// **Panie de développement** si la liste est vide (schéma insatisfaisable)
 /// ou contient un doublon (le meta-schema JSON Schema exige des éléments
@@ -844,25 +1035,147 @@ pub fn enumeration(values: &[&str]) -> Enum {
         );
     }
     Enum {
-        values: values.iter().map(|v| (*v).to_string()).collect(),
+        values: values.iter().map(|v| json!(*v)).collect(),
+        kind: "string",
+    }
+}
+
+/// `z.enum([1, 2, 3])` — énumération d'**entiers**.
+///
+/// Même contrat que [`enumeration`] : liste vide ou doublon → panique de
+/// développement. Publié `{"type": "integer", "enum": [1, 2, 3]}`.
+pub fn integer_enumeration(values: &[i64]) -> Enum {
+    assert!(
+        !values.is_empty(),
+        "litemcp/zod : enumeration vide — schéma insatisfaisable"
+    );
+    for (index, value) in values.iter().enumerate() {
+        assert!(
+            !values[index + 1..].contains(value),
+            "litemcp/zod : doublon {value:?} dans enumeration — le meta-schema \
+             JSON Schema exige des éléments uniques"
+        );
+    }
+    Enum {
+        values: values.iter().map(|v| json!(*v)).collect(),
+        kind: "integer",
+    }
+}
+
+impl Enum {
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
     }
 }
 
 impl Schema for Enum {
     fn json(&self) -> Value {
-        json!({ "type": "string", "enum": self.values })
+        json!({ "type": self.kind, "enum": self.values })
     }
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
-        match value.as_str() {
-            Some(s) if self.values.iter().any(|v| v == s) => {}
-            Some(_) => issues.push(format!(
-                "`{}` : doit être l'un de {}",
-                path.as_str(),
-                self.values.join(", ")
-            )),
-            None => issues.push(format!("`{}` : chaîne attendue", path.as_str())),
+        if self.values.iter().any(|v| v == value) {
+            return;
         }
+        // Type incorrect → message de type ; sinon message d'appartenance.
+        let type_ok = match self.kind {
+            "integer" => value.is_i64() || value.is_u64(),
+            _ => value.is_string(),
+        };
+        if type_ok {
+            let rendered = self
+                .values
+                .iter()
+                .map(|v| match v.as_str() {
+                    Some(s) => s.to_string(),
+                    None => v.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            issues.push(format!(
+                "`{}` : doit être l'un de {rendered}",
+                path.as_str()
+            ));
+        } else {
+            let expected = if self.kind == "integer" {
+                "entier attendu"
+            } else {
+                "chaîne attendue"
+            };
+            issues.push(format!("`{}` : {expected}", path.as_str()));
+        }
+    }
+}
+
+/// `z.record(inner)` — objet à **valeurs typées** (dictionnaire).
+///
+/// Chaque valeur de l'objet est validée par le schéma interne ; les clés
+/// sont libres (chaînes, comme en JSON).
+///
+/// Publié `{"type": "object", "additionalProperties": <inner>}` — la
+/// forme JSON Schema du dictionnaire.
+///
+/// ```rust
+/// # use litemcp::zod;
+/// let schema = zod::record(zod::string());
+/// // {"a": "x", "b": "y"} → valide ; {"a": 1} → refusé.
+/// ```
+#[derive(Clone)]
+pub struct Record {
+    inner: std::sync::Arc<dyn Schema>,
+}
+
+impl Record {
+    /// Le schéma interne (type des valeurs).
+    #[must_use]
+    pub fn inner(&self) -> &dyn Schema {
+        self.inner.as_ref()
+    }
+}
+
+/// `z.record(inner)`
+pub fn record(inner: impl Schema + 'static) -> Record {
+    Record {
+        inner: std::sync::Arc::new(inner),
+    }
+}
+
+impl Schema for Record {
+    fn json(&self) -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": self.inner.json(),
+        })
+    }
+
+    fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
+        let Some(map) = value.as_object() else {
+            issues.push(format!("`{}` : objet attendu", path.as_str()));
+            return;
+        };
+        for (key, child) in map {
+            let mark = path.mark();
+            path.push_field(key);
+            self.inner.validate(path, child, issues);
+            path.truncate(mark);
+        }
+    }
+
+    fn apply_defaults(&self, value: &mut Value) {
+        // Les valeurs présentes sont parcourues (chacune peut porter
+        // ses propres défauts) ; aucune clé n'est inventée.
+        if let Some(map) = value.as_object_mut() {
+            for child in map.values_mut() {
+                self.inner.apply_defaults(child);
+            }
+        }
+    }
+
+    fn has_defaults(&self) -> bool {
+        self.inner.has_defaults()
     }
 }
 
@@ -905,6 +1218,13 @@ impl Arr {
             assert_ordered(&min, &max, "array()");
         }
     }
+
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
+    }
 }
 
 impl Schema for Arr {
@@ -941,6 +1261,18 @@ impl Schema for Arr {
             path.truncate(mark);
         }
     }
+
+    fn apply_defaults(&self, value: &mut Value) {
+        if let Some(items) = value.as_array_mut() {
+            for item in items {
+                self.inner.apply_defaults(item);
+            }
+        }
+    }
+
+    fn has_defaults(&self) -> bool {
+        self.inner.has_defaults()
+    }
 }
 
 /// `z.nullable()` — accepte `null` **en plus** du schéma interne.
@@ -959,6 +1291,15 @@ pub fn nullable(inner: impl Schema + 'static) -> Nullable {
     }
 }
 
+impl Nullable {
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
+    }
+}
+
 impl Schema for Nullable {
     fn json(&self) -> Value {
         json!({ "anyOf": [self.inner.json(), { "type": "null" }] })
@@ -969,6 +1310,16 @@ impl Schema for Nullable {
             return;
         }
         self.inner.validate(path, value, issues);
+    }
+
+    fn apply_defaults(&self, value: &mut Value) {
+        if !value.is_null() {
+            self.inner.apply_defaults(value);
+        }
+    }
+
+    fn has_defaults(&self) -> bool {
+        self.inner.has_defaults()
     }
 }
 
@@ -990,6 +1341,15 @@ pub fn describe(description: &str, inner: impl Schema + 'static) -> Described {
     }
 }
 
+impl Described {
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
+    }
+}
+
 impl Schema for Described {
     fn json(&self) -> Value {
         let mut schema = self.inner.json();
@@ -1001,6 +1361,14 @@ impl Schema for Described {
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         self.inner.validate(path, value, issues);
+    }
+
+    fn apply_defaults(&self, value: &mut Value) {
+        self.inner.apply_defaults(value);
+    }
+
+    fn has_defaults(&self) -> bool {
+        self.inner.has_defaults()
     }
 }
 

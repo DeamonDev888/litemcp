@@ -52,6 +52,119 @@ use serde_json::Value;
 use std::marker::PhantomData;
 use std::sync::OnceLock;
 
+/// Un schéma construit depuis un **document JSON Schema brut**.
+///
+/// Pour les schémas **exotiques** que le DSL [`crate::zod`] n'exprime pas
+/// (`oneOf`, `anyOf`, `not`, `patternProperties`, `if`/`then`/`else`,
+/// `$ref` internes…) : on écrit le document à la main et on le branche
+/// comme n'importe quel autre schéma.
+///
+/// ```ignore
+/// use litemcp::schemars::from_json_schema;
+/// use serde_json::json;
+///
+/// let schema = from_json_schema(json!({
+///     "type": "object",
+///     "properties": { "x": { "type": "string" } },
+///     "required": ["x"]
+/// }));
+///
+/// ServerBuilder::new("app", "1.0.0")
+///     .tool_typed("t", "t", schema, |args| Ok(args.clone()))
+///     .bind("127.0.0.1:8080")?
+///     .serve()?;
+/// ```
+///
+/// Le document est **publié tel quel** et **appliqué** par le validateur
+/// [`jsonschema`] — la promesse « le schéma publié est exécuté » tient.
+///
+/// Le document doit être un **objet** (ou un booléen JSON Schema) : toute
+/// autre forme est refusée à la construction (erreur de programmation).
+pub struct FromJsonSchema {
+    document: Value,
+    validator: OnceLock<Validator>,
+}
+
+/// Validateur compilé — ou le diagnostic d'échec de compilation.
+enum Validator {
+    Compiled(::jsonschema::Validator),
+    Broken(String),
+}
+
+/// Construit un schéma exécuteur depuis un **document JSON Schema brut**.
+///
+/// Le document est **publié tel quel** dans l'`inputSchema` et **appliqué**
+/// par le validateur [`jsonschema`].
+///
+/// # Panics
+///
+/// Si le document n'est ni un objet ni un booléen JSON Schema — une
+/// erreur de programmation (un document invalide ne peut pas être
+/// publié).
+#[must_use]
+pub fn from_json_schema(document: Value) -> FromJsonSchema {
+    assert!(
+        document.is_object() || document.is_boolean(),
+        "litemcp/schemars : document JSON Schema invalide — un objet ou un \
+         booléen est attendu (reçu : {})",
+        if document.is_null() {
+            "null".to_string()
+        } else {
+            document.to_string()
+        }
+    );
+    FromJsonSchema {
+        document,
+        validator: OnceLock::new(),
+    }
+}
+
+impl FromJsonSchema {
+    /// Le document JSON Schema publié.
+    #[must_use]
+    pub fn document(&self) -> &Value {
+        &self.document
+    }
+
+    fn validator(&self) -> &Validator {
+        self.validator.get_or_init(|| {
+            match ::jsonschema::options()
+                .should_validate_formats(true)
+                .build(&self.document)
+            {
+                Ok(validator) => Validator::Compiled(validator),
+                Err(error) => Validator::Broken(error.to_string()),
+            }
+        })
+    }
+}
+
+impl Schema for FromJsonSchema {
+    fn json(&self) -> Value {
+        self.document.clone()
+    }
+
+    fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
+        match self.validator() {
+            Validator::Broken(message) => issues.push(format!(
+                "`{}` : schéma interne incompilable ({message})",
+                path.as_str()
+            )),
+            Validator::Compiled(validator) => {
+                for error in validator.iter_errors(value) {
+                    let pointer = error.instance_path().to_string();
+                    let location = if pointer.is_empty() {
+                        path.as_str().to_string()
+                    } else {
+                        format!("{}{}", path.as_str(), pointer_to_suffix(&pointer))
+                    };
+                    issues.push(format!("`{location}` : {error}"));
+                }
+            }
+        }
+    }
+}
+
 /// Adaptateur « schéma exécuteur » pour un type `schemars`.
 ///
 /// Construit-le avec [`from_schemars::<T>()`] — le schéma JSON et le
@@ -67,15 +180,6 @@ pub struct FromSchemars<T: ?Sized> {
     /// activation explicite, le validateur l'ignore et le schéma
     /// publié ne serait pas appliqué (promesse « exécuteur » rompue).
     validator_with_formats: OnceLock<Validator>,
-}
-
-/// Validateur compilé — ou le diagnostic d'échec de compilation (un schéma
-/// généré par schemars est valide en pratique ; si le document ne compile
-/// pas, chaque validation rend UNE issue le disant au lieu d'accepter en
-/// silence).
-enum Validator {
-    Compiled(::jsonschema::Validator),
-    Broken(String),
 }
 
 /// Adapte un type `#[derive(JsonSchema)]` en schéma exécuteur litemcp.

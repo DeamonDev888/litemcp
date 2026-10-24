@@ -676,6 +676,21 @@ impl ServerCore {
                 );
             }
         };
+        // **Injection des valeurs par défaut** : un champ absent dont le
+        // schéma porte un `default` est complété **avant** l'exécution
+        // (comme Zod) — le handler reçoit les arguments complets.
+        //
+        // La copie n'a lieu que si le schéma porte des défauts : sans
+        // défaut, le chemin nominal reste **zéro allocation**.
+        let mut injected_arguments;
+        let arguments = match &tool.schema {
+            Some(schema) if schema.has_defaults() => {
+                injected_arguments = arguments.clone();
+                schema.apply_defaults(&mut injected_arguments);
+                &injected_arguments
+            }
+            _ => arguments,
+        };
         if let Some(schema) = &tool.schema {
             let mut issues = Issues::new();
             let mut path = Path::root("arguments");

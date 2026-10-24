@@ -26,6 +26,69 @@ fn capteur(celsius: f64, actif: bool) -> litemcp::ToolResult {
     Ok(json!({ "celsius": celsius, "actif": actif }))
 }
 
+/// Valeurs par défaut déclarées au niveau de la macro :
+/// `#[tool(default(limit = 10, mode = "fast"))]`.
+#[tool(
+    description = "Recherche avec limite par défaut",
+    default(limit = 10, mode = "fast")
+)]
+fn recherche_defaut(query: String, limit: u64, mode: String) -> litemcp::ToolResult {
+    Ok(json!({ "query": query, "limit": limit, "mode": mode }))
+}
+
+#[test]
+fn macro_parameter_default_is_published_and_applied() {
+    let core = ServerBuilder::new("m", "0.1.0")
+        .with_tool(register_recherche_defaut)
+        .core();
+
+    // Le défaut est **publié** dans l'inputSchema.
+    let list = call(&core, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+    let schema = &list["result"]["tools"][0]["inputSchema"];
+    assert_eq!(
+        schema["properties"]["limit"]["default"],
+        json!(10),
+        "le défaut doit être publié : {list}"
+    );
+    assert_eq!(
+        schema["properties"]["mode"]["default"],
+        json!("fast"),
+        "le défaut doit être publié : {list}"
+    );
+    // Un champ avec défaut n'est pas `required`.
+    let required = schema["required"].as_array().cloned().unwrap_or_default();
+    assert!(!required.contains(&json!("limit")), "{list}");
+    assert!(required.contains(&json!("query")), "{list}");
+
+    // Le défaut est **injecté** : le handler reçoit la valeur.
+    let v = call_tool(&core, 2, "recherche_defaut", json!({ "query": "x" }));
+    assert!(v.get("error").is_none(), "{v}");
+    assert_eq!(v["result"]["structuredContent"]["limit"], json!(10), "{v}");
+    assert_eq!(
+        v["result"]["structuredContent"]["mode"],
+        json!("fast"),
+        "{v}"
+    );
+
+    // Une valeur explicite écrase le défaut.
+    let v2 = call_tool(
+        &core,
+        3,
+        "recherche_defaut",
+        json!({ "query": "x", "limit": 99, "mode": "slow" }),
+    );
+    assert_eq!(
+        v2["result"]["structuredContent"]["limit"],
+        json!(99),
+        "{v2}"
+    );
+    assert_eq!(
+        v2["result"]["structuredContent"]["mode"],
+        json!("slow"),
+        "{v2}"
+    );
+}
+
 fn call(core: &litemcp::ServerCore, body: &str) -> Value {
     let reply = core.dispatch(body.as_bytes()).unwrap();
     serde_json::from_slice(&reply).unwrap()

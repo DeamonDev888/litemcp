@@ -3,7 +3,7 @@ members = [".", "litemcp-macros"]
 
 [package]
 name = "litemcp"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 description = "La lib MCP (Model Context Protocol) la plus légère pour Rust : votre serveur MCP en quelques lignes. Streamable HTTP stateless uniquement (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement."
@@ -26,7 +26,7 @@ schemars = ["dep:schemars", "dep:jsonschema"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-litemcp-macros = { path = "litemcp-macros", version = "0.2.0", optional = true }
+litemcp-macros = { path = "litemcp-macros", version = "0.3.0", optional = true }
 schemars = { version = "1", optional = true }
 jsonschema = { version = "0.60", default-features = false, optional = true }
 

@@ -58,6 +58,33 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 - 72 tests au total (19 unitaires JSON-RPC/zod/protocol, 44 HTTP sur vraies sockets, 5 smoke, 4 doctests).
 
+## [0.6.0] - 2026-10-24
+
+### Ajout — comblement des trous du DSL Zod
+
+Quatre manques signalés à l'usage, tous comblés :
+
+- **Valeurs par défaut** — `.default(v)` attache une valeur par défaut à n'importe quel schéma (`string`, `integer`, `number`, `boolean`, `enum`, `array`, `object`, `record`, `nullable`, `describe`). Le défaut est **publié** (mot-clé `default` du JSON Schema) **et appliqué** : le champ devient optionnel (plus dans `required`) et la valeur est **injectée** dans les arguments **avant** l'exécution du handler (comme Zod). Le défaut est lui-même validé contre son schéma — un défaut incohérent est une erreur de programmation, refusée à la validation. Les défauts s'appliquent **récursivement** (un objet imbriqué porte ses propres défauts) ;
+- **`record(valeur)`** — objet à **valeurs typées** (dictionnaire) : chaque valeur est validée par le schéma interne, les clés sont libres. Publié `{"type": "object", "additionalProperties": <schéma>}` ; les chemins d'issue pointent la clé fautive (`arguments.labels.a`) ;
+- **Énumération d'entiers** — `integer_enumeration(&[1, 2, 3])` publie `{"type": "integer", "enum": [1, 2, 3]}` (la variante `enumeration` reste limitée aux chaînes, comme avant) ;
+- **Schéma JSON Schema brut** — `schemars::from_json_schema(document)` prend un document JSON Schema écrit à la main et le branche comme n'importe quel schéma : il est **publié tel quel** et **appliqué** par le validateur `jsonschema`. Couvre ce que le DSL n'exprime pas (`oneOf`, `not`, `patternProperties`, `if`/`then`/`else`, `$ref` internes…). Le document doit être un objet ou un booléen JSON Schema — sinon panique de développement.
+
+### Ajout — valeurs par défaut dans les macros
+
+- `#[tool(default(limit = 10, mode = "fast"))]` — les valeurs par défaut sont déclarées **au niveau de la macro** (Rust interdit les attribute macros sur les paramètres d'une fonction). Le champ devient optionnel, la valeur est publiée **et injectée** si elle est absente des arguments. La valeur doit être un **littéral** (elle est publiée en JSON) ; un `default(nom = …)` qui ne désigne aucun paramètre est refusé à la compilation.
+
+### API
+
+- `Schema` gagne trois méthodes : `default_value()` (la valeur par défaut), `apply_defaults()` (injection récursive) et `has_defaults()` (permet d'éviter toute copie des arguments quand aucun défaut n'est à injecter — le chemin nominal reste **zéro allocation**).
+
+### Documentation
+
+- **Coût réel des features, mesuré et publié** — le tableau du README compare les trois jeux (défaut / `+ macros` / `+ schemars`) sur un **projet consommateur externe**, feature réellement utilisée : 19 → 20 → 70 crates, 147 Kio → 214 Kio → **6,0 Mio**. Le point clé : `schemars` coûte +5,9 Mio de binaire quand on s'en sert (le linker élimine tout si on l'active sans l'utiliser) — c'est l'argument qui tranche pour l'embarqué, pas le décompte de crates.
+
+### Tests
+
+- **168 tests** (13 de régression dédiés : `tests/zod_gaps_2026_10_24.rs` pour le DSL, +1 dans `tests/macros.rs` pour les valeurs par défaut des macros).
+
 ## [0.5.1] - 2026-10-24
 
 ### Correctifs — audit complet 2026-10-24

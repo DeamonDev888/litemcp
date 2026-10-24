@@ -6,7 +6,7 @@
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.5.1%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.6.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
 ![crates.io](https://img.shields.io/crates/v/litemcp.svg) ![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI) ![Docs](https://img.shields.io/docsrs/litemcp)
 
@@ -34,11 +34,29 @@ Les principes :
 3. **Deux dépendances, pas une de plus.** `serde` et `serde_json` — la dérivation JSON Schema et la validation sont faites maison, dans le module [`zod`](#outils--schémas-à-la-zod). Les features `macros` et `schemars` en ajoutent d'autres, mais **uniquement** si vous les activez.
 4. **Mesuré ou rien.** Chaque release publie taille de binaire, latence et mémoire, avec les conditions de mesure. Jamais d'adjectif sans chiffre.
 
+### Le coût réel des features
+
+| Jeu de features | Crates (projet consommateur) | Binaire release (LTO fat + strip) |
+|---|---|---|
+| **défaut** (rien d'activé) | **19** | **147 Kio** |
+| `+ macros` | 20 (+1) | 214 Kio (+67 Kio) |
+| `+ schemars` | 70 (+51) | **6,0 Mio** (+5,9 Mio) |
+
+*Mesuré le 2026-10-24 — Windows 11, rustc 1.99.1, release + `lto = "fat"` + `codegen-units = 1` + `strip`. Méthode : un projet consommateur externe dépendant de litemcp (un serveur, un outil), comparé avec et sans chaque feature — **la feature étant réellement utilisée**, sinon le linker élimine tout et le binaire ne change pas.*
+
+**Le cœur est minimal par défaut.** Le build par défaut ne tire que deux dépendances : `serde` et `serde_json` — rien d'autre.
+
+- **`macros`** ajoute **une** crate (`litemcp-macros`, compilation seule : `syn`/`quote` ne sont jamais liés dans votre binaire) ;
+- **`schemars`** est la feature à surveiller : elle tire `schemars` + `jsonschema` et **+51 crates transitives** (`regex`, `fancy-regex`, `num`, `parking_lot`, `ahash`…). Si vous l'utilisez réellement, le binaire passe de **147 Kio à 6,0 Mio** ; si vous l'activez sans l'utiliser, le linker élimine tout et le binaire reste à 147 Kio ;
+- **Si vous voulez rester minimal**, gardez le jeu par défaut et utilisez le module `zod` intégré : il couvre le même terrain — validation, formats, défauts, dictionnaires, énumérations — **sans aucune dépendance de plus**.
+
+> Le cœur du crate reste à **2 dépendances** quoi que vous activiez : `schemars` n'est qu'un adaptateur *optionnel* pour les types `#[derive(JsonSchema)]`.
+
 ## Fonctions phares
 
 | | |
 |---|---|
-| ⚡ **Minuscule** | 2 dépendances, binaire minimal **148 Kio** (mesuré, release strippé), démarrage en quelques ms |
+| ⚡ **Minuscule** | 2 dépendances, binaire minimal **147 Kio** (mesuré, release strippé), démarrage en quelques ms |
 | 🚀 **Sans runtime** | threads `std`, un par connexion — pas de tokio au cœur |
 | 🧩 **Schémas à la Zod** | `inputSchema` dérivé du schéma, publié dans `tools/list` ; `outputSchema` **exécuteur** (sortie validée avant envoi) |
 | ✅ **Validation avant exécution** | un appel hors schéma ne touche jamais votre handler |
@@ -52,12 +70,12 @@ Les principes :
 
 ```toml
 [dependencies]
-litemcp = "0.5.1"
+litemcp = "0.6.0"
 
 # pour la macro #[tool] (deps de compilation seulement) :
-# litemcp = { version = "0.5.1", features = ["macros"] }
+# litemcp = { version = "0.6.0", features = ["macros"] }
 # pour l'adaptateur schemars (#[derive(JsonSchema)] en schéma exécuteur) :
-# litemcp = { version = "0.5.1", features = ["schemars"] }
+# litemcp = { version = "0.6.0", features = ["schemars"] }
 ```
 
 Ou directement depuis GitHub :
@@ -146,7 +164,22 @@ Trois registres, du plus direct au plus confortable :
 | `tool_typed` | `&Value` (déjà validé) | dérivé du schéma | automatique |
 | `tool_parse` | struct `Deserialize` | dérivé du schéma | automatique |
 
-Schémas disponibles : `object().field(..)/.opt(..)/.strict()`, `string().min/.max` **et formats exécutés** `.email()/.uuid()/.url()/.datetime()`, `integer().min/.max`, `number().min/.max`, `boolean()`, `enumeration(&[..])`, `array(s).min/.max`, plus `nullable(schéma)` (accepte `null`, publié `anyOf`) et `describe("…", schéma)` (description publiée). Les contraintes deviennent `minLength`/`maxLength`/`minimum`/`maximum`/`minItems`/`maxItems`/`enum`/`format` dans le JSON Schema publié à `tools/list` — **appliquées** à l'identique par la validation. Des bornes incohérentes (`min > max`), non finies (`NaN`/±∞) ou une `enumeration` vide/doublonnée paniquent au démarrage (erreur de programmation, jamais publiées).
+Schémas disponibles : `object().field(..)/.opt(..)/.strict()`, `string().min/.max` **et formats exécutés** `.email()/.uuid()/.url()/.datetime()`, `integer().min/.max`, `number().min/.max`, `boolean()`, `enumeration(&[..])` (chaînes) et `integer_enumeration(&[..])` (entiers), `array(s).min/.max`, `record(valeur)` (objet à valeurs typées), plus `nullable(schéma)` (accepte `null`, publié `anyOf`) et `describe("…", schéma)` (description publiée). Les contraintes deviennent `minLength`/`maxLength`/`minimum`/`maximum`/`minItems`/`maxItems`/`enum`/`format` dans le JSON Schema publié à `tools/list` — **appliquées** à l'identique par la validation. Des bornes incohérentes (`min > max`), non finies (`NaN`/±∞) ou une `enumeration` vide/doublonnée paniquent au démarrage (erreur de programmation, jamais publiées).
+
+**Valeurs par défaut** — `.default(v)` attache une valeur par défaut à n'importe quel schéma. Elle est **publiée** (mot-clé `default` du JSON Schema) **et appliquée** : le champ devient optionnel, et la valeur est **injectée** dans les arguments avant l'exécution du handler (comme Zod).
+
+```rust
+zod::object()
+    .field("query", zod::string())
+    .opt("limit", zod::integer().default(10))   // publié `default: 10`, injecté si absent
+```
+
+**Dictionnaires** — `record(valeur)` valide **chaque valeur** d'un objet (les clés sont libres) ; publié `{"type": "object", "additionalProperties": <schéma>}`.
+
+```rust
+zod::object().field("labels", zod::record(zod::string()))
+// {"a": "x"} → valide ; {"a": 1} → refusé (chemin `arguments.labels.a`)
+```
 
 `Box<S>`, `Arc<S>` et `&S` implémentent `Schema` : un **registre de schémas hétérogènes** (issus d'une config, d'une base, d'un registre dynamique) s'utilise directement, sans wrapper manuel.
 
@@ -186,6 +219,16 @@ ServerBuilder::new("calc", "1.0.0")
 
 `#[tool]` et `#[prompt]` valident les arguments via le schéma dérivé (`#[prompt]` passe par `.prompt_typed(…)`, la variante validée de `.prompt()`) ; `#[resource]` prend une fonction **sans paramètre** (`uri` requise). Types supportés : entiers, `f32`/`f64`, `bool`, `String`, `Option<T>` (champ optionnel), `Vec<T>`. Le cœur du crate reste à **2 dépendances** — `syn`/`quote` ne sont que des deps de compilation, activées seulement par la feature.
 
+**Valeurs par défaut** — `default(nom = valeur, …)` déclaré sur la macro (Rust interdit les attribute macros sur les paramètres). Le champ devient optionnel, la valeur est **publiée** dans l'`inputSchema` **et injectée** dans les arguments si elle est absente.
+
+```rust
+#[tool(description = "Recherche", default(limit = 10, mode = "fast"))]
+fn recherche(query: String, limit: u64, mode: String) -> litemcp::ToolResult {
+    Ok(serde_json::json!({ "query": query, "limit": limit, "mode": mode }))
+}
+// sans "limit" dans les arguments → limit = 10 ; "limit": 42 → 42
+```
+
 ### Adaptateur `schemars` (feature `schemars`)
 
 Un type `#[derive(JsonSchema)]` devient un schéma exécuteur — le JSON Schema publié est celui que schemars dérive, et la validation applique **le même document** via le validateur `jsonschema` :
@@ -207,6 +250,24 @@ ServerBuilder::new("recherche", "1.0.0")
 ```
 
 Utilisable partout où l'API attend `impl zod::Schema` (`tool_typed`, `tool_parse`, `prompt_typed`, `output_schema`). Sémantiques JSON Schema de bout en bout (le validateur officiel accepte par ex. `3.0` pour `integer` — pour la garantie `as_i64()` stricte, restez sur `zod::integer()`). Les `format` (`email`, `uuid`, `date-time`, `uri`…) sont **appliqués**, comme dans `zod`. Deux deps de plus, uniquement si la feature est activée.
+
+**Schéma JSON brut** — pour les schémas que le DSL n'exprime pas (`oneOf`, `not`, `patternProperties`, `if`/`then`/`else`, `$ref` internes…), `from_json_schema` prend un document écrit à la main : il est **publié tel quel** et **appliqué** par le même validateur.
+
+```rust
+use litemcp::schemars::from_json_schema;
+use serde_json::json;
+
+let schema = from_json_schema(json!({
+    "type": "object",
+    "properties": { "value": { "oneOf": [{ "type": "string" }, { "type": "integer" }] } },
+    "required": ["value"]
+}));
+
+ServerBuilder::new("app", "1.0.0")
+    .tool_typed("t", "t", schema, |args| Ok(args.clone()))
+    .bind("127.0.0.1:8080")?
+    .serve()?;
+```
 
 ### Resources & Prompts
 
@@ -318,7 +379,7 @@ Trois passes consécutives, même machine, même session :
 | `tools/call` keep-alive (moyenne) | **0,077–0,086 ms/req** | 2 000 appels, warmup 200 déduit |
 | p50 / p99 keep-alive | 0,062–0,065 / **0,297–0,442 ms** | 2 000 appels |
 | Connexions neuves | **1 576–1 759 conn/s** | 300 connexions |
-| Binaire release strippé — **minimal** (1 outil) | **148 Kio** (151 552 o) | LTO fat + `codegen-units = 1` |
+| Binaire release strippé — **minimal** (1 outil) | **147 Kio** (150 528 o) | LTO fat + `codegen-units = 1`, mesuré depuis un projet consommateur |
 | Binaire release strippé — **démo `hello`** (3 registres + annotations) | **596 Kio** (610 816 o) | idem |
 | Démarrage in-process (bind + 1ʳᵉ réponse) | **5,4 ms** | `examples/slo` |
 | Mémoire après 2 300 requêtes | n/a hors Linux | `VmRSS` via `/proc/self/status` |
