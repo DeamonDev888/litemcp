@@ -66,10 +66,26 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - **`.prompt_typed(name, description, schéma, handler)`** : la variante validée de `.prompt()` — hors schéma → `-32602` avec `error.data.issues`, le handler ne tourne jamais (même contrat que `tool_typed`).
 - **Fuzz du transport HTTP (proptest, dev-dépendance uniquement)** : trois propriétés sur serveur réel — (1) des octets arbitraires ne produisent que des réponses HTTP **complètes et correctement cadrées** (status line, en-têtes terminés, `Content-Length` exact) ou rien ; (2) des requêtes « réalistes » (verbes/chemins plausibles, en-têtes piégeux : duplications, obs-fold, `Transfer-Encoding`, `Content-Length` menteurs, séparateurs TAB) respectent le même invariant et le serveur **survit** à chaque cas ; (3) toute requête JSON-RPC valide reçoit exactement une enveloppe bien formée (`jsonrpc: "2.0"` + `result`|`error`, code numérique). 144 cas générés par exécution de la suite.
 
+### Mesures — campagne SLO Linux (conditions figées)
+
+**Suite complète sur Linux** : 134/134 tests (Ubuntu 26.04 LTS, kernel 7.0.0-38, 8 cœurs, rustc 1.99.1) — y compris le fuzz proptest et les sockets. Nouvel exemple **`examples/slo`** (démarrage in-process, 2 300 requêtes keep-alive warmup déduit, `VmRSS` avant/après via `/proc/self/status`) : la campagne est reproductible par n'importe qui (`cargo run --release --example slo`).
+
+| Métrique | Windows 11 | Linux (Ubuntu 26.04, 8 cœurs) |
+|---|---|---|
+| keep-alive moyenne / p99 | 0,065–0,070 / 0,095–0,123 ms | **0,031–0,033 / 0,048–0,065 ms** |
+| Connexions neuves | 848–1 257 conn/s | **4 400–5 041 conn/s** |
+| Mémoire après 2 300 requêtes | 5,5 Mo (WorkingSet) | **2,7 Mio `VmRSS`, +4 Kio pendant la charge** |
+| Démarrage in-process (bind + 1ʳᵉ réponse) | — | **~0,4 ms** |
+| Binaire release stripped (hello) | 385 Ko | 687 Ko |
+
+### CI — protection de la branche `main`
+
+- Workflow : groupe `concurrency` (les runs supplantés d'une même branche/PR sont annulés) ; les jobs `test`/`msrv`/`advisories` se déclenchent automatiquement sur **tout push et toute pull request**.
+- Protection de branche `main` : les trois checks CI sont **requis**, une **approbation** est exigée avant merge (reviews périmées rejetées sur nouveau push), histoire linéaire requise — les admins conservent l'accès direct.
+
 ### Prévu (suite)
 
 - Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur.
-- Mesures SLO Linux (`VmRSS`, démarrage in-process) et publication des conditions figées.
 
 ## [0.4.0] - 2026-10-24
 

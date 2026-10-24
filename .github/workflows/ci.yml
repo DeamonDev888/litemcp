@@ -1,9 +1,18 @@
 name: CI
 
+# Les trois jobs se déclenchent automatiquement sur tout push vers main et
+# sur TOUTE pull request (quelle que soit la branche source). La protection
+# de branche les rend requis avant merge + 1 approbation.
 on:
   push:
     branches: [main]
   pull_request:
+
+# Un seul run actif par ref : un nouveau push sur la même branche/PR annule
+# le run supplanté (économise les runners, résultats plus rapides).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:

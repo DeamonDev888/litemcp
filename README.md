@@ -276,7 +276,7 @@ Le durcissement transport est intégré et vérifié par la suite de tests : lim
 
 ## Benchmarks
 
-> Règle du projet : **jamais d'adjectif sans chiffre.** Première campagne mesurée (Windows 11, release, loopback) — les conditions seront figées et republiées à chaque release.
+> Règle du projet : **jamais d'adjectif sans chiffre.** Deux campagnes mesurées et figées (Windows 11 et Ubuntu 26.04, release, loopback) — republiées à chaque release.
 
 **Route maison vs backend alternatif `tiny_http`** (bench A/B exécuté le 2026-10-22, `examples/bench_backends`) :
 
@@ -300,14 +300,21 @@ Le durcissement transport est intégré et vérifié par la suite de tests : lim
 
 Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** par réponse — avant : deux syscalls, deux paquets avec nodelay), parsing d'en-têtes **zéro allocation** (`Origin`/`Host`/`Accept`/`Connection` réduits à des verdicts, sans chaînes ni `Vec`), buffers de lecture réutilisés sur toute la connexion keep-alive, **zéro clone des arguments** dans le dispatch (`params` déplacé hors du JSON parsé, handler et validation travaillent par référence), `route`/`allow_origins` partagés par `Arc`. Dépendances inchangées : toujours exactement deux (`serde`, `serde_json`).
 
-**SLO (conditions : Windows 11, release, loopback — mesures Linux/`VmRSS` à la prochaine campagne) :**
+**SLO — deux campagnes, conditions figées :**
 
-| Métrique | Cible | Mesuré |
-|---|---|---|
-| Binaire release stripped (hello) | < 1,5 Mo | **385 Ko** ✅ |
-| `tools/call` keep-alive (moyenne) | < 1 ms | **0,065–0,070 ms** ✅ (p99 < 0,13 ms, bruit Windows ; campagne figée Linux à venir) |
-| RSS serveur hello (au repos) | < 2 Mo | 4,7 Mo (WorkingSet Windows, DLL partagées incluses — mesure `VmRSS` Linux à venir) |
-| Démarrage à froid | < 10 ms | ~130 ms via shell Windows (overhead de spawn inclus ; mesure in-process à venir) |
+- **Windows 11** (release, loopback, build `x86_64-pc-windows-msvc`).
+- **Linux** (Ubuntu 26.04 LTS, kernel 7.0.0-38-generic, 8 cœurs, 15 Gio, rustc 1.99.1, release LTO fat/strip, loopback — campagnes du 2026-10-24, reproductibles via `cargo run --release --example bench_backends` et `cargo run --release --example slo`).
+
+| Métrique | Cible | Windows 11 | Linux (Ubuntu 26.04) |
+|---|---|---|---|
+| Binaire release stripped (hello) | < 1,5 Mo | **385 Ko** ✅ | **687 Ko** ✅ |
+| `tools/call` keep-alive (moyenne) | < 1 ms | 0,065–0,070 ms ✅ | **0,031–0,033 ms** ✅ |
+| p99 keep-alive | < 2 ms | 0,095–0,123 ms ✅ | **0,048–0,065 ms** ✅ |
+| Connexions neuves | — | 848–1 257 conn/s | **4 400–5 041 conn/s** |
+| Mémoire après 2 300 requêtes (processus complet : serveur + client) | < 10 Mo | 5,5 Mo (WorkingSet, DLL partagées incluses) | **2,7 Mio `VmRSS`, +4 Kio pendant la charge** ✅ |
+| Démarrage in-process (bind + 1ʳᵉ réponse) | < 10 ms | ~130 ms via shell (spawn inclus) | **~0,4 ms** ✅ |
+
+`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **134 tests** (dont fuzz proptest) est vérifiée sur les deux OS.
 
 ## Comparatif — ViteMCP (TypeScript)
 
