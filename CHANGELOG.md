@@ -68,6 +68,45 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - Ressources et prompts dans le noyau (aujourd'hui : `tools` seulement).
 - Mesures SLO Linux (`VmRSS`, démarrage in-process) et publication des conditions figées.
 
+## [0.3.3] - 2026-10-23
+
+### Conformité MCP 2026-07-28 — la spec est maintenant implémentée **entièrement**
+
+La lib annonçait viser la spec `2026-07-28` mais implémentait encore la surface *legacy* `2025-11-25`. La spec `2026-07-28` a changé de modèle (stateless, sans handshake, version par requête) — l'écart est désormais comblé :
+
+- **`server/discover`** (SEP-2575, **MUST**) : implémentée — annonce `supportedVersions`, `capabilities` et `serverInfo` sous `_meta["io.modelcontextprotocol/serverInfo"]` ;
+- **`resultType` obligatoire** (SEP-2322) : présent dans **chaque** résultat (`"complete"`) ;
+- **`ttlMs` / `cacheScope`** (SEP-2549) : présents sur `tools/list` (`60000` / `"private"`) ;
+- **Gestion de version** (SEP-2575) : la version est lue dans `_meta["io.modelcontextprotocol/protocolVersion"]` ; une version **explicite** non supportée est refusée en `-32022` (`UnsupportedProtocolVersionError`) avec `data.supported` / `data.requested`. L'**absence** de version est tolérée (compatibilité `2025-11-25`) ;
+- **En-têtes de routage** (SEP-2243) : `Mcp-Method` et `Mcp-Name` sont acceptés et **vérifiés contre le corps** de la requête ; incohérents → `-32020` (`HeaderMismatch`) ;
+- `initialize` et `ping` (retirées de la spec) restent **tolérées** comme extensions legacy.
+
+### Sécurité — correctifs de l'audit du 2026-10-23
+
+Audit statique (code intégral) + revue indépendante croisée + **vérifications dynamiques sur serveur réel** (build release, config par défaut). Un **P1** et quatre **P2** corrigés :
+
+- **[P1] Désynchronisation de la file sur `/health`** : la branche `health_probe` répondait **sans consommer le corps**. Le corps résiduel devenait la requête suivante — un `GET /health` avec un `Content-Length` et un corps contenant une `POST /mcp` produisait **2 réponses** et **exécutait le corps caché** (reproduit : `id: 42`). Correctif : **un corps est refusé sur la sonde** (`400`, fermeture) — plus simple et plus sûr qu'un drain, qui aurait obligé à attendre des octets pouvant ne jamais arriver (un `Content-Length: 1048576` sans corps retenait un slot jusqu'à la deadline de 60 s, et `Expect: 100-continue` provoquait un blocage croisé) ;
+- **[P1] `Transfer-Encoding` refusé APRÈS le routage** : `TE: chunked` sur `/health` était **accepté** (200) et les octets chunked résiduels étaient relus comme requête. Le contrôle est désormais appliqué **avant** le routage, donc sur toutes les routes ;
+- **[P2] Le `503` « trop de connexions » était perdu** : le `close()` partait avec la requête du client **non lue** dans le tampon de réception → RST → le tampon du client (qui contient le 503) était purgé. Mesuré : **4/20 réponses lues**. Correctif : drain borné (64 Kio / 50 ms) + `shutdown(Write)`, et le refus est écrit **hors de la boucle d'`accept`** (thread court, borné à 64 refus simultanés) — mesuré : **15/15** lues, latence médiane par refus **1,4 ms** (contre 240 ms de blocage de la boucle auparavant). Le test existant passait pour la mauvaise raison (il n'envoyait rien avant de lire) ;
+- **[P2] Amplification mémoire ×9 800** : le corps était pré-alloué et zéroé en entier avant la moindre lecture (`vec![0u8; len]`). 256 clients annonçant 1 Mio sans envoyer de corps consommaient **264 Mio** de commit pour 28 Kio reçus. Lecture désormais **par tranches** (buffer 64 Ko réutilisé) → **+24 Mio** mesurés (×864) ;
+- **[P2] TTL de connexion** : le deadline par requête était réinitialisé à chaque requête keep-alive — un client qui drip-feed des requêtes valides (sous le `read_timeout`) retenait son slot **indéfiniment**, et 256 clients lents suffisaient à saturer le plafond durablement. Nouvelle option `.connection_ttl(duration)` (défaut **5 min**) ;
+- **[P2] L'`id` JSON-RPC était perdu sur les erreurs** : toute réponse `-32600` portait `id: null`, comme la réponse de panique. L'`id` est désormais extrait *best-effort* **avant** la validation et repris dans la réponse (JSON-RPC 2.0 §5) ;
+- **[P2] `arguments` non-objet accepté** : un outil sans schéma recevait un scalaire/tableau/`null` en violation du contrat de l'API (« la closure reçoit `arguments` (objet JSON) »). Refusé en `-32602` dans **tous** les cas ;
+- **[P3] Schéma Zod exécuteur** : `integer()` acceptait `3.0`/`1e2` alors que `Value::as_i64()` y renvoie `None` — le motif documenté `args["a"].as_i64().unwrap()` **paniquait** sur une valeur que le schéma déclarait valide. `integer()` n'accepte plus que les entiers JSON **syntaxiques**, et publie ses bornes exactes (`minimum`/`maximum`) : ce que le schéma annonce est **exactement** ce que la validation applique — aucune dérogation possible ;
+- **[P3] Doublon de nom de champ** : `Obj::field`/`Obj::opt` ne refusaient pas les doublons → `required: ["a","a"]` (JSON Schema invalide) et un outil insatisfaisable. Panique de développement au démarrage ;
+- **[P3] Parsing strict** : séparateurs de la ligne de requête = **espaces ASCII (SP) uniquement** (le HTAB et les caractères de contrôle sont refusés) ; fin de ligne **CRLF stricte** (le LF seul — vecteur *httpoxy* — est refusé) ; `Accept` et `Expect` comparés **par jeton exact** (`text/event-stream-x` ne vaut pas `text/event-stream` ; `not-100-continued` ne déclenche pas de `100 Continue`) ; `Connection: close` est **absorbant** en HTTP/1.0 ;
+- **[P3] `Content-Type` vérifié** : un `POST` en `text/plain` était traité comme du JSON → `415 Unsupported Media Type` (absent : accepté) ;
+- **[P3] `.annotate()` sans effet selon l'ordre** : les annotations sont désormais stockées à part et fusionnées à l'enregistrement de l'outil — `.annotate()` **avant** ou **après** `.tool()` donne le même résultat (avant : perte silencieuse) ;
+- **[P3] `tool_parse` ne clone plus le `Value`** : la désérialisation passait par `value.clone()` (copie de l'arbre JSON des arguments, jusqu'à 1 Mio par appel) — désormais sérialisation unique puis désérialisation ;
+- **[P3] `u64::MAX` accepté comme `id`** : JSON-RPC autorise tout `Number` ; les ids au-delà de `i64::MAX` sont désormais acceptés (`RequestId::Unsigned`) ;
+- **[P3] `core()` documenté comme un instantané** ; `serve()` reste non interruptible (les tests fuient ~51 threads — connu, non corrigé) ;
+- **CI** : job `cargo-deny` (advisories RustSec sur `Cargo.lock`) + `deny.toml` minimal ;
+- **README** : section « Sécurité » (modèle de menace opérationnel — TLS/auth/rate-limit par IP au proxy, plafond global ≠ par IP, TTL de connexion, timeout des handlers bloquants à la charge du handler, format des origines autorisées : origine normalisée navigateur, sans port par défaut) + tableau « Protocole » aligné sur la spec `2026-07-28`.
+
+### Tests
+
+- **109 tests au total** (27 unitaires JSON-RPC/zod/protocol, 73 HTTP sur vraies sockets, 5 smoke, 4 doctests) — 29 nouveaux, un par correctif ci-dessus.
+
 ## [0.3.0] - 2026-10-22
 
 ### Added

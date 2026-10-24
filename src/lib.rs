@@ -11,10 +11,22 @@
 //!
 //! Schémas à la Zod ([`crate::zod`]) : dérivation de l'`inputSchema` et
 //! validation des arguments avant exécution, handlers typés disponibles.
+//! Le schéma publié est **exécuteur** : ce qu'il annonce est exactement ce
+//! que la validation applique (pas de dérogation possible).
 //!
-//! Spec cible : MCP 2026-07-28 — chaque message est un `POST /mcp`, la
-//! réponse arrive en `application/json` (ou en `text/event-stream` si le
-//! client ne demande que du SSE).
+//! Spec cible : MCP **2026-07-28** — protocole **stateless**, sans handshake :
+//! chaque message est un `POST /mcp`, la réponse arrive en `application/json`
+//! (ou en `text/event-stream` si le client ne demande que du SSE).
+//!
+//! - `server/discover` : implémentée (SEP-2575) — annonce les versions
+//!   supportées, les capacités et l'identité du serveur ;
+//! - `resultType` : présent dans **chaque** résultat (SEP-2322) ;
+//! - `ttlMs` / `cacheScope` : présents sur `tools/list` (SEP-2549) ;
+//! - version de protocole : lue dans `_meta`, refusée en `-32022` si
+//!   inconnue ; son absence est tolérée (compatibilité `2025-11-25`) ;
+//! - `Mcp-Method` / `Mcp-Name` : acceptés et vérifiés contre le corps
+//!   (SEP-2243) ;
+//! - `initialize` et `ping` : tolérés (méthodes legacy `2025-11-25`).
 //!
 //! ```no_run
 //! use litemcp::prelude::*;
@@ -44,7 +56,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Tout ce qu'il faut pour écrire un serveur en quelques lignes.
 pub mod prelude {
     pub use crate::VERSION;
-    pub use crate::protocol::{PROTOCOL_VERSION, ToolAnnotations};
-    pub use crate::server::{ServerBuilder, ToolResult};
+    pub use crate::protocol::{
+        CacheScope, PROTOCOL_VERSION, ResultType, SUPPORTED_VERSIONS, ToolAnnotations,
+    };
+    pub use crate::server::{McpHeaders, ServerBuilder, ToolResult};
     pub use crate::zod;
 }

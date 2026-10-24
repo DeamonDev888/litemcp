@@ -21,3 +21,13 @@ jobs:
         run: cargo test --all-features
       - name: Doc
         run: cargo doc --no-deps
+
+  advisories:
+    # Chaîne d'approvisionnement : échoue si une dépendance verrouillée
+    # (Cargo.lock) a un advisory RustSec connu.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-deny
+      - name: Advisories
+        run: cargo deny check advisories

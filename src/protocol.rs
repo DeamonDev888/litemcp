@@ -4,14 +4,65 @@ use serde::Serialize;
 use serde_json::Value;
 
 /// Version de la spec MCP ciblée.
+///
+/// La spec `2026-07-28` est **stateless** : pas de handshake
+/// `initialize`/`initialized`, pas de `Mcp-Session-Id`. Chaque requête porte
+/// sa version dans `_meta["io.modelcontextprotocol/protocolVersion"]`.
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// Versions de protocole supportées par ce serveur.
+///
+/// La spec `2026-07-28` exige qu'un serveur annonce les versions qu'il
+/// implémente (`server/discover`) et refuse une version non supportée avec
+/// `UnsupportedProtocolVersionError` (`-32022`).
+pub const SUPPORTED_VERSIONS: &[&str] = &[PROTOCOL_VERSION];
+
+/// Clé `_meta` portant la version de protocole d'une requête (SEP-2575).
+pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// Clé `_meta` portant les informations client (SEP-2575).
+pub const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+
+/// Clé `_meta` portant les informations serveur (SEP-2575).
+pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 
 /// Méthodes supportées par le noyau.
 pub mod method {
+    /// Découverte des capacités du serveur (**MUST**, SEP-2575).
+    pub const DISCOVER: &str = "server/discover";
+    /// Handshake legacy `2025-11-25` — toléré, plus requis.
     pub const INITIALIZE: &str = "initialize";
+    /// Méthode legacy `2025-11-25` — retirée de la spec `2026-07-28`.
     pub const PING: &str = "ping";
     pub const TOOLS_CALL: &str = "tools/call";
     pub const TOOLS_LIST: &str = "tools/list";
+}
+
+/// Type de résultat — champ **obligatoire** dans chaque `result` (SEP-2322).
+///
+/// * `"complete"` : résultat ordinaire, terminal ;
+/// * `"input_required"` : résultat intermédiaire d'une requête multi-tour
+///   (MRTR) — le client doit réémettre la requête avec `inputResponses`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultType {
+    /// Résultat terminal.
+    Complete,
+    /// Résultat intermédiaire : des informations supplémentaires sont requises.
+    InputRequired,
+}
+
+/// Portée de cache d'un résultat de liste (SEP-2549).
+///
+/// * `"public"` : les intermédiaires partagés peuvent mettre en cache ;
+/// * `"private"` : cache réservé au client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheScope {
+    /// Cacheable par les intermédiaires.
+    Public,
+    /// Cacheable uniquement par le client.
+    Private,
 }
 
 /// Description d'un outil exposé par `tools/list`.
@@ -89,8 +140,20 @@ impl ToolAnnotations {
 }
 
 /// Résultat de `tools/list`.
+///
+/// Conformité `2026-07-28` : porte `resultType`, `ttlMs` (indice de
+/// fraîcheur) et `cacheScope` (SEP-2549).
 #[derive(Debug, Serialize)]
 pub struct ToolsListResult {
+    /// Type de résultat — **obligatoire** (SEP-2322).
+    #[serde(rename = "resultType")]
+    pub result_type: ResultType,
+    /// Durée de vie conseillée du catalogue, en millisecondes (SEP-2549).
+    #[serde(rename = "ttlMs")]
+    pub ttl_ms: u64,
+    /// Portée de cache (SEP-2549).
+    #[serde(rename = "cacheScope")]
+    pub cache_scope: CacheScope,
     pub tools: Vec<Tool>,
 }
 
@@ -103,8 +166,13 @@ pub struct TextContent {
 }
 
 /// Résultat de `tools/call` (MCP : `content` + `isError` + `structuredContent`).
+///
+/// Conformité `2026-07-28` : porte `resultType` (SEP-2322).
 #[derive(Debug, Serialize)]
 pub struct CallToolResult {
+    /// Type de résultat — **obligatoire** (SEP-2322).
+    #[serde(rename = "resultType")]
+    pub result_type: ResultType,
     pub content: Vec<TextContent>,
     #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
@@ -126,6 +194,7 @@ impl From<Result<Value, String>> for CallToolResult {
                     serde_json::json!({ "result": value })
                 };
                 Self {
+                    result_type: ResultType::Complete,
                     content: vec![TextContent {
                         kind: "text",
                         text: structured.to_string(),
@@ -135,6 +204,7 @@ impl From<Result<Value, String>> for CallToolResult {
                 }
             }
             Err(message) => Self {
+                result_type: ResultType::Complete,
                 content: vec![TextContent {
                     kind: "text",
                     text: message,
@@ -146,11 +216,32 @@ impl From<Result<Value, String>> for CallToolResult {
     }
 }
 
-/// Informations serveur renvoyées à `initialize` (compatibilité inspecteurs).
+/// Informations serveur renvoyées par `server/discover` et `initialize`
+/// (compatibilité inspecteurs).
 #[derive(Debug, Serialize)]
 pub struct ServerInfo {
     pub name: String,
     pub version: String,
+}
+
+/// Résultat de `server/discover` (**MUST**, SEP-2575).
+///
+/// Annonce les versions de protocole supportées, les capacités du serveur et
+/// son identité. C'est la méthode que les clients `2026-07-28` appellent
+/// pour découvrir les capacités *avant* toute autre requête.
+#[derive(Debug, Serialize)]
+pub struct DiscoverResult {
+    /// Type de résultat — **obligatoire** (SEP-2322).
+    #[serde(rename = "resultType")]
+    pub result_type: ResultType,
+    /// Versions de protocole supportées par le serveur.
+    #[serde(rename = "supportedVersions")]
+    pub supported_versions: Vec<&'static str>,
+    /// Capacités exposées par le serveur.
+    pub capabilities: Value,
+    /// Identité du serveur, sous `_meta` (SEP-2575).
+    #[serde(rename = "_meta")]
+    pub meta: Value,
 }
 
 #[cfg(test)]
@@ -165,6 +256,7 @@ mod tests {
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["structuredContent"], json!({ "result": 42 }));
         assert_eq!(v["content"][0]["text"], r#"{"result":42}"#);
+        assert_eq!(v["resultType"], "complete");
 
         let result = CallToolResult::from(Ok::<Value, String>(Value::Null));
         let v = serde_json::to_value(&result).unwrap();
@@ -179,5 +271,13 @@ mod tests {
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["structuredContent"], json!({ "somme": 12 }));
         assert_eq!(v["content"][0]["text"], r#"{"somme":12}"#);
+    }
+
+    #[test]
+    fn every_result_carries_a_result_type() {
+        // SEP-2322 : resultType est OBLIGATOIRE dans chaque result.
+        let call = CallToolResult::from(Ok::<Value, String>(json!({})));
+        let v = serde_json::to_value(&call).unwrap();
+        assert_eq!(v["resultType"], "complete");
     }
 }

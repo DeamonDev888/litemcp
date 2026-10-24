@@ -6,11 +6,11 @@
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.3.2%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.3.3%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
 ![crates.io](https://img.shields.io/crates/v/litemcp.svg) ![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI) ![Docs](https://img.shields.io/docsrs/litemcp)
 
-[Installation](#installation) · [Démarrage rapide](#démarrage-rapide) · [Concepts](#concepts) · [Protocole](#protocole) · [FAQ](#faq)
+[Installation](#installation) · [Démarrage rapide](#démarrage-rapide) · [Concepts](#concepts) · [Configuration](#configuration) · [Sécurité](#sécurité) · [Protocole](#protocole) · [FAQ](#faq)
 
 </div>
 
@@ -155,26 +155,49 @@ La valeur de retour d'un outil devient `structuredContent` — les objets JSON p
 | Méthode | Défaut | Rôle |
 |---|---|---|
 | `.route(path)` | `/mcp` | chemin unique du serveur |
-| `.allow_origins(&[..])` | vide | origines `Origin` autorisées (clients navigateur) — toute requête avec `Origin` non listée est refusée (garde DNS-rebinding) ; les clients CLI n'en envoient pas |
+| `.allow_origins(&[..])` | vide | origines `Origin` autorisées (clients navigateur) — toute requête avec `Origin` non listée est refusée (garde DNS-rebinding) ; les clients CLI n'en envoient pas. Format : l'origine **normalisée navigateur** — schéma + hôte en minuscules, **sans port par défaut** (un navigateur écrit `https://a.example`, jamais `https://a.example:443`) ; comparaison exacte insensible à la casse |
 | `.read_timeout(duration)` | 30 s | timeout de lecture par opération (anti-slowloris) — un client trop lent est déconnecté sans réponse |
 | `.max_connections(n)` | 256 (par serveur) | plafond de connexions simultanées — au-delà, `503` immédiat, pas de spawn |
-| Sonde `GET /health` | `/health` (inclus) | `200` « ok » sans JSON-RPC — probes k8s/systemd/équilibreur |
-| Corps de requête | 1 Mio | au-delà → `413` |
+| `.connection_ttl(duration)` | 5 min | durée de vie maximale d'une connexion keep-alive — borne le temps d'occupation d'un slot (sans elle, un client qui drip-feed des requêtes valides retient son slot indéfiniment) ; `0` désactive le TTL |
+| Sonde `GET /health` | `/health` (inclus) | `200` « ok » sans JSON-RPC — probes k8s/systemd/équilibreur (`HEAD` accepté, sans corps) |
+| Corps de requête | 1 Mio | au-delà → `413` — lu **par tranches** (buffer 64 Ko) : la mémoire engagée est proportionnelle aux octets réellement reçus |
 | En-têtes | 64 max, lignes 16 Kio max | au-delà → `431` |
 
+## Sécurité
+
+**Modèle de menace assumé : litemcp est une bibliothèque réseau, pas un service exposé.** Quiconque peut joindre le socket peut appeler vos outils — il n'y a ni authentification ni TLS intégrés (choix architectural : voir le comparatif ViteMCP, « OAuth 2.1 intégré » est écarté volontairement). Le durcissement intégré couvre le protocole ; la périphérie est à votre charge :
+
+- **Liaison** : bind `127.0.0.1:8080` (comme dans tous les exemples) si le serveur ne parle qu'à des processus locaux ; sinon, exposez derrière un **reverse proxy** qui apporte TLS, authentification (par ex. OAuth 2.1) et rate-limiting **par IP** — le plafond de connexions de litemcp est **global au serveur** (256 par défaut) : 256 clients lents peuvent l'occuper et renvoyer `503` aux autres, c'est à ça que sert le quota par IP du proxy (le TTL de connexion de 5 min borne par ailleurs la durée d'occupation d'un slot) ;
+- **Navigateurs** : garde DNS-rebinding intégrée — toute requête portant un `Origin` non listé dans `.allow_origins` est refusée (`403`), et les préflights CORS échouent par défaut (`OPTIONS` → `405`) ;
+- **Handlers bloquants** : il n'y a pas de timeout d'exécution des outils — un handler qui bloque retient son thread et son slot de connexion. Encadrez vos appels lents (thread + canal avec délai, ou futures bloquantes bornées) ;
+- **Validation** : privilégiez `tool_typed`/`tool_parse` (schéma appliqué **avant** votre code) ; `tool` brut vous laisse la validation des arguments — c'est là que naissent les bugs d'injection côté handler, pas dans le transport. Le schéma publié est **exécuteur** : ce qu'il annonce est exactement ce que la validation applique.
+
+Le durcissement transport est intégré et vérifié par la suite de tests : limites (corps 1 Mio, 64 en-têtes, lignes 16 Kio, 256 connexions, TTL 5 min), timeouts (lecture 30 s, deadline 60 s — slowloris coupé), anti request-smuggling (`Transfer-Encoding` ou `Content-Length` dupliqué → `400` sur **toutes** les routes, corps consommé partout pour éviter toute désynchronisation de file), parsing strict (ligne d'en-tête sans `:` ou espace avant `:` → `400`, séparateurs SP uniquement, CRLF strict, version sensible à la casse, `Accept`/`Expect` comparés par jeton exact), `Host` requis, obs-fold refusé, `Content-Type` vérifié (`415`), paniques de handlers contenues (`-32603` **avec l'`id` de la requête**, le serveur continue). Le transport a fait l'objet d'un audit complet (statique + dynamique sur serveur réel) ; les correctifs qui en découlent sont consignés dans le [CHANGELOG](CHANGELOG.md).
+
 ## Protocole
+
+**Spec MCP `2026-07-28`** (stateless, sans handshake) — implémentée intégralement :
 
 | Comportement | Réponse |
 |---|---|
 | `POST /mcp` valide | `200 application/json` — réponse JSON-RPC |
 | `POST` avec `Accept: text/event-stream` seul | `200 text/event-stream` — un événement `data:` (SSE request-scoped) + en-têtes anti-tampon |
 | Notification (sans `id`) | `202 Accepted` sans corps |
-| Sonde `GET /health` | `200` « ok » (sans JSON-RPC ; probes k8s/systemd) · autre méthode : `405` |
+| `server/discover` (SEP-2575) | `200` — versions supportées, capacités, `serverInfo` dans `_meta` |
+| Version de protocole dans `_meta` | `2026-07-28` acceptée · version inconnue : `-32022` (`UnsupportedProtocolVersionError`) · **absence tolérée** (compatibilité `2025-11-25`) |
+| `resultType` (SEP-2322) | présent dans **chaque** résultat (`"complete"`) |
+| `tools/list` — `ttlMs` / `cacheScope` (SEP-2549) | `60000` / `"private"` |
+| `Mcp-Method` / `Mcp-Name` (SEP-2243) | acceptés ; **incohérents avec le corps** → `-32020` (`HeaderMismatch`) |
+| `initialize` / `ping` | tolérés (méthodes legacy `2025-11-25`, retirées de la spec `2026-07-28`) |
+| Sonde `GET /health` | `200` « ok » (sans JSON-RPC ; probes k8s/systemd) · `HEAD /health` : mêmes en-têtes, sans corps · **un corps annoncé est refusé** (`400`, la sonde n'en accepte aucun) · autre méthode : `405` (`Allow: GET, HEAD`) |
 | `GET` sur `/mcp` | `405 Method Not Allowed` (pas de listener SSE permanent en stateless) |
-| Version HTTP ≠ 1.0/1.1 · ligne de requête malformée | `505` · `400` |
-| HTTP/1.1 sans `Host` (ou `Host` dupliqué) · ligne obs-fold | `400` |
-| Route inconnue | `404` · `Content-Length` absent : `411` · malformé : `400` · corps > 1 Mio : `413` |
+| Version HTTP ≠ `HTTP/1.0`/`HTTP/1.1` exactes (sensible à la casse) · ligne de requête malformée | `505` · `400` |
+| HTTP/1.1 sans `Host` (ou `Host` dupliqué) · ligne obs-fold · en-tête sans `:` · espace avant `:` · HTAB dans la ligne de requête · fin de ligne LF seul | `400` |
+| Route inconnue | `404` · `Content-Length` absent (POST) : `411` · malformé : `400` · corps > 1 Mio : `413` |
+| `Content-Type` ≠ `application/json` | `415 Unsupported Media Type` (absent : accepté) |
+| `Transfer-Encoding` présent (toute route) · `Content-Length` dupliqué | `400` (anti request-smuggling) |
 | En-tête `Origin` non autorisé | `403` (garde DNS-rebinding ; CLI sans `Origin` : libre) |
+| Toute erreur JSON-RPC | l'`id` de la requête est **repris** dans la réponse (JSON-RPC 2.0 §5) |
 
 ## Benchmarks
 
@@ -262,7 +285,7 @@ location /mcp {
 ## Tests
 
 ```bash
-cargo test                          # 72 tests : unitaires + intégration (vraies sockets) + doctests
+cargo test                          # 109 tests : unitaires + intégration (vraies sockets) + doctests
 cargo clippy -- -D warnings         # CI stricte
 ```
 
@@ -277,7 +300,7 @@ L'historique complet et détaillé vit dans [CHANGELOG.md](CHANGELOG.md) — sec
 | 0 | Fondations (repo, Cargo, CI, licences) | ✅ |
 | 1 | Noyau JSON-RPC + dispatch MCP | ✅ |
 | 2 | Transport HTTP stateless (bind, POST/SSE) | ✅ |
-| 3 | Durcissement HTTP (timeouts, limites, 100-continue, keep-alive) | ✅ (+ audit complet : Host/505/obs-fold/CL malformé, plafond d'issues ; fuzz + Inspector → 0.4) |
+| 3 | Durcissement HTTP (timeouts, limites, 100-continue, keep-alive) | ✅ (+ audits complets : Host/505/obs-fold/CL malformé, plafond d'issues ; durcissement 2026-10-23 appliqué ; fuzz + Inspector → 0.4) |
 | 4 | Schémas Zod + outils typés + annotations | ✅ (macros → 0.4) |
 | 5 | Publication crates.io | ✅ |
 | 6 | Conformance officielle + benchmarks → 1.0 | ⏳ |

@@ -860,3 +860,757 @@ fn truncated_body_gets_400() {
     let _ = stream.read_to_string(&mut raw);
     assert!(raw.contains("HTTP/1.1 400"), "{raw:?}");
 }
+
+// --- Durcissement supplémentaire (audit du 2026-10-23) ---
+
+#[test]
+fn header_without_colon_is_400() {
+    // RFC 9112 §5 : une ligne d'en-tête sans deux-points est malformée —
+    // l'ignorer exposerait une lecture divergente d'avec un proxy amont.
+    let addr = spawn_hardened();
+    let (status, _) = raw_request(
+        addr,
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nJunkHeaderSansColon\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn space_before_colon_is_400() {
+    // RFC 9112 §5.1 : aucun espace entre le nom de champ et le deux-points.
+    let addr = spawn_hardened();
+    let (status, _) = raw_request(
+        addr,
+        "POST /mcp HTTP/1.1\r\nHost : t\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn empty_header_name_is_400() {
+    let addr = spawn_hardened();
+    let (status, _) = raw_request(
+        addr,
+        "POST /mcp HTTP/1.1\r\nHost: t\r\n: vide\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn unicode_whitespace_in_request_line_is_400() {
+    // RFC 9112 §3 : séparateurs = espaces ASCII uniquement. Un NBSP (valide
+    // en UTF-8) ne doit pas faire une ligne de requête acceptable.
+    let addr = spawn_hardened();
+    let request = "POST\u{00a0}/mcp\u{00a0}HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+    let (status, _) = raw_request(addr, request);
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn lowercase_version_is_505() {
+    // RFC 9112 §2.3 : la version est un jeton exact, sensible à la casse.
+    let addr = spawn_hardened();
+    let (status, _) = raw_request(
+        addr,
+        "POST /mcp http/1.1\r\nHost: t\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    assert_eq!(status, 505);
+}
+
+#[test]
+fn head_health_is_200_without_body_and_keeps_alive() {
+    // HEAD : en-têtes du GET équivalent (Content-Length: 2), SANS corps —
+    // et la connexion reste réutilisable (le client HEAD sait qu'aucun
+    // corps ne suit, la requête pipelinée d'après doit être servie).
+    let addr = spawn_hardened();
+    let ping_body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let pipeline = format!(
+        "HEAD /health HTTP/1.1\r\nHost: t\r\n\r\nPOST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{ping_body}",
+        ping_body.len()
+    );
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.write_all(pipeline.as_bytes()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    assert_eq!(raw.matches("HTTP/1.1 200 OK").count(), 2, "{raw:?}");
+    // Le Content-Length annoncé reste celui du GET.
+    assert!(raw.contains("Content-Length: 2"), "{raw:?}");
+    // Zéro octet entre la fin des en-têtes HEAD et la réponse suivante.
+    let head_end = raw.find("\r\n\r\n").unwrap() + 4;
+    let next_response = raw[head_end..].find("HTTP/1.1 200 OK").unwrap() + head_end;
+    assert_eq!(
+        head_end,
+        next_response,
+        "la réponse HEAD porte un corps : {:?}",
+        &raw[head_end..head_end + 20]
+    );
+    assert!(raw.contains("\"result\":{}"), "{raw:?}");
+}
+
+#[test]
+fn head_on_mcp_is_405_without_body() {
+    // Toute réponse à HEAD est sans corps — même les erreurs : un corps sur
+    // une réponse HEAD désynchroniserait un client keep-alive.
+    let addr = spawn_hardened();
+    let (status, body) = raw_request(
+        addr,
+        "HEAD /mcp HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 405);
+    assert!(body.is_empty(), "corps sur une réponse HEAD : {body:?}");
+}
+
+#[test]
+fn params_array_is_32600_not_silently_empty() {
+    // JSON-RPC 2.0 : params présent mais non-objet = requête invalide,
+    // pas une requête sans paramètres.
+    let addr = spawn_hardened();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":["add"]}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], -32600);
+}
+
+// --- Correctifs de l'audit du 2026-10-23 (constats A0, A2, A4, B1, B3, B4) ---
+
+/// Envoie une requête brute et renvoie la réponse complète (status + corps).
+fn raw_exchange(addr: SocketAddr, request: &str, timeout: std::time::Duration) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(timeout)).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+    parse(&raw)
+}
+
+#[test]
+fn health_probe_rejects_a_body_so_it_cannot_become_the_next_request() {
+    // P1 : la branche /health ne consommait pas le corps. Le corps résiduel
+    // devenait la requête suivante → 2 réponses pour 1 requête et exécution
+    // du corps caché (désynchronisation de la file).
+    //
+    // Correctif retenu : un corps est **refusé** sur la sonde (400) — c'est
+    // la seule façon d'être sûr qu'aucun reliquat ne reste, sans attendre
+    // des octets qui pourraient ne jamais arriver.
+    let addr = spawn_hardened();
+    let hidden_body = r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"add","arguments":{"a":1,"b":2}}}"#;
+    let hidden = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{hidden_body}",
+        hidden_body.len()
+    );
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n{hidden}",
+        hidden.len()
+    );
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(800)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+
+    assert_eq!(
+        raw.matches("HTTP/1.1").count(),
+        1,
+        "une seule réponse attendue (le corps caché ne doit pas être exécuté) : {raw:?}"
+    );
+    assert!(
+        raw.contains("HTTP/1.1 400"),
+        "un corps sur la sonde doit être refusé : {raw:?}"
+    );
+    assert!(
+        !raw.contains("\"id\":42"),
+        "le corps caché ne doit jamais être exécuté : {raw:?}"
+    );
+}
+
+#[test]
+fn health_probe_with_an_announced_body_does_not_hang() {
+    // Un `Content-Length` annoncé sans corps ne doit pas retenir le slot
+    // jusqu'à la deadline de 60 s : la sonde refuse immédiatement.
+    let addr = spawn_hardened();
+    let request = "GET /health HTTP/1.1\r\nHost: t\r\nContent-Length: 1048576\r\n\r\n";
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    let result = stream.read_to_string(&mut raw);
+    assert!(
+        result.is_ok(),
+        "la sonde doit répondre sans attendre le corps : {raw:?} ({result:?})"
+    );
+    assert!(raw.contains("HTTP/1.1 400"), "{raw:?}");
+}
+
+#[test]
+fn health_probe_with_expect_100_continue_does_not_deadlock() {
+    // `Expect: 100-continue` sur la sonde : sans traitement, le client
+    // attendrait un `100 Continue` que la sonde n'envoie jamais.
+    let addr = spawn_hardened();
+    let request =
+        "GET /health HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\n";
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    let result = stream.read_to_string(&mut raw);
+    assert!(
+        result.is_ok(),
+        "pas de blocage croisé attendu : {raw:?} ({result:?})"
+    );
+    assert!(raw.contains("HTTP/1.1 400"), "{raw:?}");
+}
+
+#[test]
+fn transfer_encoding_is_rejected_on_every_route() {
+    // Le refus de Transfer-Encoding était placé APRÈS le routage : il ne
+    // s'appliquait donc pas à /health.
+    let addr = spawn_hardened();
+    for path in ["/mcp", "/health"] {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        );
+        let (status, _) = raw_exchange(addr, &request, std::time::Duration::from_secs(2));
+        assert_eq!(status, 400, "Transfer-Encoding sur {path} doit être refusé");
+    }
+}
+
+#[test]
+fn content_type_must_be_json() {
+    // Un POST en text/plain était traité comme du JSON (confusion de type).
+    let addr = spawn_hardened();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, _) = raw_exchange(addr, &request, std::time::Duration::from_secs(2));
+    assert_eq!(status, 415, "Content-Type non-JSON doit être refusé");
+
+    // ... mais application/json (avec ou sans charset) passe.
+    for ct in ["application/json", "application/json; charset=utf-8"] {
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, _) = raw_exchange(addr, &request, std::time::Duration::from_secs(2));
+        assert_eq!(status, 200, "Content-Type {ct} doit être accepté");
+    }
+}
+
+#[test]
+fn invalid_requests_keep_their_id_in_the_error_response() {
+    // JSON-RPC 2.0 §5 : la réponse d'erreur porte le même id.
+    let addr = spawn_hardened();
+    for (request, expected_id) in [
+        (r#"{"jsonrpc":"1.0","id":7,"method":"ping"}"#, 7),
+        (r#"{"jsonrpc":"2.0","id":8,"method":42}"#, 8),
+        (
+            r#"{"jsonrpc":"2.0","id":9,"method":"ping","params":[1]}"#,
+            9,
+        ),
+    ] {
+        let (status, body) = post(addr, request, "application/json", None);
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["id"], expected_id, "id non préservé pour {request}");
+        assert_eq!(v["error"]["code"], -32600);
+    }
+}
+
+#[test]
+fn arguments_must_be_an_object_even_without_a_schema() {
+    // Le contrat de l'API (« la closure reçoit arguments (objet JSON) »)
+    // doit tenir même pour un outil sans schéma.
+    let addr = spawn_hardened();
+    for arguments in ["\"chaine\"", "[1,2]", "null", "42"] {
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"echo","arguments":{arguments}}}}}"#
+        );
+        let (status, body) = post(addr, &request, "application/json", None);
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "arguments={arguments} doit être refusé : {body}"
+        );
+    }
+}
+
+#[test]
+fn server_discover_advertises_capabilities_and_versions() {
+    // MCP 2026-07-28 : `server/discover` est obligatoire (SEP-2575).
+    let addr = spawn_hardened();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let result = &v["result"];
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["supportedVersions"][0], "2026-07-28");
+    assert!(result["capabilities"]["tools"].is_object());
+    assert!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"].is_string(),
+        "serverInfo attendu dans _meta : {body}"
+    );
+}
+
+#[test]
+fn every_result_carries_a_result_type() {
+    // SEP-2322 : `resultType` est obligatoire dans chaque result.
+    let addr = spawn_hardened();
+    for method in ["tools/list", "server/discover"] {
+        let (status, body) = post(
+            addr,
+            &format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}"}}"#),
+            "application/json",
+            None,
+        );
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["resultType"], "complete", "méthode {method}");
+    }
+}
+
+#[test]
+fn tools_list_carries_cache_hints() {
+    // SEP-2549 : `ttlMs` et `cacheScope` sur les résultats de liste.
+    let addr = spawn_hardened();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["result"]["ttlMs"].is_u64(), "ttlMs absent : {body}");
+    assert_eq!(v["result"]["cacheScope"], "private");
+}
+
+#[test]
+fn unsupported_protocol_version_is_rejected_with_32022() {
+    // SEP-2575 : une version non supportée → UnsupportedProtocolVersionError.
+    let addr = spawn_hardened();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01"}}}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], -32022);
+    assert_eq!(v["error"]["data"]["supported"][0], "2026-07-28");
+}
+
+#[test]
+fn tab_in_the_request_line_is_rejected() {
+    // RFC 9112 §3 : seul SP sépare les jetons de la ligne de requête.
+    let addr = spawn_hardened();
+    let request =
+        "POST\t/mcp\tHTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+    let (status, _) = raw_exchange(addr, request, std::time::Duration::from_secs(2));
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn bare_lf_line_endings_are_rejected() {
+    // RFC 9112 §2.2 : la fin de ligne est CRLF (le LF seul est le vecteur
+    // « httpoxy »).
+    let addr = spawn_hardened();
+    let request = "GET /health HTTP/1.1\nHost: t\n\n";
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(800)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+    assert!(
+        !raw.contains("HTTP/1.1 200"),
+        "un LF seul ne doit pas composer une requête valide : {raw:?}"
+    );
+}
+
+#[test]
+fn accept_and_expect_are_matched_by_exact_token() {
+    // `text/event-stream-x` ne contient pas le jeton `text/event-stream` ;
+    // `not-100-continued` ne contient pas le jeton `100-continue`.
+    let addr = spawn_hardened();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: text/event-stream-x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+    assert!(
+        !raw.contains("text/event-stream"),
+        "Accept par sous-chaîne ne doit pas basculer en SSE : {raw:?}"
+    );
+
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nExpect: not-100-continued\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+    assert!(
+        !raw.contains("100 Continue"),
+        "Expect par sous-chaîne ne doit pas déclencher 100-continue : {raw:?}"
+    );
+}
+
+#[test]
+fn saturated_server_delivers_the_503_to_a_client_that_wrote_first() {
+    // Le chemin 503 faisait un `close()` avec la requête du client non lue
+    // dans le tampon de réception → RST → le client ne lisait jamais le 503
+    // (16/20 réponses perdues). Le drain + shutdown(Write) le corrige.
+    let bound = ServerBuilder::new("cap", "0.2.0")
+        .tool("ok", "Répond ok", |_args| Ok(serde_json::json!({})))
+        .read_timeout(std::time::Duration::from_millis(300))
+        .max_connections(1)
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+
+    // La première connexion occupe l'unique slot.
+    let _holder = TcpStream::connect(addr).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // Client réaliste : il ENVOIE sa requête avant de lire la réponse.
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let write_result = stream.write_all(request.as_bytes());
+    assert!(
+        write_result.is_ok(),
+        "l'écriture peut échouer si le serveur ferme — mais le 503 doit rester lisible"
+    );
+
+    let mut raw = String::new();
+    let read_result = stream.read_to_string(&mut raw);
+    assert!(
+        read_result.is_ok(),
+        "le client doit lire le 503 sans erreur RST : {raw:?} ({read_result:?})"
+    );
+    assert!(
+        raw.contains("HTTP/1.1 503"),
+        "le client doit lire le 503 : {raw:?}"
+    );
+    // Le corps JSON complet doit être là (pas seulement la ligne de statut).
+    assert!(
+        raw.contains("trop de connexions"),
+        "le corps du 503 doit être complet : {raw:?}"
+    );
+}
+
+#[test]
+fn connection_header_semantics_are_exact() {
+    // Matrice complète du comportement `Connection` (HTTP/1.0 vs 1.1).
+    // `Connection: close` est ABSORBANT : une fois présent, il reste même
+    // si un `keep-alive` suit dans un autre en-tête (RFC 9112 §9.6).
+    let addr = spawn_hardened();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+    fn connection_of(response: &str) -> String {
+        response
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("connection:"))
+            .map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())
+            .unwrap_or_default()
+    }
+
+    for (version, headers, expected) in [
+        ("1.0", vec![], "close"),
+        ("1.0", vec!["Connection: close"], "close"),
+        ("1.0", vec!["Connection: keep-alive"], "keep-alive"),
+        (
+            "1.0",
+            vec!["Connection: close", "Connection: keep-alive"],
+            "close",
+        ),
+        (
+            "1.0",
+            vec!["Connection: keep-alive", "Connection: close"],
+            "close",
+        ),
+        ("1.1", vec![], "keep-alive"),
+        ("1.1", vec!["Connection: close"], "close"),
+        ("1.1", vec!["Connection: keep-alive"], "keep-alive"),
+        (
+            "1.1",
+            vec!["Connection: close", "Connection: keep-alive"],
+            "close",
+        ),
+    ] {
+        let mut lines = vec![format!("POST /mcp HTTP/{version}"), "Host: t".to_string()];
+        lines.extend(headers.iter().map(|h| h.to_string()));
+        lines.push(format!("Content-Length: {}", body.len()));
+        let request = format!("{}\r\n\r\n{body}", lines.join("\r\n"));
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            // Lit UNE réponse complète (en-tête + corps selon Content-Length).
+            let mut read = 0usize;
+            while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        raw.extend_from_slice(&buf[..n]);
+                        read += n;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if read == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let Some(split) = text.find("\r\n\r\n") else {
+                break;
+            };
+            let head = &text[..split];
+            let body_len = head
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                .and_then(|l| l.split(':').nth(1))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if text.len() - (split + 4) >= body_len {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        assert_eq!(
+            connection_of(&text),
+            expected,
+            "HTTP/{version} avec {:?} -> Connection attendu {expected}",
+            headers
+        );
+    }
+}
+
+#[test]
+fn accept_ignores_media_type_parameters() {
+    // RFC 9110 §12.5.1 : `application/json; charset=utf-8` contient bien le
+    // type `application/json`.
+    let addr = spawn_hardened();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    for (accept, expect_sse) in [
+        ("application/json", false),
+        ("application/json; charset=utf-8", false),
+        ("text/event-stream", true),
+        ("text/event-stream; charset=utf-8", true),
+    ] {
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: {accept}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut raw = String::new();
+        let _ = stream.read_to_string(&mut raw);
+
+        let split = raw.find("\r\n\r\n").expect("réponse complète");
+        let head = &raw[..split];
+        let resp_body = &raw[split + 4..];
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "Accept {accept} : {raw:?}"
+        );
+        assert_eq!(
+            head.contains("Content-Type: text/event-stream"),
+            expect_sse,
+            "Accept {accept} : {head}"
+        );
+        // SSE : le corps est `data: {json}` ; JSON : le corps est `{json}`.
+        let payload = resp_body.trim();
+        let payload = payload.strip_prefix("data: ").unwrap_or(payload).trim();
+        let v: Value = serde_json::from_str(payload)
+            .unwrap_or_else(|e| panic!("Accept {accept} : {e} — {resp_body:?}"));
+        assert!(v.get("result").is_some(), "Accept {accept} : {resp_body}");
+    }
+}
+
+#[test]
+fn initialize_result_carries_a_result_type() {
+    // SEP-2322 : `resultType` est obligatoire dans CHAQUE résultat.
+    let addr = spawn_hardened();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["result"]["resultType"], "complete", "{body}");
+}
+
+#[test]
+fn health_probe_rejects_a_body_larger_than_one_chunk() {
+    // Un corps de plus de 64 Kio (la taille d'un chunk de lecture) doit lui
+    // aussi être refusé : aucun reliquat ne doit devenir la requête suivante.
+    let addr = spawn_hardened();
+    let hidden_body = r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"add","arguments":{"a":1,"b":1}}}"#;
+    let hidden = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{hidden_body}",
+        hidden_body.len()
+    );
+    let payload = "A".repeat(64 * 1024) + &hidden;
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n{payload}",
+        payload.len()
+    );
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(800)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+
+    assert_eq!(
+        raw.matches("HTTP/1.1").count(),
+        1,
+        "une seule réponse attendue : {raw:?}"
+    );
+    assert!(raw.contains("HTTP/1.1 400"), "{raw:?}");
+    assert!(
+        !raw.contains("\"id\":42"),
+        "le corps caché ne doit jamais être exécuté : {raw:?}"
+    );
+}
+
+#[test]
+fn connection_ttl_zero_disables_the_ttl() {
+    // `connection_ttl(0)` doit DÉSACTIVER le TTL (documenté ainsi), pas
+    // couper la connexion immédiatement.
+    let bound = ServerBuilder::new("ttl0", "0.1.0")
+        .tool("ok", "ok", |_args| Ok(serde_json::json!({})))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .connection_ttl(std::time::Duration::ZERO)
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+
+    // Plusieurs requêtes espacées : avec un TTL nul, la connexion survit.
+    for i in 0..3 {
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).expect("réponse attendue");
+        assert!(
+            n > 0,
+            "connexion coupée à l'itération {i} — TTL nul mal traité"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+}
+
+#[test]
+fn connection_ttl_cuts_a_drip_fed_connection() {
+    let bound = ServerBuilder::new("ttl", "0.1.0")
+        .tool("ok", "ok", |_args| Ok(serde_json::json!({})))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .connection_ttl(std::time::Duration::from_millis(800))
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(400)))
+        .unwrap();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+
+    let start = std::time::Instant::now();
+    let mut closed = false;
+    while start.elapsed() < std::time::Duration::from_secs(6) {
+        if stream.write_all(request.as_bytes()).is_err()
+            || stream.write_all(body.as_bytes()).is_err()
+        {
+            closed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    assert!(closed, "la connexion doit être coupée par le TTL");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(4),
+        "la coupure doit venir du TTL (800 ms), pas du read_timeout (30 s)"
+    );
+}

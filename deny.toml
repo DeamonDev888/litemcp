@@ -1,0 +1,6 @@
+# cargo-deny — périmètre volontairement minimal : uniquement les advisories
+# RustSec sur les dépendances verrouillées (le crate n'a que serde/serde_json).
+# `cargo deny check advisories` échoue sur toute vulnérabilité connue.
+[advisories]
+version = 2
+yanked = "deny"

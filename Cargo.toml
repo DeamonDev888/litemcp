@@ -1,6 +1,6 @@
 [package]
 name = "litemcp"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.85"
 description = "La lib MCP (Model Context Protocol) la plus légère pour Rust : votre serveur MCP en quelques lignes. Streamable HTTP stateless uniquement (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement."

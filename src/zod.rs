@@ -23,8 +23,11 @@
 //!             .field("a", zod::integer())
 //!             .field("b", zod::integer()),
 //!         |args| {
-//!             let a = args["a"].as_i64().unwrap(); // garanti par le schéma
-//!             let b = args["b"].as_i64().unwrap();
+//!             // Le schéma garantit la présence et le type : `as_i64()` est
+//!             // toujours `Some`. Le `?` reste recommandé par prudence
+//!             // (il n'est jamais déclenché).
+//!             let a = args["a"].as_i64().ok_or("a manquant")?;
+//!             let b = args["b"].as_i64().ok_or("b manquant")?;
 //!             Ok(serde_json::json!({ "somme": a + b }))
 //!         },
 //!     )
@@ -127,25 +130,42 @@ pub fn object() -> Obj {
 
 impl Obj {
     /// Ajoute un champ **requis**.
+    ///
+    /// **Panie de développement si le nom est déjà présent** : un doublon
+    /// produirait un `inputSchema` invalide (`required` avec des éléments
+    /// dupliqués — le meta-schema JSON Schema 2020-12 exige des éléments
+    /// uniques) et un outil insatisfaisable (toutes les valeurs échouent).
+    /// C'est une erreur de programmation, pas une entrée d'utilisateur :
+    /// une panique au démarrage est le bon signal.
     #[must_use]
     pub fn field(mut self, name: &str, schema: impl Schema + 'static) -> Self {
-        self.fields.push(Field {
-            name: name.to_string(),
-            schema: std::sync::Arc::new(schema),
-            required: true,
-        });
+        self.push_field(name, schema, true);
         self
     }
 
     /// Ajoute un champ **optionnel** (peut être absent).
+    ///
+    /// **Panie de développement si le nom est déjà présent** (voir
+    /// [`Obj::field`]).
     #[must_use]
     pub fn opt(mut self, name: &str, schema: impl Schema + 'static) -> Self {
+        self.push_field(name, schema, false);
+        self
+    }
+
+    /// Insertion interne — refuse les doublons de nom.
+    fn push_field(&mut self, name: &str, schema: impl Schema + 'static, required: bool) {
+        assert!(
+            !self.fields.iter().any(|f| f.name == name),
+            "litemcp/zod : le champ `{name}` est déjà défini — un doublon produirait \
+             un inputSchema invalide (required avec doublons) et un outil \
+             insatisfaisable"
+        );
         self.fields.push(Field {
             name: name.to_string(),
             schema: std::sync::Arc::new(schema),
-            required: false,
+            required,
         });
-        self
     }
 
     /// Mode strict : tout champ inconnu devient un problème de validation.
@@ -262,6 +282,20 @@ impl Schema for Str {
 }
 
 /// `z.number().int()` — entier signé 64 bits, contraintes `.min(n)` / `.max(n)`.
+///
+/// **Validation stricte, alignée sur le schéma publié.** Seuls les entiers
+/// JSON *syntaxiques* sont acceptés (`1`, `-1`, `42`) : un flottant à
+/// fractule nulle (`3.0`, `1e2`) est **refusé**.
+///
+/// Pourquoi ce choix : le schéma publié est `{"type": "integer"}`, et le
+/// JSON Schema draft 2020-12 y accepte `3.0`. Mais `serde_json::Value::as_i64()`
+/// renvoie `None` sur un tel nombre — le motif d'usage documenté par la crate
+/// (`args["a"].as_i64().unwrap()`) **paniquerait** sur une valeur que le
+/// schéma disait valide. Refuser `3.0` rend la garantie du schéma
+/// inconditionnelle : `as_i64()` succeeds **toujours** quand le schéma passe.
+///
+/// Le schéma publié porte donc les bornes exactes (`minimum`/`maximum`) :
+/// ce qu'il annonce est **exactement** ce que la validation applique.
 #[derive(Clone, Default)]
 pub struct Int {
     min: Option<i64>,
@@ -292,40 +326,33 @@ impl Int {
 impl Schema for Int {
     fn json(&self) -> Value {
         let mut schema = json!({ "type": "integer" });
-        if let Some(min) = self.min {
-            schema["minimum"] = json!(min);
-        }
-        if let Some(max) = self.max {
-            schema["maximum"] = json!(max);
-        }
+        // Les bornes publiées sont **exactement** celles appliquées : le
+        // schéma ne peut pas promettre plus que la validation n'accorde.
+        schema["minimum"] = json!(self.min.unwrap_or(i64::MIN));
+        schema["maximum"] = json!(self.max.unwrap_or(i64::MAX));
         schema
     }
 
     fn validate(&self, key: &str, value: &Value, issues: &mut Issues) {
-        // JSON Schema "type":"integer" accepte tout nombre mathématiquement
-        // entier (1e2, 3.0) — pas seulement les i64 syntaxiques. Borne
-        // stricte : ±2^63 (bornes i64 une fois arrondies en f64) est rejeté,
-        // sinon le cast saturerait en i64::MIN/i64::MAX.
-        let as_int = value.as_i64().or_else(|| {
-            value
-                .as_f64()
-                .filter(|n| n.fract() == 0.0 && *n > i64::MIN as f64 && *n < i64::MAX as f64)
-                .map(|n| n as i64)
-        });
-        match as_int {
-            Some(n) => {
-                if let Some(min) = self.min {
-                    if n < min {
-                        issues.push(format!("`{key}` : doit être ≥ {min}"));
-                    }
-                }
-                if let Some(max) = self.max {
-                    if n > max {
-                        issues.push(format!("`{key}` : doit être ≤ {max}"));
-                    }
-                }
+        // **Entier JSON strict** : `Value::as_i64()` ne réussit que pour un
+        // nombre stocké comme entier (`1`, `-1`). Un flottant à fractule
+        // nulle (`3.0`, `1e2`) est refusé : il passerait le schéma JSON
+        // (« integer » matche `3.0`) mais casserait `as_i64().unwrap()`,
+        // dont la crate **documente** l'usage (zod.rs : « garanti par le
+        // schéma »). Refuser ici rend la promesse du schéma vraie.
+        let Some(n) = value.as_i64() else {
+            issues.push(format!("`{key}` : entier attendu"));
+            return;
+        };
+        if let Some(min) = self.min {
+            if n < min {
+                issues.push(format!("`{key}` : doit être ≥ {min}"));
             }
-            None => issues.push(format!("`{key}` : entier attendu")),
+        }
+        if let Some(max) = self.max {
+            if n > max {
+                issues.push(format!("`{key}` : doit être ≤ {max}"));
+            }
         }
     }
 }
@@ -528,7 +555,8 @@ mod tests {
             json!({
                 "type": "object",
                 "properties": {
-                    "a": { "type": "integer" },
+                    // Les bornes publiées sont celles réellement appliquées.
+                    "a": { "type": "integer", "minimum": i64::MIN, "maximum": i64::MAX },
                     "b": { "type": "string", "maxLength": 8 }
                 },
                 "required": ["a"],
@@ -586,6 +614,62 @@ mod tests {
     }
 
     #[test]
+    fn integer_rejects_non_integral_floats() {
+        // Le schéma doit être EXÉCUTEUR : une valeur acceptée par la
+        // validation doit toujours être lisible par `Value::as_i64()`.
+        // `3.0` et `1e2` sont des « integer » pour JSON Schema mais
+        // `as_i64()` renvoie None → ils sont refusés.
+        let schema = object().field("n", integer());
+        assert!(!issues_of(&schema, json!({ "n": 3.0 })).is_empty());
+        assert!(!issues_of(&schema, json!({ "n": 1e2 })).is_empty());
+        assert!(!issues_of(&schema, json!({ "n": 0.0 })).is_empty());
+        assert!(!issues_of(&schema, json!({ "n": -0.0 })).is_empty());
+        // Les vrais entiers passent.
+        assert!(issues_of(&schema, json!({ "n": 3 })).is_empty());
+        assert!(issues_of(&schema, json!({ "n": -3 })).is_empty());
+        assert!(issues_of(&schema, json!({ "n": 0 })).is_empty());
+    }
+
+    #[test]
+    fn integer_published_bounds_match_the_validation() {
+        // Le schéma publié ne doit pas promettre plus que la validation
+        // n'accorde : les bornes exactes sont publiées.
+        let schema = object().field("n", integer().min(1).max(10));
+        assert_eq!(schema.json()["properties"]["n"]["minimum"], 1);
+        assert_eq!(schema.json()["properties"]["n"]["maximum"], 10);
+
+        // Sans bornes explicites : les bornes i64 réelles sont publiées.
+        let schema = object().field("n", integer());
+        assert_eq!(schema.json()["properties"]["n"]["minimum"], i64::MIN);
+        assert_eq!(schema.json()["properties"]["n"]["maximum"], i64::MAX);
+    }
+
+    #[test]
+    fn duplicate_field_name_panics() {
+        // Un doublon produirait un inputSchema invalide (`required` avec
+        // des doublons) et un outil insatisfaisable : c'est une erreur de
+        // programmation → panique au démarrage.
+        let result =
+            std::panic::catch_unwind(|| object().field("a", integer()).field("a", string()));
+        assert!(result.is_err(), "un doublon de nom doit paniquer");
+    }
+
+    #[test]
+    fn integer_rejects_values_outside_i64_range() {
+        let schema = object().field("n", integer());
+        // 2^63 n'est pas représentable en i64 : refusé, jamais saturé en i64::MAX.
+        let issues = issues_of(&schema, json!({ "n": 9_223_372_036_854_775_808u64 }));
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        // Les flottants sont refusés (as_i64() strict).
+        let two_pow_63 = 2f64.powi(63);
+        assert_eq!(issues_of(&schema, json!({ "n": two_pow_63 })).len(), 1);
+        assert_eq!(issues_of(&schema, json!({ "n": -two_pow_63 })).len(), 1);
+        // Les bornes exactes i64, elles, passent.
+        assert!(issues_of(&schema, json!({ "n": i64::MAX })).is_empty());
+        assert!(issues_of(&schema, json!({ "n": i64::MIN })).is_empty());
+    }
+
+    #[test]
     fn enumeration_limits_values() {
         let schema = object().field("mode", enumeration(&["fast", "safe"]));
         assert!(issues_of(&schema, json!({ "mode": "fast" })).is_empty());
@@ -604,20 +688,5 @@ mod tests {
         assert_eq!(issues.render().len(), MAX_ISSUES + 1);
         assert!(issues.render().last().unwrap().contains("omis"));
         assert!(!issues.is_empty());
-    }
-
-    #[test]
-    fn integer_rejects_values_outside_i64_range() {
-        let schema = object().field("n", integer());
-        // 2^63 n'est pas représentable en i64 : rejeté, jamais saturé en i64::MAX.
-        let issues = issues_of(&schema, json!({ "n": 9_223_372_036_854_775_808u64 }));
-        assert_eq!(issues.len(), 1, "{issues:?}");
-        // ±2^63 en f64 : rejetés aussi (le cast saturerait).
-        let two_pow_63 = 2f64.powi(63);
-        assert_eq!(issues_of(&schema, json!({ "n": two_pow_63 })).len(), 1);
-        assert_eq!(issues_of(&schema, json!({ "n": -two_pow_63 })).len(), 1);
-        // Les bornes exactes i64, elles, passent.
-        assert!(issues_of(&schema, json!({ "n": i64::MAX })).is_empty());
-        assert!(issues_of(&schema, json!({ "n": i64::MIN })).is_empty());
     }
 }

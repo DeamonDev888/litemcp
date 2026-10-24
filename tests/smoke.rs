@@ -82,14 +82,38 @@ fn zod_string_counts_characters_not_bytes() {
 }
 
 #[test]
-fn zod_integer_accepts_mathematically_integral_floats() {
+fn zod_integer_is_strict_json_integers() {
     use litemcp::zod::{Issues, Schema};
     let schema = litemcp::zod::object().field("n", litemcp::zod::integer().max(200));
+
+    // Les entiers JSON syntaxiques passent.
+    let mut issues = Issues::new();
+    schema.validate("arguments", &serde_json::json!({ "n": 100 }), &mut issues);
+    assert!(
+        issues.is_empty(),
+        "100 entier doit passer : {:?}",
+        issues.render()
+    );
+    let mut issues = Issues::new();
+    schema.validate("arguments", &serde_json::json!({ "n": -3 }), &mut issues);
+    assert!(issues.is_empty(), "-3 doit passer : {:?}", issues.render());
+
+    // Les flottants sont REFUSÉS, même à fractule nulle : le schéma est
+    // exécuteur — une valeur acceptée doit toujours être lisible par
+    // `Value::as_i64()` (le motif `as_i64().unwrap()` documenté par la
+    // crate ne doit jamais paniquer sur une valeur que le schéma a validée).
     let mut issues = Issues::new();
     schema.validate("arguments", &serde_json::json!({ "n": 1e2 }), &mut issues);
     assert!(
-        issues.is_empty(),
-        "1e2 = 100 entier doit passer : {:?}",
+        !issues.is_empty(),
+        "1e2 doit etre refuse (as_i64() renvoie None) : {:?}",
+        issues.render()
+    );
+    let mut issues = Issues::new();
+    schema.validate("arguments", &serde_json::json!({ "n": 3.0 }), &mut issues);
+    assert!(
+        !issues.is_empty(),
+        "3.0 doit etre refuse (as_i64() renvoie None) : {:?}",
         issues.render()
     );
     let mut issues = Issues::new();
