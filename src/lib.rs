@@ -12,9 +12,14 @@
 //! Schémas à la Zod ([`crate::zod`]) : dérivation de l'`inputSchema` et
 //! validation des arguments avant exécution, handlers typés disponibles.
 //! Le schéma publié est **exécuteur** : ce qu'il annonce est exactement ce
-//! que la validation applique (pas de dérogation possible) — y compris le
+//! que la validation applique (pas de dérogation possible) — y compris les
+//! **formats** (`.email()`, `.uuid()`, `.url()`, `.datetime()` : publiés
+//! `format` et **appliqués**), [`nullable`](crate::zod::nullable),
+//! [`describe`](crate::zod::describe) et le
 //! [`outputSchema`](crate::server::ServerBuilder::output_schema), qui
-//! valide la **sortie** structurée avant envoi.
+//! valide la **sortie** structurée avant envoi. La feature `schemars`
+//! adapte en plus n'importe quel type `#[derive(JsonSchema)]`
+//! ([`crate::schemars`]) avec les sémantiques JSON Schema de bout en bout.
 //!
 //! Trois surfaces MCP : **outils** (`tools/*`), **ressources**
 //! (`resources/*`) et **prompts** (`prompts/*`) — chaque handler peut être
@@ -67,6 +72,9 @@ pub mod macros {
     pub use litemcp_macros::{prompt, resource, tool};
 }
 pub mod protocol;
+/// Adaptateur schemars (feature `schemars`) — voir [`crate::schemars`].
+#[cfg(feature = "schemars")]
+pub mod schemars;
 pub mod server;
 pub mod zod;
 
@@ -85,6 +93,8 @@ pub mod prelude {
         CacheScope, PROTOCOL_VERSION, PromptMessage, ResultType, SUPPORTED_VERSIONS,
         ToolAnnotations,
     };
+    #[cfg(feature = "schemars")]
+    pub use crate::schemars::from_schemars;
     pub use crate::server::{McpHeaders, ServerBuilder, ToolResult};
     pub use crate::zod;
 }

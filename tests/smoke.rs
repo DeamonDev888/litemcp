@@ -73,7 +73,8 @@ fn zod_string_counts_characters_not_bytes() {
     // "é" = 1 caractère, 2 octets : max(3) doit accepter "ééé" (3 caractères)
     let schema = litemcp::zod::object().field("s", litemcp::zod::string().max(3));
     let mut issues = Issues::new();
-    schema.validate("arguments", &serde_json::json!({ "s": "ééé" }), &mut issues);
+    let mut path = litemcp::zod::Path::root("arguments");
+    schema.validate(&mut path, &serde_json::json!({ "s": "ééé" }), &mut issues);
     assert!(
         issues.is_empty(),
         "3 caractères (6 octets) doit passer : {:?}",
@@ -88,14 +89,16 @@ fn zod_integer_is_strict_json_integers() {
 
     // Les entiers JSON syntaxiques passent.
     let mut issues = Issues::new();
-    schema.validate("arguments", &serde_json::json!({ "n": 100 }), &mut issues);
+    let mut path = litemcp::zod::Path::root("arguments");
+    schema.validate(&mut path, &serde_json::json!({ "n": 100 }), &mut issues);
     assert!(
         issues.is_empty(),
         "100 entier doit passer : {:?}",
         issues.render()
     );
     let mut issues = Issues::new();
-    schema.validate("arguments", &serde_json::json!({ "n": -3 }), &mut issues);
+    let mut path = litemcp::zod::Path::root("arguments");
+    schema.validate(&mut path, &serde_json::json!({ "n": -3 }), &mut issues);
     assert!(issues.is_empty(), "-3 doit passer : {:?}", issues.render());
 
     // Les flottants sont REFUSÉS, même à fractule nulle : le schéma est
@@ -103,20 +106,23 @@ fn zod_integer_is_strict_json_integers() {
     // `Value::as_i64()` (le motif `as_i64().unwrap()` documenté par la
     // crate ne doit jamais paniquer sur une valeur que le schéma a validée).
     let mut issues = Issues::new();
-    schema.validate("arguments", &serde_json::json!({ "n": 1e2 }), &mut issues);
+    let mut path = litemcp::zod::Path::root("arguments");
+    schema.validate(&mut path, &serde_json::json!({ "n": 1e2 }), &mut issues);
     assert!(
         !issues.is_empty(),
         "1e2 doit etre refuse (as_i64() renvoie None) : {:?}",
         issues.render()
     );
     let mut issues = Issues::new();
-    schema.validate("arguments", &serde_json::json!({ "n": 3.0 }), &mut issues);
+    let mut path = litemcp::zod::Path::root("arguments");
+    schema.validate(&mut path, &serde_json::json!({ "n": 3.0 }), &mut issues);
     assert!(
         !issues.is_empty(),
         "3.0 doit etre refuse (as_i64() renvoie None) : {:?}",
         issues.render()
     );
     let mut issues = Issues::new();
-    schema.validate("arguments", &serde_json::json!({ "n": 1.5 }), &mut issues);
+    let mut path = litemcp::zod::Path::root("arguments");
+    schema.validate(&mut path, &serde_json::json!({ "n": 1.5 }), &mut issues);
     assert!(!issues.is_empty(), "1.5 n'est pas entier");
 }

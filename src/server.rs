@@ -7,7 +7,7 @@ use crate::protocol::{
     PromptsListResult, ReadResourceResult, Resource, ResourceContents, ResourcesListResult,
     ResultType, ServerInfo, Tool, ToolAnnotations, ToolsListResult,
 };
-use crate::zod::{Issues, Schema};
+use crate::zod::{Issues, Path, Schema};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -142,6 +142,11 @@ pub struct ServerCore {
     /// Délai maximal d'exécution des handlers (tools, resources, prompts) —
     /// `None` : illimité (comportement historique).
     tool_timeout: Option<Duration>,
+    /// Catalogues sérialisés — immuables après construction (les registres
+    /// ne bougent plus), servis **tels quels** : `tools/list` et
+    /// `server/discover` ne resérialisent rien à chaque requête.
+    tools_list_cache: std::sync::OnceLock<Value>,
+    discover_cache: std::sync::OnceLock<Value>,
 }
 
 impl ServerCore {
@@ -257,10 +262,7 @@ impl ServerCore {
         }
 
         let outgoing = match incoming.method.as_str() {
-            protocol::method::DISCOVER => Outgoing::success(
-                id,
-                serde_json::to_value(self.discover()).unwrap_or(Value::Null),
-            ),
+            protocol::method::DISCOVER => Outgoing::success(id, self.discover_json().clone()),
             protocol::method::INITIALIZE => Outgoing::success(
                 id,
                 json!({
@@ -293,10 +295,7 @@ impl ServerCore {
                     "_meta": self.meta(),
                 }),
             ),
-            protocol::method::TOOLS_LIST => Outgoing::success(
-                id,
-                serde_json::to_value(self.list_tools()).unwrap_or_else(|_| json!({ "tools": [] })),
-            ),
+            protocol::method::TOOLS_LIST => Outgoing::success(id, self.tools_list_json().clone()),
             protocol::method::TOOLS_CALL => self.call_tool(&id, params),
             protocol::method::RESOURCES_LIST => Outgoing::success(
                 id,
@@ -368,6 +367,19 @@ impl ServerCore {
             capabilities["prompts"] = json!({});
         }
         capabilities
+    }
+
+    /// `server/discover` sérialisé, calculé une fois puis servi tel quel.
+    fn discover_json(&self) -> &Value {
+        self.discover_cache
+            .get_or_init(|| serde_json::to_value(self.discover()).unwrap_or(Value::Null))
+    }
+
+    /// `tools/list` sérialisé, calculé une fois puis servi tel quel.
+    fn tools_list_json(&self) -> &Value {
+        self.tools_list_cache.get_or_init(|| {
+            serde_json::to_value(self.list_tools()).unwrap_or_else(|_| json!({ "tools": [] }))
+        })
     }
 
     /// Résultat de `server/discover` (**MUST**, SEP-2575).
@@ -525,7 +537,8 @@ impl ServerCore {
         // handler ne tourne jamais (même contrat que `tool_typed`).
         if let Some(schema) = &def.schema {
             let mut issues = Issues::new();
-            schema.validate("arguments", arguments, &mut issues);
+            let mut path = Path::root("arguments");
+            schema.validate(&mut path, arguments, &mut issues);
             if !issues.is_empty() {
                 let rendered = issues.render();
                 return Outgoing::failure(
@@ -621,7 +634,8 @@ impl ServerCore {
         };
         if let Some(schema) = &tool.schema {
             let mut issues = Issues::new();
-            schema.validate("arguments", arguments, &mut issues);
+            let mut path = Path::root("arguments");
+            schema.validate(&mut path, arguments, &mut issues);
             if !issues.is_empty() {
                 let rendered = issues.render();
                 return Outgoing::failure(
@@ -669,7 +683,8 @@ impl ServerCore {
                     (&tool.output_schema, &call.structured_content)
                 {
                     let mut issues = Issues::new();
-                    output.validate("output", structured, &mut issues);
+                    let mut path = Path::root("output");
+                    output.validate(&mut path, structured, &mut issues);
                     if !issues.is_empty() {
                         let rendered = issues.render().join(" ; ");
                         call = CallToolResult::from(Err::<Value, String>(format!(
@@ -1076,6 +1091,8 @@ impl ServerBuilder {
             resources: Arc::new(self.resources.clone()),
             prompts: Arc::new(self.prompts.clone()),
             tool_timeout: self.tool_timeout,
+            tools_list_cache: std::sync::OnceLock::new(),
+            discover_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -1123,6 +1140,8 @@ impl ServerBuilder {
             resources: Arc::new(self.resources),
             prompts: Arc::new(self.prompts),
             tool_timeout: self.tool_timeout,
+            tools_list_cache: std::sync::OnceLock::new(),
+            discover_cache: std::sync::OnceLock::new(),
         });
         Ok(crate::http::BoundServer {
             listener,

@@ -60,9 +60,26 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
+### Zod — durcissement & optimisation (audit du module, 2026-10-24)
+
+- **Bornes cassées impossibles à publier** : `min > max` (integer/string/number/array), bornes non finies (`NaN`/±∞ sur `number()` — `serde_json` les aurait publiées en `null`, borne jamais appliquée), `enumeration` vide (insatisfaisable) ou doublonnée (meta-schema JSON Schema exige des éléments uniques) → **panique de développement au démarrage**, comme le doublon de champ ;
+- **Chemin de validation zéro allocation** (`zod::Path`) : le chemin était alloué (`format!`) par champ et par élément de tableau **même quand tout était valide** (12 allocations pour un appel valide à 2 champs + 10 éléments) — désormais un buffer unique étendu/tronqué, une chaîne n'est construite qu'en émettant une issue. *Breaking* : `Schema::validate` prend `&mut Path` au lieu de `&str` (les implémentations custom de `Schema` doivent s'aligner) ;
+- **`tools/list` et `server/discover` ne resérialisent plus rien** : le catalogue est immuable après `bind()`/`core()` — le JSON est calculé une fois (`OnceLock`) puis servi tel quel.
+
+### Ajout — zod et écosystème
+
+- **Formats de chaîne exécutés** : `.email()`, `.uuid()`, `.url()`, `.datetime()` — publiés `format` (`email`/`uuid`/`uri`/`date-time`, mots-clés JSON Schema 2020-12) **et appliqués** (`date-time` vérifie le calendrier : jours par mois, années bissextiles, fuseau obligatoire RFC 3339 ; aucun regex, aucune dépendance) ;
+- **`zod::nullable(schéma)`** : accepte `null` en plus du schéma interne, publié `anyOf: [schéma, {"type":"null"}]` — compose avec tout, sans changer la cardinalité (`.field` reste requis, `.opt` optionnel) ;
+- **`zod::describe("…", schéma)`** : description publiée dans le JSON Schema ;
+- **Feature opt-in `schemars`** : l'adaptateur `from_schemars::<T>()` rend n'importe quel type `#[derive(JsonSchema)]` utilisable partout où l'API attend `impl zod::Schema` — le schéma publié est celui de schemars, la validation applique **le même document** via le validateur `jsonschema` (erreurs mappées en issues bornées, chemins lisibles). Deux deps de plus (`schemars`, `jsonschema`), uniquement si activée ; le cœur reste à `serde` + `serde_json`.
+
+### Documentation
+- Lien réciproque vers le [MCP Command Center](https://github.com/DeamonDev888/mcp-command-center) — client qui détecte les serveurs litemcp par fingerprint (badge dédié) — nouvelle section « Supervisé par MCP Command Center ».
+
 ### Prévu (suite)
 
 - Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur.
+- `zod::record(inner)` (dictionnaires `{"clé": valeur}`).
 
 ## [0.4.1] - 2026-10-24
 

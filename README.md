@@ -48,6 +48,13 @@ Les principes :
 | 🛑 **Arrêt propre** | `bound.handle()` puis `handle.shutdown()` : `serve()` rend `Ok(())`, les connexions ferment entre deux requêtes |
 | 🛡️ **Sûr par défaut** | `#![forbid(unsafe_code)]`, garde DNS-rebinding, corps limité |
 
+## Supervisé par MCP Command Center
+
+Le [**MCP Command Center**](https://github.com/DeamonDev888/mcp-command-center) — superviseur de serveurs MCP en
+Rust natif (détection multi-machines par scan et SSH, boutique, démarrage auto) — reconnaît les serveurs litemcp
+**par fingerprint** : `initialize` répondu en 2026-07-28 sans négocier la version demandée + sonde `GET /health`
+« ok ». Il affiche alors un badge dédié et supervise vos serveurs (état, tools, latence) sans rien ajouter à la lib.
+
 ## Installation
 
 ```toml
@@ -55,7 +62,9 @@ Les principes :
 litemcp = "0.4"
 
 # pour la macro #[tool] (deps de compilation seulement) :
-# litemcp = { version = "0.3", features = ["macros"] }
+# litemcp = { version = "0.4", features = ["macros"] }
+# pour l'adaptateur schemars (#[derive(JsonSchema)] en schéma exécuteur) :
+# litemcp = { version = "0.4", features = ["schemars"] }
 ```
 
 Ou directement depuis GitHub :
@@ -142,7 +151,7 @@ Trois registres, du plus direct au plus confortable :
 | `tool_typed` | `&Value` (déjà validé) | dérivé du schéma | automatique |
 | `tool_parse` | struct `Deserialize` | dérivé du schéma | automatique |
 
-Schémas disponibles : `object().field(..)/.opt(..)/.strict()`, `string().min/.max`, `integer().min/.max`, `number().min/.max`, `boolean()`, `enumeration(&[..])`, `array(s).min/.max`. Les contraintes deviennent `minLength`/`maxLength`/`minimum`/`maximum`/`minItems`/`maxItems`/`enum` dans le JSON Schema publié à `tools/list`.
+Schémas disponibles : `object().field(..)/.opt(..)/.strict()`, `string().min/.max` **et formats exécutés** `.email()/.uuid()/.url()/.datetime()`, `integer().min/.max`, `number().min/.max`, `boolean()`, `enumeration(&[..])`, `array(s).min/.max`, plus `nullable(schéma)` (accepte `null`, publié `anyOf`) et `describe("…", schéma)` (description publiée). Les contraintes deviennent `minLength`/`maxLength`/`minimum`/`maximum`/`minItems`/`maxItems`/`enum`/`format` dans le JSON Schema publié à `tools/list` — **appliquées** à l'identique par la validation. Des bornes incohérentes (`min > max`), non finies (`NaN`/±∞) ou une `enumeration` vide/doublonnée paniquent au démarrage (erreur de programmation, jamais publiées).
 
 ### Macros `#[tool]` · `#[resource]` · `#[prompt]` (feature `macros`)
 
@@ -179,6 +188,28 @@ ServerBuilder::new("calc", "1.0.0")
 ```
 
 `#[tool]` et `#[prompt]` valident les arguments via le schéma dérivé (`#[prompt]` passe par `.prompt_typed(…)`, la variante validée de `.prompt()`) ; `#[resource]` prend une fonction **sans paramètre** (`uri` requise). Types supportés : entiers, `f32`/`f64`, `bool`, `String`, `Option<T>` (champ optionnel), `Vec<T>`. Le cœur du crate reste à **2 dépendances** — `syn`/`quote` ne sont que des deps de compilation, activées seulement par la feature.
+
+### Adaptateur `schemars` (feature `schemars`)
+
+Un type `#[derive(JsonSchema)]` devient un schéma exécuteur — le JSON Schema publié est celui que schemars dérive, et la validation applique **le même document** via le validateur `jsonschema` :
+
+```rust
+use litemcp::schemars::from_schemars; // features = ["schemars"]
+use schemars::JsonSchema;
+
+#[derive(JsonSchema)]
+struct SearchArgs { query: String, limit: Option<u8> }
+
+ServerBuilder::new("recherche", "1.0.0")
+    .tool_typed("search", "Recherche indexée", from_schemars::<SearchArgs>(), |args| {
+        // arguments validés par le schéma dérivé du struct
+        Ok(serde_json::json!({}))
+    })
+    .bind("127.0.0.1:8080")?
+    .serve()?;
+```
+
+Utilisable partout où l'API attend `impl zod::Schema` (`tool_typed`, `tool_parse`, `prompt_typed`, `output_schema`). Sémantiques JSON Schema de bout en bout (le validateur officiel accepte par ex. `3.0` pour `integer` — pour la garantie `as_i64()` stricte, restez sur `zod::integer()`). Deux deps de plus, uniquement si la feature est activée.
 
 ### Resources & Prompts
 
