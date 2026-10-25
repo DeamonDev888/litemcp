@@ -4,8 +4,8 @@
 > reproductible depuis ce dépôt (`examples/bench_backends`, `examples/slo`) et depuis
 > `litemcp-it` (client neutre, serveurs de démonstration, campagne et agrégation).
 
-Campagne de référence : **2026-10-25**, Windows 11, `rustc 1.99.1`, loopback, 9 serveurs MCP
-mis à jour le jour même. Journal brut : `litemcp-it/bench-arena-2026-10-25.log`.
+Campagne de référence : **2026-10-25**, Windows 11, `rustc 1.99.1`, loopback, 9 frameworks MCP
+(un serveur de démo identique construit avec chacun), mis à jour le jour même. Journal brut : `litemcp-it/bench-arena-2026-10-25.log`.
 
 ![Latence MCP serveur — 9 frameworks](bench-arena-2026-10-25.svg)
 
@@ -42,7 +42,7 @@ rencontrés en pratique — `Content-Length`, SSE encadré en `chunked`, fermetu
 
 ## 3. Résultats — keep-alive
 
-| # | Serveur | Langage / version | Mode | moy (ms) | p50 | p99 | Réutilisées | Neuves (conn/s) |
+| # | Framework (démo 4 outils) | Langage / version | Mode | moy (ms) | p50 | p99 | Réutilisées | Neuves (conn/s) |
 |---|---|---|---|---|---|---|---|---|
 | 🥇 | **LiteMCP** | Rust 0.7.0 | bare | **0,075–0,091** | 0,064–0,084 | **0,25–0,29** | **2000/2000** | 1 249–1 729 |
 | 🥈 | tower-mcp | Rust 0.25.0 | bare | 0,162–0,186 | 0,129–0,152 | 0,90–1,28 | 2000/2000 | 1 167–1 215 |
@@ -60,7 +60,7 @@ Médiane des 3 passes, écart avec LiteMCP : **×2,1** tower-mcp · **×2,2** mc
 
 ## 4. Résultats — mémoire et binaire
 
-| Serveur | WorkingSet après ≈6 900 req. | Binaire (release, non strippé) |
+| Framework | WorkingSet après ≈6 900 req. | Binaire (release, non strippé) |
 |---|---|---|
 | **LiteMCP** | **5,1 Mo** | **0,81 Mo** (démo 4 outils) |
 | rust-mcp-sdk | 8,5 Mo | 6,70 Mo |
@@ -179,7 +179,7 @@ tour.
 - **2026-07-28 strict** : sans `Mcp-Name`, `rmcp` répond `missing required Mcp-Name header for
   tools/call` ; sans `_meta`, `mcp-go` répond `missing or invalid _meta field
   io.modelcontextprotocol/protocolVersion`.
-- **Serveurs résidents** : les neuf tournaient pendant toute la campagne (~20 000 connexions
+- **Démos résidentes** : les neuf tournaient pendant toute la campagne (~20 000 connexions
   par passe). Les chiffres vitemcp de cette arène (1,3–2,5 ms) sont donc supérieurs à ceux de
   la campagne isolée 1-contre-1 (1,16–1,33 ms). Une arène se lit **entre ses participants**,
   pas contre une campagne précédente.

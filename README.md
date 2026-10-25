@@ -18,13 +18,13 @@ Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro
 
 ---
 
-## 🏆 Le serveur MCP le plus rapide et le plus léger au monde
+## 🏆 La lib MCP la plus rapide et la plus légère au monde
 
-> **À notre connaissance, aucun serveur MCP public ne publie de meilleures mesures — et le
-> protocole est publié pour nous démentir.** Campagne du **2026-10-25** : **9 implémentations**
-> (Rust, Go, TypeScript, Python), le même serveur de démonstration (4 outils), **un seul client
-> neutre**, 3 passes, Windows 11 loopback, appels séquentiels. Journal brut, scripts et serveurs
-> de démonstration fournis : [`docs/BENCH.md`](docs/BENCH.md).
+> **À notre connaissance, aucune implémentation MCP publique ne publie de meilleures mesures —
+> et le protocole est publié pour nous démentir.** Campagne du **2026-10-25** : **9 frameworks**
+> (Rust, Go, TypeScript, Python), la même démo de 4 outils construite avec chacun, **un seul
+> client neutre**, 3 passes, Windows 11 loopback, appels séquentiels. Journal brut, scripts et
+> serveurs de démonstration fournis : [`docs/BENCH.md`](docs/BENCH.md).
 
 | | **LiteMCP 0.7.0** | Meilleur concurrent | Écart |
 |---|---|---|---|
@@ -47,9 +47,9 @@ existe déjà pour le local.
 
 ### Le benchmark complet
 
-![Latence MCP serveur — 9 frameworks](docs/bench-arena-2026-10-25.svg)
+![Latence MCP — 9 frameworks](docs/bench-arena-2026-10-25.svg)
 
-| # | Serveur | Langage / version | Mode | moy (ms) | p50 | p99 | Réutilisées | Neuves (conn/s) | Mémoire |
+| # | Framework (démo 4 outils) | Langage / version | Mode | moy (ms) | p50 | p99 | Réutilisées | Neuves (conn/s) | Mémoire |
 |---|---|---|---|---|---|---|---|---|---|
 | 🥇 | **LiteMCP** | Rust 0.7.0 | bare | **0,075–0,091** | 0,064–0,084 | **0,25–0,29** | **2000/2000** | 1 249–1 729 | **5,1 Mo** |
 | 🥈 | tower-mcp | Rust 0.25.0 | bare | 0,162–0,186 | 0,129–0,152 | 0,90–1,28 | 2000/2000 | 1 167–1 215 | 144–183 Mo ⚠ |
@@ -74,13 +74,13 @@ casser.
    pièges de mesure : [`docs/BENCH.md`](docs/BENCH.md) ;
 2. **Le client est neutre** — il n'appartient à aucun des frameworks comparés
    (`litemcp-it/examples/bench_remote.rs`), il accepte `Content-Length`, SSE `chunked` et EOF ;
-3. **Les serveurs sont fournis** — un serveur de démonstration par framework, 4 outils
+3. **Les démos sont fournies** — une même démo de 4 outils par framework
    identiques, dans `mcp-bench-arena/` ; la campagne se rejoue en deux commandes
    (`bench_arena.sh` puis `arena_aggregate.py`) ;
 4. **Le journal brut est versionné** — `bench-arena-2026-10-25.log`, 27 mesures, 0 erreur.
 
 Si une implémentation va plus vite ou pèse moins lourd dans ces conditions, la phrase tombe.
-Ce qui est mesuré exactement : **ces 9 implémentations**, ce serveur de démonstration, sur
+Ce qui est mesuré exactement : **ces 9 frameworks**, la même démo de 4 outils, sur
 Windows 11 en loopback, en appels séquentiels. Ce qui ne l'est pas : les SDK Java/C#/Kotlin,
 les mesures Linux de référence, la charge concurrente et les proxys — c'est écrit dans
 [`docs/BENCH.md` §7](docs/BENCH.md).
@@ -541,7 +541,7 @@ L'écart structurel : LiteMCP délimite ses réponses par `Content-Length` et cl
 
 ## Arène multi-frameworks — méthode et détail
 
-Le tableau des 9 serveurs est dans la section **Record mesuré**, en haut de ce README.
+Le tableau des 9 frameworks est dans la section **Record mesuré**, en haut de ce README.
 La méthode complète — définitions des métriques, mémoire et binaire, pièges de mesure,
 campagnes écartées et **portée exacte des chiffres** — est dans [`docs/BENCH.md`](docs/BENCH.md).
 
