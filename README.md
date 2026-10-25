@@ -387,7 +387,7 @@ unique, Windows 11 loopback, 3 passes) :
 
 Méthode, définitions, planchers de transport (TCP nu 0,060–0,067 ms, socket local
 0,032–0,037 ms), portée exacte des chiffres et journal brut : [`docs/BENCH.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/BENCH.md) ·
-graphique : [graphique](https://github.com/DeamonDev888/litemcp/blob/main/docs/bench-arena-2026-10-25.svg).
+graphique : [SVG des latences](https://github.com/DeamonDev888/litemcp/blob/main/docs/bench-arena-2026-10-25.svg).
 
 ### Mesures 0.5.1 — Windows 11 (rustc 1.99.1, release LTO fat/strip, loopback)
 
