@@ -1,0 +1,133 @@
+# Publication de litemcp sur crates.io + notification du tuto.
+#
+# Deux jobs :
+#   1. `publish` — publie la version du `Cargo.toml` si elle n'existe pas
+#      encore sur crates.io (idempotent : relancer est sans effet) ;
+#   2. `notifier` — envoie l'evenement `litemcp-version` au repo du
+#      tuto, qui met alors sa doc a jour automatiquement.
+#
+# Le `notifier` ne part qu'APRES une publication reussie : le tuto ne
+# peut donc jamais suivre une version qui n'est pas publiee. Si le
+# token de notification est absent, le tuto suivra quand même — via le
+# filet de securite hebdomadaire (cron) du workflow maj-version.
+
+name: Publication
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version a publier (ex. 0.6.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publier sur crates.io
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      published: ${{ steps.verif.outputs.publiee }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Rust (toolchain stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Determiner la version
+        id: ver
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          if [ -z "$V" ]; then
+            V=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "version a publier : $V"
+
+      - name: Verifier que la version n'existe pas deja sur crates.io
+        id: existe
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          if curl -sf -A "litemcp-publish (https://github.com/DeamonDev888/litemcp)" \
+             "https://crates.io/api/v1/crates/litemcp/$V" >/dev/null 2>&1; then
+            echo "deja=true" >> "$GITHUB_OUTPUT"
+            echo "litemcp $V est deja publiee — rien a faire"
+          else
+            echo "deja=false" >> "$GITHUB_OUTPUT"
+            echo "litemcp $V n'est pas encore publiee"
+          fi
+
+      - name: Publier (si necessaire)
+        if: steps.existe.outputs.deja == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          cargo publish
+          echo "litemcp ${{ steps.ver.outputs.version }} publiee sur crates.io"
+
+      - name: Verifier la publication
+        id: verif
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          for i in $(seq 1 18); do
+            if curl -sf -A "litemcp-publish (https://github.com/DeamonDev888/litemcp)" \
+               "https://crates.io/api/v1/crates/litemcp/$V" >/dev/null 2>&1; then
+              echo "publiee=true" >> "$GITHUB_OUTPUT"
+              echo "litemcp $V est en ligne sur crates.io"
+              exit 0
+            fi
+            echo "crates.io n'a pas encore indexe $V — tentative $i/18…"
+            sleep 10
+          done
+          # Version deja en ligne avant ce run ? Succes quand même.
+          if [ "${{ steps.existe.outputs.deja }}" = "true" ]; then
+            echo "publiee=true" >> "$GITHUB_OUTPUT"
+            echo "litemcp $V etait deja en ligne"
+            exit 0
+          fi
+          echo "publiee=false" >> "$GITHUB_OUTPUT"
+          echo "crates.io n'a pas indexe $V dans le temps imparti"
+          exit 1
+
+  notifier:
+    name: Notifier le tuto
+    needs: publish
+    if: needs.publish.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Envoyer l'evenement au repo du tuto
+        env:
+          GH_TOKEN: ${{ secrets.TUTO_DISPATCH_TOKEN }}
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "TUTO_DISPATCH_TOKEN absent — notification ignoree (le cron hebdo rattrapera)"
+            exit 0
+          fi
+          code=$(curl -s -o /tmp/disp_resp.json -w "%{http_code}" -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/DeamonDev888/litemcp-tuto/dispatches \
+            -d "{\"event_type\":\"litemcp-version\",\"client_payload\":{\"version\":\"$VERSION\"}}")
+          if [ "$code" = "204" ]; then
+            echo "evenement litemcp-version envoye (v$VERSION) — HTTP 204"
+          else
+            echo "envoi de l'evenement impossible (HTTP $code) — le cron hebdo rattrapera"
+            cat /tmp/disp_resp.json || true
+          fi
