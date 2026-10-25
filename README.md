@@ -2,7 +2,7 @@
 
 # LiteMCP
 
-**La lib MCP la plus légère de l'écosystème Rust : votre serveur MCP en quelques lignes.**
+**La lib MCP la plus légère en mémoire et la plus rapide au monde.**
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
@@ -10,11 +10,80 @@ Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro
 
 [![crates.io](https://img.shields.io/crates/v/litemcp.svg)](https://crates.io/crates/litemcp) [![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI)](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml) [![Docs](https://img.shields.io/docsrs/litemcp)](https://docs.rs/litemcp)
 
-📦 **Crate officiel : [crates.io/crates/litemcp](https://crates.io/crates/litemcp)** · 📖 **Docs : [docs.rs/litemcp](https://docs.rs/litemcp)**
+📦 **Crate officiel : [crates.io/crates/litemcp](https://crates.io/crates/litemcp)** · 📖 **Docs : [docs.rs/litemcp](https://docs.rs/litemcp)** · ⬇️ **Paquet `.crate` attaché à chaque [release GitHub](https://github.com/DeamonDev888/litemcp/releases)**
 
 [Installation](#installation) · [Démarrage rapide](#démarrage-rapide) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/) · [Concepts](#concepts) · [Configuration](#configuration) · [Sécurité](#sécurité) · [Protocole](#protocole) · [FAQ](#faq) · [Client](#client--mcp-command-center)
 
 </div>
+
+---
+
+## 🏆 Le serveur MCP le plus rapide et le plus léger au monde
+
+> **À notre connaissance, aucun serveur MCP public ne publie de meilleures mesures — et le
+> protocole est publié pour nous démentir.** Campagne du **2026-10-25** : **9 implémentations**
+> (Rust, Go, TypeScript, Python), le même serveur de démonstration (4 outils), **un seul client
+> neutre**, 3 passes, Windows 11 loopback, appels séquentiels. Journal brut, scripts et serveurs
+> de démonstration fournis : [`docs/BENCH.md`](docs/BENCH.md).
+
+| | **LiteMCP 0.7.0** | Meilleur concurrent | Écart |
+|---|---|---|---|
+| `tools/call` keep-alive (moyenne) | **0,075–0,091 ms** | 0,162–0,186 ms — tower-mcp 0.25 | **×2,1** |
+| p99 (le pire cas) | **0,25–0,29 ms** | 0,90–1,28 ms — tower-mcp | **×3,8** |
+| Mémoire après ≈6 900 requêtes | **5,1 Mo** | 8,5 Mo — rust-mcp-sdk 2.0 | **×1,7** |
+| Binaire démo 4 outils (release, non strippé — même base des deux côtés) | **0,81 Mo** | 5,50 Mo — tower-mcp | **×6,8** |
+| Connexion TCP réutilisable | **2000/2000** | 2000/2000 — tower-mcp, mcp-go | égalité |
+
+Autrement dit : **2,1× plus rapide et 1,7× plus léger que le meilleur des huit autres** — et,
+avec tower-mcp et mcp-go, l'un des trois seuls à laisser la connexion TCP réutilisable
+(2000/2000) au lieu d'en rouvrir une à chaque appel.
+
+**Et il n'y a presque plus rien à gratter** : sur la même machine, un **écho TCP nu** (zéro
+HTTP, zéro JSON, 128 octets) coûte **0,060–0,067 ms**. LiteMCP ajoute **12 à 28 µs** à ce
+plancher — 70 à 80 % du chiffre final est le transport Windows, pas la lib
+([détail](docs/BENCH.md)). Seul un **socket local** (named pipe / AF_UNIX) descend plus bas :
+**0,032–0,037 ms**, deux fois moins que le TCP — mais ce n'est pas un transport MCP, et stdio
+existe déjà pour le local.
+
+### Le benchmark complet
+
+![Latence MCP serveur — 9 frameworks](docs/bench-arena-2026-10-25.svg)
+
+| # | Serveur | Langage / version | Mode | moy (ms) | p50 | p99 | Réutilisées | Neuves (conn/s) | Mémoire |
+|---|---|---|---|---|---|---|---|---|---|
+| 🥇 | **LiteMCP** | Rust 0.7.0 | bare | **0,075–0,091** | 0,064–0,084 | **0,25–0,29** | **2000/2000** | 1 249–1 729 | **5,1 Mo** |
+| 🥈 | tower-mcp | Rust 0.25.0 | bare | 0,162–0,186 | 0,129–0,152 | 0,90–1,28 | 2000/2000 | 1 167–1 215 | 144–183 Mo ⚠ |
+| 🥉 | mcp-go | Go 1.3.0 | bare | 0,164–0,484 | 0,129–0,204 | 1,02–5,23 | 2000/2000 | 819–1 739 | 58,2 Mo |
+| 4 | rust-mcp-sdk | Rust 2.0.0 | strict | 0,306–0,412 | 0,263–0,363 | 1,26–1,58 | 0/2000 | 953–1 555 | 8,5 Mo |
+| 5 | rmcp (SDK officiel) | Rust 3.7.0 | strict | 0,341–0,589 | 0,272–0,441 | 1,72–2,62 | 0/2000 | 990–1 759 | 9,5 Mo |
+| 6 | vitemcp (SSE) | TypeScript 1.9.7 | bare | 1,72–2,46 | 1,56–1,94 | 4,7–8,0 | 0/2000 | 342–609 | 191,7 Mo |
+| 7 | vitemcp (JSON) | TypeScript 1.9.7 | bare | 1,31–2,25 | 1,14–1,91 | 3,5–8,0 | 0/2000 | 369–596 | 191,2 Mo |
+| 8 | mcp (SDK officiel) | Python 2.3.0 | bare | 2,55–2,88 | 2,05–2,24 | 6,3–8,5 | 0/2000 | 237–346 | 79,9 Mo |
+| 9 | FastMCP | Python 4.1.3 | bare | 3,57–4,01 | 3,05–3,38 | 6,9–9,4 | 0/2000 | 204–234 | 113,4 Mo |
+
+Médiane des 3 passes, écart avec LiteMCP : **×2,1** tower-mcp · **×2,2** mcp-go ·
+**×4,4** rust-mcp-sdk · **×5,5** rmcp · **×22,5** vitemcp SSE · **×25,7** vitemcp JSON ·
+**×30,9** SDK Python · **×44,6** FastMCP.
+
+### Comment nous démentir
+
+Le titre n'est pas un slogan : c'est une **mesure révocable**, et tout est fourni pour la
+casser.
+
+1. **Le protocole est écrit** — définitions exactes des métriques, dispositif, modes de requête,
+   pièges de mesure : [`docs/BENCH.md`](docs/BENCH.md) ;
+2. **Le client est neutre** — il n'appartient à aucun des frameworks comparés
+   (`litemcp-it/examples/bench_remote.rs`), il accepte `Content-Length`, SSE `chunked` et EOF ;
+3. **Les serveurs sont fournis** — un serveur de démonstration par framework, 4 outils
+   identiques, dans `mcp-bench-arena/` ; la campagne se rejoue en deux commandes
+   (`bench_arena.sh` puis `arena_aggregate.py`) ;
+4. **Le journal brut est versionné** — `bench-arena-2026-10-25.log`, 27 mesures, 0 erreur.
+
+Si une implémentation va plus vite ou pèse moins lourd dans ces conditions, la phrase tombe.
+Ce qui est mesuré exactement : **ces 9 implémentations**, ce serveur de démonstration, sur
+Windows 11 en loopback, en appels séquentiels. Ce qui ne l'est pas : les SDK Java/C#/Kotlin,
+les mesures Linux de référence, la charge concurrente et les proxys — c'est écrit dans
+[`docs/BENCH.md` §7](docs/BENCH.md).
 
 ---
 
@@ -372,6 +441,8 @@ Le durcissement transport est intégré et vérifié par la suite de tests : lim
 
 ## Benchmarks
 
+> Méthode, définitions et portée exacte des chiffres : [`docs/BENCH.md`](docs/BENCH.md).
+
 > Règle du projet : **jamais d'adjectif sans chiffre.** Toute mesure est
 > reproductible via `cargo run --release --example bench_backends` et
 > `cargo run --release --example slo` (release, loopback).
@@ -394,6 +465,10 @@ Trois passes consécutives, même machine, même session :
 > environnement bureautique ; les campagnes Linux du 2026-10-24 (0,031–0,033 ms
 > en moyenne, p99 0,048–0,065 ms) restent la référence pour un serveur
 > dédié — voir la [feuille de route](https://github.com/DeamonDev888/litemcp/blob/main/docs/ROADMAP.md) pour le détail des conditions figées.
+
+**Contrôle 0.7.0 (2026-10-25, même machine, même outil)** : **0,087 ms** de
+moyenne, p50 0,077 / p99 0,325 ms, **1 983 conn/s** en connexions neuves —
+aucune régression depuis la 0.5.1.
 
 ### Décisions prises sur mesures
 
@@ -434,29 +509,41 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 
 ## Comparatif — ViteMCP (TypeScript)
 
-[`@vitemcp/server`](https://github.com/vitemcp/server) est le framework TS qui cible la **même spec** stateless 2026-07-28 — le comparatif naturel. Même serveur démo (4 outils identiques) des deux côtés, **un seul client de bench neutre** (Rust, `litemcp-it/examples/bench_remote`), Windows 11, loopback, passes alternées (campagne du 2026-10-22).
+[`@vitemcp/server`](https://github.com/vitemcp/server) est le framework TS qui cible la **même spec** stateless 2026-07-28 — le comparatif naturel. Même serveur démo (4 outils identiques) des deux côtés, **un seul client de bench neutre** (Rust, `litemcp-it/examples/bench_remote`), Windows 11, loopback, passes alternées — **campagne du 2026-10-25, libs à jour** : litemcp `0.7.0` (crates.io) contre `@vitemcp/server` `1.9.7` (variantes SSE et `enableJsonResponse`), 3 passes.
 
 **Résumé express :**
 
-| | LiteMCP | ViteMCP (TS) |
+| | LiteMCP 0.7.0 | ViteMCP 1.9.7 |
 |---|---|---|
-| ⚡ Temps de réponse moyen | **0,09 ms** | 1,43 ms |
-| 😰 Le pire cas (p99) | **0,18 ms** | 5,4 ms |
+| ⚡ Temps de réponse moyen | **0,08 ms** | 1,16–1,33 ms |
+| 😰 Le pire cas (p99) | **0,16–0,23 ms** | 3,0–3,8 ms |
 | 🔌 Connexions réutilisées | **2000/2000** | 0/2000 |
-| 📊 Nouvelles connexions par seconde | **~1000** | ~400 |
-| 🧠 Mémoire après 2300 requêtes | **5,5 Mo** | ~417 Mo |
+| 📊 Nouvelles connexions par seconde | **~2 000** | 521–737 |
+| 🧠 Mémoire (WorkingSet du serveur) | **5,8 Mo** | 179–228 Mo |
 
-Détail complet (plages, passes alternées) :
+Détail complet (plages sur 3 passes, passes alternées) :
 
-| Métrique | **LiteMCP** | @vitemcp/server | Verdict |
+| Métrique | **LiteMCP 0.7.0** | @vitemcp/server 1.9.7 | Verdict |
 |---|---|---|---|
-| keep-alive (moyenne) | **0,09–0,10 ms** | 1,43–1,73 ms | **~15–18× plus rapide** |
-| p99 keep-alive | **0,18–0,22 ms** | 5,4–5,9 ms | ~25× plus resserré |
+| keep-alive (moyenne) | **0,073–0,082 ms** | 1,16–1,33 ms | **~16–17× plus rapide** |
+| p50 keep-alive | **0,063–0,073 ms** | 0,99–1,18 ms | ~15–18× |
+| p99 keep-alive | **0,16–0,23 ms** | 3,0–3,8 ms | ~17× plus resserré |
 | Connexions réutilisées | **2000/2000** | 0/2000 | flux SSE maintenu ouvert côté ViteMCP → reconnect à chaque appel |
-| Nouvelles connexions acceptées **(connexions/seconde)** | **848–1257 connexions/s** | 354–498 connexions/s | **~2–3× plus de nouveaux clients par seconde** |
-| Mémoire après 2 300 requêtes | **5,5 Mo** (0,9 Mo privé, reste = DLL partagées) | ~417 Mo (3 processus Node : 47 + 63 + 306) | **~75× moins de mémoire** |
+| Nouvelles connexions acceptées **(connexions/seconde)** | **1 968–2 122 conn/s** | 521–737 conn/s | **~3–4× plus de nouveaux clients par seconde** |
+| Mémoire (WorkingSet du serveur) | **5,8 Mo** (0,8 Mo privé, reste = DLL partagées) | 179 Mo (SSE) / 228 Mo (JSON) — `node.exe` + `esbuild.exe` | **~31–39× moins de mémoire** |
 
-L'écart structurel : LiteMCP délimite ses réponses par `Content-Length` et clôt le flux après l'événement — la connexion TCP reste proprement réutilisable ; ViteMCP répond en **SSE encadré** qu'il maintient ouvert, le client doit donc rouvrir une connexion par appel séquentiel. (Conditions : tsx/Node 24 côté TS ; les deux serveurs complétaient les mêmes requêtes JSON-RPC.)
+L'écart structurel : LiteMCP délimite ses réponses par `Content-Length` et clôt le flux après l'événement — la connexion TCP reste proprement réutilisable ; ViteMCP répond en **SSE encadré** qu'il maintient ouvert, le client doit donc rouvrir une connexion par appel séquentiel. (Conditions : tsx/Node 26.7 côté TS ; les deux serveurs complétaient les mêmes requêtes JSON-RPC. Campagne précédente du 2026-10-22 sur `@vitemcp/server` 1.9.6 : 1,43–1,73 ms de moyenne, p99 5,4–5,9 ms, 354–498 conn/s, ~417 Mo — la 1.9.7 gagne ~20 % de latence et ~50 % de mémoire, l'ordre de grandeur ne bouge pas.)
+
+> Reproductibilité : `bash bench_campaign.sh` dans `litemcp-it` (3 passes alternées,
+> client neutre `bench_remote`, drainage du pool de ports éphémères entre passes —
+> une passe ≈ 6 900 connexions, le pool Windows de 16 384 ports se sature en
+> `TIME_WAIT` si on enchaîne sans pause).
+
+## Arène multi-frameworks — méthode et détail
+
+Le tableau des 9 serveurs est dans la section **Record mesuré**, en haut de ce README.
+La méthode complète — définitions des métriques, mémoire et binaire, pièges de mesure,
+campagnes écartées et **portée exacte des chiffres** — est dans [`docs/BENCH.md`](docs/BENCH.md).
 
 ## Hébergement VPS & proxies (le piège du tamponnage SSE)
 

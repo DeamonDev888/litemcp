@@ -12,6 +12,13 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
+### Documentation — arène multi-frameworks (2026-10-25)
+
+- **Comparatif 9 serveurs MCP** dans le README, mêmes 4 outils et même client neutre : LiteMCP `0.7.0` face à `tower-mcp` 0.25, `mcp-go` 1.3, `rust-mcp-sdk` 2.0, `rmcp` 3.7, `vitemcp` 1.9.7 (SSE et JSON), `mcp` Python 2.3 et `fastmcp` 4.1.3. Résultat en keep-alive (médiane de 3 passes) : **0,075–0,091 ms** pour LiteMCP, soit ×2,1 tower-mcp, ×2,2 mcp-go, ×4,4 rust-mcp-sdk, ×5,5 rmcp, ×22–26 vitemcp, ×31 le SDK Python, ×45 FastMCP ; seuls LiteMCP, tower-mcp et mcp-go laissent la connexion réutilisable (2000/2000 contre 0/2000 pour les transports SSE) ;
+- **Deux enseignements de banc** : `rmcp` et `rust-mcp-sdk` exigent les en-têtes 2026-07-28 (`Mcp-Method`, `Mcp-Name`, `_meta`) pour un `tools/call` sans session, et **tower-mcp voit sa mémoire croître avec le volume** (5,8 Mo à froid → 144–183 Mo après ≈7 000 requêtes, reproduit deux fois) ;
+- Banc reproductible hors crate : `litemcp-it/bench_arena.sh` + `arena_aggregate.py`, serveurs de démonstration dans `mcp-bench-arena/` ;
+- **[`docs/BENCH.md`](docs/BENCH.md)** : méthode, définitions des métriques, pièges de mesure, mémoire/binaire et **portée exacte** des chiffres (ce qui est établi : meilleur des neuf mesurés ; ce qui ne l'est pas : « toutes implémentations confondues »), avec le graphique `docs/bench-arena-2026-10-25.svg`.
+
 ### Prévu (suite)
 
 - Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur.
@@ -51,6 +58,11 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 ### Tests
 
 - **230 tests** au total (56 unitaires dont le plafond d'inflight, 19 `audit_2026_10_25`, 15 `http_security_audit`, 10 `audit_2026_10_24`, 11 `zod_gaps_2026_10_24`, 9 features, 3 fuzz proptest, 81 HTTP sur vraies sockets dont le plafond de réponse, 9 macros, 3 schemars, 5 smoke, 9 doctests — 3 doctests `ignore`).
+
+### Mesures — campagne 2026-10-25 (libs à jour, client neutre)
+
+- **vs `@vitemcp/server` 1.9.7** (3 passes alternées, Windows 11, loopback, `litemcp-it/examples/bench_remote`) : keep-alive **0,073–0,082 ms** contre 1,16–1,33 ms (**~16–17×**), p99 **0,16–0,23 ms** contre 3,0–3,8 ms, **2000/2000** connexions réutilisées contre **0/2000**, **1 968–2 122 conn/s** neuves contre 521–737, et **5,8 Mo** de WorkingSet contre 179–228 Mo. La 1.9.7 améliore son propre score d'environ 20 % en latence et 50 % en mémoire par rapport à la campagne du 2026-10-22 (1,43–1,73 ms, ~417 Mo) sans changer l'écart structurel ;
+- **non-régression côté route maison** : `examples/bench_backends` sur 0.7.0 → **0,087 ms** de moyenne, p50 0,077 / p99 0,325 ms, **1 983 conn/s** — identique à la 0.5.1.
 
 ## [0.6.0] - 2026-10-24
 

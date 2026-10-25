@@ -122,7 +122,7 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 |---|---|---|
 | HTTP/1.1 maison (parsing, edge cases) | Élevé | Périmètre minimal (POST only), fuzz en Phase 3, repli `tiny_http` décidé par les tests |
 | Conformance incomplète en 0.1 | Moyen | 0.1 assumée « socle » ; 1.0 seulement après suite officielle |
-| Superlatif « le plus léger du monde » non mesuré | Réputation | Benchmarks obligatoires à chaque release ; la phrase reste un objectif, les chiffres tranchent |
+| Revendication « le plus rapide et le plus léger au monde » | Réputation | Publiée comme **mesure révocable** : protocole, client neutre, serveurs et journal dans le dépôt (`docs/BENCH.md`) — toute implémentation qui fait mieux dans ces conditions fait tomber la phrase ; benchmarks rejoués à chaque release |
 
 ## 6. Journal
 

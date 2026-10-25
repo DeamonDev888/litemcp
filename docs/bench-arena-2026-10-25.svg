@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="520" viewBox="0 0 1000 520" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif">
+<rect width="1000" height="520" fill="#ffffff"/>
+<text x="195" y="32" font-size="18" font-weight="700" fill="#111827">Latence MCP serveur · 9 frameworks · Windows 11 loopback</text>
+<text x="195" y="53" font-size="12" fill="#6b7280">campagne du 2026-10-25 · 4 outils identiques · client neutre unique · médiane de 3 passes · échelle log</text>
+<line x1="205.0" y1="74" x2="205.0" y2="430" stroke="#e5e7eb" stroke-width="1"/>
+<text x="205.0" y="66" font-size="11" fill="#6b7280" text-anchor="middle">0,05 ms</text>
+<line x1="306.6" y1="74" x2="306.6" y2="430" stroke="#e5e7eb" stroke-width="1"/>
+<text x="306.6" y="66" font-size="11" fill="#6b7280" text-anchor="middle">0,1 ms</text>
+<line x1="440.9" y1="74" x2="440.9" y2="430" stroke="#e5e7eb" stroke-width="1"/>
+<text x="440.9" y="66" font-size="11" fill="#6b7280" text-anchor="middle">0,25 ms</text>
+<line x1="542.5" y1="74" x2="542.5" y2="430" stroke="#e5e7eb" stroke-width="1"/>
+<text x="542.5" y="66" font-size="11" fill="#6b7280" text-anchor="middle">0,5 ms</text>
+<line x1="644.1" y1="74" x2="644.1" y2="430" stroke="#e5e7eb" stroke-width="1"/>
+<text x="644.1" y="66" font-size="11" fill="#6b7280" text-anchor="middle">1 ms</text>
+<line x1="745.7" y1="74" x2="745.7" y2="430" stroke="#e5e7eb" stroke-width="1"/>
+<text x="745.7" y="66" font-size="11" fill="#6b7280" text-anchor="middle">2 ms</text>
+<line x1="847.3" y1="74" x2="847.3" y2="430" stroke="#e5e7eb" stroke-width="1"/>
+<text x="847.3" y="66" font-size="11" fill="#6b7280" text-anchor="middle">4 ms</text>
+<text x="193" y="101.5" font-size="12.5" text-anchor="end" fill="#111827" font-weight="700">litemcp 0.7.0</text>
+<rect x="205" y="84" width="79.5" height="26" rx="4" fill="#10b981" opacity="1"/>
+<text x="293.5" y="101.5" font-size="12.5" font-weight="600" fill="#111827">0,09 ms</text>
+<text x="350.5" y="101.5" font-size="11" fill="#6b7280">référence</text>
+<text x="193" y="140.5" font-size="12.5" text-anchor="end" fill="#111827" font-weight="500">tower-mcp 0.25</text>
+<rect x="205" y="123" width="190.2" height="26" rx="4" fill="#2563eb" opacity="0.85"/>
+<text x="404.2" y="140.5" font-size="12.5" font-weight="600" fill="#111827">0,18 ms</text>
+<text x="193" y="179.5" font-size="12.5" text-anchor="end" fill="#111827" font-weight="500">mcp-go 1.3</text>
+<rect x="205" y="162" width="194.1" height="26" rx="4" fill="#0ea5e9" opacity="0.85"/>
+<text x="408.1" y="179.5" font-size="12.5" font-weight="600" fill="#111827">0,19 ms</text>
+<text x="193" y="218.5" font-size="12.5" text-anchor="end" fill="#111827" font-weight="500">rust-mcp-sdk 2.0</text>
+<rect x="205" y="201" width="297.3" height="26" rx="4" fill="#2563eb" opacity="0.85"/>
+<text x="511.3" y="218.5" font-size="12.5" font-weight="600" fill="#111827">0,38 ms</text>
+<text x="193" y="257.5" font-size="12.5" text-anchor="end" fill="#111827" font-weight="500">rmcp 3.7</text>
+<rect x="205" y="240" width="328.1" height="26" rx="4" fill="#2563eb" opacity="0.85"/>
+<text x="542.1" y="257.5" font-size="12.5" font-weight="600" fill="#111827">0,47 ms</text>
+<text x="193" y="296.5" font-size="12.5" text-anchor="end" fill="#111827" font-weight="500">vitemcp 1.9.7 (SSE)</text>
+<rect x="205" y="279" width="535.9" height="26" rx="4" fill="#f59e0b" opacity="0.85"/>
+<text x="749.9" y="296.5" font-size="12.5" font-weight="600" fill="#111827">1,94 ms</text>
+<text x="193" y="335.5" font-size="12.5" text-anchor="end" fill="#111827" font-weight="500">vitemcp 1.9.7 (JSON)</text>
+<rect x="205" y="318" width="555.1" height="26" rx="4" fill="#f59e0b" opacity="0.85"/>
+<text x="769.1" y="335.5" font-size="12.5" font-weight="600" fill="#111827">2,21 ms</text>
+<text x="193" y="374.5" font-size="12.5" text-anchor="end" fill="#111827" font-weight="500">mcp officiel 2.3</text>
+<rect x="205" y="357" width="582.4" height="26" rx="4" fill="#8b5cf6" opacity="0.85"/>
+<text x="796.4" y="374.5" font-size="12.5" font-weight="600" fill="#111827">2,66 ms</text>
+<text x="193" y="413.5" font-size="12.5" text-anchor="end" fill="#111827" font-weight="500">FastMCP 4.1.3</text>
+<rect x="205" y="396" width="636.0" height="26" rx="4" fill="#8b5cf6" opacity="0.85"/>
+<text x="850.0" y="413.5" font-size="12.5" font-weight="600" fill="#111827">3,83 ms</text>
+<text x="195" y="451" font-size="12" fill="#6b7280">LiteMCP ≈ 2,1× tower-mcp · 2,2× mcp-go · 4,4× rust-mcp-sdk · 5,5× rmcp · 22–26× vitemcp · 31× SDK Python · 45× FastMCP</text>
+<text x="195" y="471" font-size="11.5" fill="#6b7280">Les transports SSE (rmcp, rust-mcp-sdk, vitemcp, Python) rouvrent une connexion par appel : la mesure inclut le connect().</text>
+<text x="195" y="490" font-size="11" fill="#6b7280">Source : docs/BENCH.md · journal brut : litemcp-it/bench-arena-2026-10-25.log</text>
+</svg>
