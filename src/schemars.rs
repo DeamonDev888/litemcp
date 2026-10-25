@@ -2,7 +2,7 @@
 //! opt-in `schemars`.
 //!
 //! N'importe quel type `#[derive(JsonSchema)]` devient un schéma
-//! **exécuteur** litemcp :
+//! **exécuteur** LiteMCP :
 //! [`from_schemars::<T>()`](crate::schemars::from_schemars) s'utilise partout où
 //! l'API attend `impl zod::Schema` (`tool_typed`, `tool_parse`,
 //! `prompt_typed`, `output_schema`).
@@ -147,18 +147,22 @@ impl Schema for FromJsonSchema {
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         match self.validator() {
             Validator::Broken(message) => issues.push(format!(
-                "`{}` : schéma interne incompilable ({message})",
+                "`{}`: invalid internal schema ({message})",
                 path.as_str()
             )),
             Validator::Compiled(validator) => {
                 for error in validator.iter_errors(value) {
+                    if issues.is_full() {
+                        issues.record_overflow();
+                        continue;
+                    }
                     let pointer = error.instance_path().to_string();
                     let location = if pointer.is_empty() {
                         path.as_str().to_string()
                     } else {
                         format!("{}{}", path.as_str(), pointer_to_suffix(&pointer))
                     };
-                    issues.push(format!("`{location}` : {error}"));
+                    issues.push(format!("`{location}`: {error}"));
                 }
             }
         }
@@ -182,7 +186,7 @@ pub struct FromSchemars<T: ?Sized> {
     validator_with_formats: OnceLock<Validator>,
 }
 
-/// Adapte un type `#[derive(JsonSchema)]` en schéma exécuteur litemcp.
+/// Adapte un type `#[derive(JsonSchema)]` en schéma exécuteur LiteMCP.
 ///
 /// ```ignore
 /// use litemcp::schemars::from_schemars;
@@ -215,7 +219,7 @@ impl<T: ::schemars::JsonSchema + 'static> FromSchemars<T> {
     /// Par défaut, `jsonschema` **ignore** les `format` (annotation
     /// JSON Schema 2020-12) : un `format: "email"` publié par `schemars`
     /// serait donc publié mais **jamais appliqué** — le schéma cesserait
-    /// d'être exécuteur, contrairement à la promesse de litemcp et du
+    /// d'être exécuteur, contrairement à la promesse de LiteMCP et du
     /// module [`crate::zod`] (où `.email()` publie **et** applique).
     ///
     /// `should_validate_formats(true)` rend le validateur conforme au
@@ -258,11 +262,15 @@ impl<T: ::schemars::JsonSchema + 'static> Schema for FromSchemars<T> {
         // serait publié mais jamais appliqué (le schéma mentirait).
         match self.validator_with_formats() {
             Validator::Broken(message) => issues.push(format!(
-                "`{}` : schéma interne incompilable ({message})",
+                "`{}`: invalid internal schema ({message})",
                 path.as_str()
             )),
             Validator::Compiled(validator) => {
                 for error in validator.iter_errors(value) {
+                    if issues.is_full() {
+                        issues.record_overflow();
+                        continue;
+                    }
                     // Pointeur d'instance ("/a/0/b") → suffixe lisible
                     // (".a[0].b"), greffé sur le chemin litemcp courant.
                     let pointer = error.instance_path().to_string();
@@ -271,7 +279,7 @@ impl<T: ::schemars::JsonSchema + 'static> Schema for FromSchemars<T> {
                     } else {
                         format!("{}{}", path.as_str(), pointer_to_suffix(&pointer))
                     };
-                    issues.push(format!("`{location}` : {error}"));
+                    issues.push(format!("`{location}`: {error}"));
                 }
             }
         }

@@ -76,13 +76,36 @@ jobs:
             echo "litemcp $V n'est pas encore publiee"
           fi
 
+      - name: Publier litemcp-macros (si necessaire)
+        if: steps.existe.outputs.deja == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          MV=$(sed -n 's/^version = "\(.*\)"$/\1/p' litemcp-macros/Cargo.toml | head -1)
+          if curl -sf -A "litemcp-publish (https://github.com/DeamonDev888/litemcp)" \
+             "https://crates.io/api/v1/crates/litemcp-macros/$MV" >/dev/null 2>&1; then
+            echo "litemcp-macros $MV est deja publiee sur crates.io"
+          else
+            cargo publish -p litemcp-macros
+            for i in $(seq 1 18); do
+              if curl -sf -A "litemcp-publish (https://github.com/DeamonDev888/litemcp)" \
+                 "https://crates.io/api/v1/crates/litemcp-macros/$MV" >/dev/null 2>&1; then
+                echo "litemcp-macros $MV est en ligne sur crates.io"
+                break
+              fi
+              echo "crates.io n'a pas encore indexe litemcp-macros $MV — tentative $i/18…"
+              sleep 10
+            done
+          fi
+
       - name: Publier (si necessaire)
         if: steps.existe.outputs.deja == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          cargo publish
+          cargo publish -p litemcp
           echo "litemcp ${{ steps.ver.outputs.version }} publiee sur crates.io"
 
       - name: Verifier la publication

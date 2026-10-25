@@ -1,7 +1,8 @@
 //! Types MCP 2026-07-28 — le strict nécessaire d'un serveur stateless.
 
+use crate::error::ToolError;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Version de la spec MCP ciblée.
 ///
@@ -258,10 +259,33 @@ impl CallToolResult {
             meta: None,
         }
     }
+
+    /// Construit un résultat d'**échec d'exécution** (`isError: true`) à
+    /// partir d'une erreur structurée.
+    ///
+    /// Forme fil : le `content` textuel porte le message seul (compatible
+    /// avec les clients qui ne lisent que le texte), et
+    /// `structuredContent.error` porte l'erreur machine-lisible (`code`,
+    /// `retryable`, `retryAfterMs`) — voir [`crate::error`]. Le
+    /// `structuredContent` d'un échec n'a pas à conformer à l'`outputSchema`
+    /// publié : il décrit l'échec, pas une sortie réussie.
+    #[must_use]
+    pub fn from_tool_error(error: &ToolError) -> Self {
+        Self {
+            result_type: ResultType::Complete,
+            content: vec![TextContent {
+                kind: "text",
+                text: error.message.clone(),
+            }],
+            is_error: Some(true),
+            structured_content: Some(json!({ "error": error.to_json() })),
+            meta: None,
+        }
+    }
 }
 
-impl From<Result<Value, String>> for CallToolResult {
-    fn from(result: Result<Value, String>) -> Self {
+impl From<Result<Value, ToolError>> for CallToolResult {
+    fn from(result: Result<Value, ToolError>) -> Self {
         match result {
             Ok(value) => {
                 // Choix d'API : `structuredContent` est toujours un objet.
@@ -280,20 +304,11 @@ impl From<Result<Value, String>> for CallToolResult {
                 let structured = if value.is_object() {
                     value
                 } else {
-                    serde_json::json!({ "result": value })
+                    json!({ "result": value })
                 };
                 Self::from_structured(structured)
             }
-            Err(message) => Self {
-                result_type: ResultType::Complete,
-                content: vec![TextContent {
-                    kind: "text",
-                    text: message,
-                }],
-                is_error: Some(true),
-                structured_content: None,
-                meta: None,
-            },
+            Err(error) => Self::from_tool_error(&error),
         }
     }
 }
@@ -351,12 +366,24 @@ pub struct ReadResourceResult {
 
 // --- Prompts ---
 
+/// Argument annoncé par un prompt dans `prompts/list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PromptArgument {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+}
+
 /// Entrée du catalogue `prompts/list`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Prompt {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<PromptArgument>>,
 }
 
 /// Résultat de `prompts/list`.
@@ -462,31 +489,46 @@ mod tests {
     #[test]
     fn non_object_results_are_wrapped_into_an_object() {
         // La spec MCP exige un objet dans structuredContent.
-        let result = CallToolResult::from(Ok::<Value, String>(json!(42)));
+        let result = CallToolResult::from(Ok::<Value, ToolError>(json!(42)));
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["structuredContent"], json!({ "result": 42 }));
         assert_eq!(v["content"][0]["text"], r#"{"result":42}"#);
         assert_eq!(v["resultType"], "complete");
 
-        let result = CallToolResult::from(Ok::<Value, String>(Value::Null));
+        let result = CallToolResult::from(Ok::<Value, ToolError>(Value::Null));
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["structuredContent"], json!({ "result": null }));
 
-        let result = CallToolResult::from(Ok::<Value, String>(json!([1, 2])));
+        let result = CallToolResult::from(Ok::<Value, ToolError>(json!([1, 2])));
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["structuredContent"], json!({ "result": [1, 2] }));
 
         // Un objet passe tel quel, sans enveloppe.
-        let result = CallToolResult::from(Ok::<Value, String>(json!({ "somme": 12 })));
+        let result = CallToolResult::from(Ok::<Value, ToolError>(json!({ "somme": 12 })));
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["structuredContent"], json!({ "somme": 12 }));
         assert_eq!(v["content"][0]["text"], r#"{"somme":12}"#);
     }
 
     #[test]
+    fn tool_error_result_carries_a_structured_error() {
+        // L'échec d'exécution garde le message en texte (compatibilité
+        // clients texte) ET l'erreur machine-lisible sous
+        // structuredContent.error (réaction programmatique du client).
+        let error = ToolError::rate_limited("quota exhausted").retry_after_ms(500);
+        let result = CallToolResult::from(Err::<Value, ToolError>(error));
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(v["isError"], true);
+        assert_eq!(v["content"][0]["text"], "quota exhausted");
+        assert_eq!(v["structuredContent"]["error"]["code"], "rate_limited");
+        assert_eq!(v["structuredContent"]["error"]["retryable"], true);
+        assert_eq!(v["structuredContent"]["error"]["retryAfterMs"], 500);
+    }
+
+    #[test]
     fn every_result_carries_a_result_type() {
         // SEP-2322 : resultType est OBLIGATOIRE dans chaque result.
-        let call = CallToolResult::from(Ok::<Value, String>(json!({})));
+        let call = CallToolResult::from(Ok::<Value, ToolError>(json!({})));
         let v = serde_json::to_value(&call).unwrap();
         assert_eq!(v["resultType"], "complete");
     }

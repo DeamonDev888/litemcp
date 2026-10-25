@@ -60,6 +60,11 @@ use std::sync::Arc;
 /// problèmes sont comptés sans être stockés.
 pub const MAX_ISSUES: usize = 64;
 
+/// Profondeur maximale d'imbrication acceptée lors de la validation ou de
+/// l'injection de défauts — protège la pile d'exécution contre un arbre
+/// `serde_json::Value` profondément imbriqué construit en mémoire.
+pub const MAX_DEPTH: usize = 128;
+
 /// Collecteur d'issues de validation, **borné en mémoire**.
 ///
 /// Un tableau de centaines de milliers d'éléments invalides ne doit pas
@@ -79,13 +84,29 @@ impl Issues {
         Self::default()
     }
 
+    /// Le plafond [`MAX_ISSUES`] est-il atteint ?
+    ///
+    /// Permet d'éviter de formater et d'allouer le message d'erreur quand il
+    /// ne sera plus stocké (seul le compteur d'omissions est incrémenté via
+    /// [`Issues::record_overflow`]).
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.items.len() >= MAX_ISSUES
+    }
+
+    /// Comptabilise une issue supplémentaire au-delà de [`MAX_ISSUES`] sans
+    /// allouer de chaîne.
+    pub fn record_overflow(&mut self) {
+        self.overflow = self.overflow.saturating_add(1);
+    }
+
     /// Enregistre une issue — au-delà de [`MAX_ISSUES`], elle est seulement
     /// comptée.
     pub fn push(&mut self, issue: impl Into<String>) {
         if self.items.len() < MAX_ISSUES {
             self.items.push(issue.into());
         } else {
-            self.overflow += 1;
+            self.overflow = self.overflow.saturating_add(1);
         }
     }
 
@@ -100,12 +121,24 @@ impl Issues {
         let mut out = self.items.clone();
         if self.overflow > 0 {
             out.push(format!(
-                "… et {overflow} problème(s) supplémentaire(s) omis",
+                "… and {overflow} more issue(s) omitted",
                 overflow = self.overflow
             ));
         }
         out
     }
+}
+
+/// Émet une issue dans `$issues` sans évaluer `format!` si le plafond
+/// [`MAX_ISSUES`] est déjà atteint (zéro allocation au-delà de 64 erreurs).
+macro_rules! push_issue {
+    ($issues:expr, $($arg:tt)*) => {
+        if $issues.is_full() {
+            $issues.record_overflow();
+        } else {
+            $issues.push(format!($($arg)*));
+        }
+    };
 }
 
 /// Chemin de validation, **réutilisé par un buffer unique**.
@@ -118,15 +151,19 @@ impl Issues {
 /// validation réussissait (12 allocations pour 2 champs + 10 éléments).
 pub struct Path {
     buf: String,
+    depth: usize,
 }
 
 impl Path {
     /// Chemin racine (ex. `arguments`).
+    ///
+    /// Pré-alloue une marge de 32 octets pour les segments de champs et
+    /// d'indices afin que le premier [`Path::push_field`] ne réalloue pas.
     #[must_use]
     pub fn root(root: &str) -> Self {
-        Self {
-            buf: root.to_string(),
-        }
+        let mut buf = String::with_capacity(root.len() + 32);
+        buf.push_str(root);
+        Self { buf, depth: 0 }
     }
 
     /// Marque de longueur courante — à passer à [`Path::truncate`] pour
@@ -437,29 +474,46 @@ impl Schema for Obj {
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         let Some(map) = value.as_object() else {
-            issues.push(format!("`{}` : objet attendu", path.as_str()));
+            push_issue!(issues, "`{}`: expected an object", path.as_str());
             return;
         };
+        if path.depth >= MAX_DEPTH {
+            push_issue!(
+                issues,
+                "`{}`: maximum nesting depth ({MAX_DEPTH}) exceeded",
+                path.as_str()
+            );
+            return;
+        }
         if self.strict {
             for name in map.keys() {
                 if !self.fields.iter().any(|f| &f.name == name) {
-                    let mark = path.mark();
-                    path.push_field(name);
-                    issues.push(format!(
-                        "`{}` : champ inconnu (objet strict)",
-                        path.as_str()
-                    ));
-                    path.truncate(mark);
+                    if issues.is_full() {
+                        issues.record_overflow();
+                    } else {
+                        let mark = path.mark();
+                        path.push_field(name);
+                        issues.push(format!(
+                            "`{}`: unknown field (strict object)",
+                            path.as_str()
+                        ));
+                        path.truncate(mark);
+                    }
                 }
             }
         }
+        path.depth += 1;
         for field in &self.fields {
             match map.get(&field.name) {
                 Some(child) => {
-                    let mark = path.mark();
-                    path.push_field(&field.name);
-                    field.schema.validate(path, child, issues);
-                    path.truncate(mark);
+                    if issues.is_full() {
+                        field.schema.validate(path, child, issues);
+                    } else {
+                        let mark = path.mark();
+                        path.push_field(&field.name);
+                        field.schema.validate(path, child, issues);
+                        path.truncate(mark);
+                    }
                 }
                 // Champ absent **avec valeur par défaut** : pas une
                 // erreur — le défaut sera injecté (voir
@@ -467,22 +521,31 @@ impl Schema for Obj {
                 // validé : un défaut incohérent avec le schéma est une
                 // erreur de programmation.
                 None if field.schema.default_value().is_some() => {
-                    let mark = path.mark();
-                    path.push_field(&field.name);
                     if let Some(default) = field.schema.default_value() {
-                        field.schema.validate(path, default, issues);
+                        if issues.is_full() {
+                            field.schema.validate(path, default, issues);
+                        } else {
+                            let mark = path.mark();
+                            path.push_field(&field.name);
+                            field.schema.validate(path, default, issues);
+                            path.truncate(mark);
+                        }
                     }
-                    path.truncate(mark);
                 }
                 None if field.required => {
-                    let mark = path.mark();
-                    path.push_field(&field.name);
-                    issues.push(format!("`{}` requis", path.as_str()));
-                    path.truncate(mark);
+                    if issues.is_full() {
+                        issues.record_overflow();
+                    } else {
+                        let mark = path.mark();
+                        path.push_field(&field.name);
+                        issues.push(format!("`{}` is required", path.as_str()));
+                        path.truncate(mark);
+                    }
                 }
                 None => {}
             }
         }
+        path.depth -= 1;
     }
 
     fn apply_defaults(&self, value: &mut Value) {
@@ -493,9 +556,13 @@ impl Schema for Obj {
             match map.get_mut(&field.name) {
                 Some(child) => field.schema.apply_defaults(child),
                 None => {
-                    // Champ absent : on injecte le défaut s'il y en a un.
+                    // Champ absent : on injecte le défaut s'il y en a un,
+                    // puis on propage les éventuels défauts internes des
+                    // sous-champs.
                     if let Some(default) = field.schema.default_value() {
-                        map.insert(field.name.clone(), default.clone());
+                        let mut injected = default.clone();
+                        field.schema.apply_defaults(&mut injected);
+                        map.insert(field.name.clone(), injected);
                     }
                 }
             }
@@ -536,10 +603,10 @@ impl Format {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Email => "adresse e-mail",
+            Self::Email => "a valid e-mail address",
             Self::Uuid => "UUID",
-            Self::Url => "URL absolue",
-            Self::Datetime => "date-time ISO 8601",
+            Self::Url => "an absolute URL",
+            Self::Datetime => "an ISO 8601 date-time",
         }
     }
 
@@ -553,21 +620,36 @@ impl Format {
     }
 }
 
-/// `local@domaine` : un seul `@`, pas d'espace, domaine en labels
-/// alphanumériques contenant au moins un point — approximation sans regex,
-/// comme celle de Zod.
+/// `local@domaine` : un seul `@`, pas d'espace ni de caractère de contrôle,
+/// bornes RFC 5321 (`<= 254` octets, `local <= 64`, `label <= 63`), `local`
+/// sans point initial/final ni `..`, domaine en labels LDH (sans `-`
+/// initial/final) contenant au moins un point.
 fn is_email(text: &str) -> bool {
+    if text.len() > 254 {
+        return false;
+    }
     let Some((local, domain)) = text.split_once('@') else {
         return false;
     };
-    if domain.contains('@') || local.is_empty() || domain.is_empty() {
+    if domain.contains('@')
+        || local.is_empty()
+        || local.len() > 64
+        || domain.is_empty()
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+    {
         return false;
     }
-    if text.chars().any(char::is_whitespace) || !domain.contains('.') {
+    if text.chars().any(|c| c.is_whitespace() || c.is_control()) || !domain.contains('.') {
         return false;
     }
     domain.split('.').all(|label| {
-        !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     }) && local
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || "._%+-".contains(c))
@@ -584,25 +666,66 @@ fn is_uuid(text: &str) -> bool {
             .all(|(i, &b)| matches!(i, 8 | 13 | 18 | 23) || b.is_ascii_hexdigit())
 }
 
-/// `schéma://hôte/…` : schéma alphanumérique, hôte non vide, pas d'espace.
+/// `schéma://hôte/…` : schéma alphanumérique, autorité valide à hôte non vide,
+/// aucun espace, caractère de contrôle ou antislash.
 fn is_url(text: &str) -> bool {
-    if text.chars().any(char::is_whitespace) {
+    if text
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
         return false;
     }
     let Some((scheme, rest)) = text.split_once("://") else {
         return false;
     };
-    scheme
+    if !scheme
         .chars()
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic())
-        && scheme
+        || !scheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
-        && rest
-            .split(['/', '?', '#'])
-            .next()
-            .is_some_and(|authority| !authority.is_empty())
+    {
+        return false;
+    }
+    let Some(authority) = rest.split(['/', '?', '#']).next() else {
+        return false;
+    };
+    if authority.is_empty() {
+        return false;
+    }
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    let (host, port) = if let Some(after_bracket) = host_port.strip_prefix('[') {
+        let Some((ipv6, remainder)) = after_bracket.split_once(']') else {
+            return false;
+        };
+        if ipv6.is_empty()
+            || !ipv6
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        {
+            return false;
+        }
+        let port = match remainder.strip_prefix(':') {
+            Some(p) => Some(p),
+            None if remainder.is_empty() => None,
+            None => return false,
+        };
+        (ipv6, port)
+    } else if let Some((h, p)) = host_port.rsplit_once(':') {
+        (h, Some(p))
+    } else {
+        (host_port, None)
+    };
+    if host.is_empty() || host.starts_with('.') || host.contains("..") {
+        return false;
+    }
+    if let Some(p) = port {
+        if p.is_empty() || p.parse::<u16>().ok().filter(|&n| n > 0).is_none() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Date-time ISO 8601, calendrier vérifié (jours par mois, années
@@ -664,6 +787,8 @@ fn is_datetime(text: &str) -> bool {
             digits(i + 1..i + 3)
                 && bytes.get(i + 3) == Some(&b':')
                 && digits(i + 4..i + 6)
+                && two(i + 1) <= 23
+                && two(i + 4) <= 59
                 && i + 6 == bytes.len()
         }
         _ => false,
@@ -776,7 +901,7 @@ impl Schema for Str {
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         let Some(text) = value.as_str() else {
-            issues.push(format!("`{}` : chaîne attendue", path.as_str()));
+            push_issue!(issues, "`{}`: expected a string", path.as_str());
             return;
         };
         // JSON Schema compte minLength/maxLength en CARACTÈRES
@@ -784,17 +909,25 @@ impl Schema for Str {
         let chars = text.chars().count();
         if let Some(min) = self.min {
             if chars < min {
-                issues.push(format!("`{}` : au moins {min} caractère(s)", path.as_str()));
+                push_issue!(
+                    issues,
+                    "`{}`: must be at least {min} character(s)",
+                    path.as_str()
+                );
             }
         }
         if let Some(max) = self.max {
             if chars > max {
-                issues.push(format!("`{}` : au plus {max} caractère(s)", path.as_str()));
+                push_issue!(
+                    issues,
+                    "`{}`: must be at most {max} character(s)",
+                    path.as_str()
+                );
             }
         }
         if let Some(format) = self.format {
             if !format.matches(text) {
-                issues.push(format!("`{}` : {} attendu", path.as_str(), format.label()));
+                push_issue!(issues, "`{}`: expected {}", path.as_str(), format.label());
             }
         }
     }
@@ -875,17 +1008,17 @@ impl Schema for Int {
         // dont la crate **documente** l'usage. Refuser ici rend la promesse
         // du schéma vraie.
         let Some(n) = value.as_i64() else {
-            issues.push(format!("`{}` : entier attendu", path.as_str()));
+            push_issue!(issues, "`{}`: expected an integer", path.as_str());
             return;
         };
         if let Some(min) = self.min {
             if n < min {
-                issues.push(format!("`{}` : doit être ≥ {min}", path.as_str()));
+                push_issue!(issues, "`{}`: must be ≥ {min}", path.as_str());
             }
         }
         if let Some(max) = self.max {
             if n > max {
-                issues.push(format!("`{}` : doit être ≤ {max}", path.as_str()));
+                push_issue!(issues, "`{}`: must be ≤ {max}", path.as_str());
             }
         }
     }
@@ -964,16 +1097,16 @@ impl Schema for Num {
             Some(n) => {
                 if let Some(min) = self.min {
                     if n < min {
-                        issues.push(format!("`{}` : doit être ≥ {min}", path.as_str()));
+                        push_issue!(issues, "`{}`: must be ≥ {min}", path.as_str());
                     }
                 }
                 if let Some(max) = self.max {
                     if n > max {
-                        issues.push(format!("`{}` : doit être ≤ {max}", path.as_str()));
+                        push_issue!(issues, "`{}`: must be ≤ {max}", path.as_str());
                     }
                 }
             }
-            None => issues.push(format!("`{}` : nombre attendu", path.as_str())),
+            None => push_issue!(issues, "`{}`: expected a number", path.as_str()),
         }
     }
 }
@@ -1003,7 +1136,7 @@ impl Schema for Bool {
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         if value.as_bool().is_none() {
-            issues.push(format!("`{}` : booléen attendu", path.as_str()));
+            push_issue!(issues, "`{}`: expected a boolean", path.as_str());
         }
     }
 }
@@ -1080,6 +1213,10 @@ impl Schema for Enum {
         if self.values.iter().any(|v| v == value) {
             return;
         }
+        if issues.is_full() {
+            issues.record_overflow();
+            return;
+        }
         // Type incorrect → message de type ; sinon message d'appartenance.
         let type_ok = match self.kind {
             "integer" => value.is_i64() || value.is_u64(),
@@ -1095,17 +1232,14 @@ impl Schema for Enum {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            issues.push(format!(
-                "`{}` : doit être l'un de {rendered}",
-                path.as_str()
-            ));
+            issues.push(format!("`{}`: must be one of {rendered}", path.as_str()));
         } else {
             let expected = if self.kind == "integer" {
-                "entier attendu"
+                "expected an integer"
             } else {
-                "chaîne attendue"
+                "expected a string"
             };
-            issues.push(format!("`{}` : {expected}", path.as_str()));
+            issues.push(format!("`{}`: {expected}", path.as_str()));
         }
     }
 }
@@ -1134,6 +1268,13 @@ impl Record {
     pub fn inner(&self) -> &dyn Schema {
         self.inner.as_ref()
     }
+
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
+    }
 }
 
 /// `z.record(inner)`
@@ -1153,15 +1294,29 @@ impl Schema for Record {
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         let Some(map) = value.as_object() else {
-            issues.push(format!("`{}` : objet attendu", path.as_str()));
+            push_issue!(issues, "`{}`: expected an object", path.as_str());
             return;
         };
-        for (key, child) in map {
-            let mark = path.mark();
-            path.push_field(key);
-            self.inner.validate(path, child, issues);
-            path.truncate(mark);
+        if path.depth >= MAX_DEPTH {
+            push_issue!(
+                issues,
+                "`{}`: maximum nesting depth ({MAX_DEPTH}) exceeded",
+                path.as_str()
+            );
+            return;
         }
+        path.depth += 1;
+        for (key, child) in map {
+            if issues.is_full() {
+                self.inner.validate(path, child, issues);
+            } else {
+                let mark = path.mark();
+                path.push_field(key);
+                self.inner.validate(path, child, issues);
+                path.truncate(mark);
+            }
+        }
+        path.depth -= 1;
     }
 
     fn apply_defaults(&self, value: &mut Value) {
@@ -1241,25 +1396,47 @@ impl Schema for Arr {
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         let Some(items) = value.as_array() else {
-            issues.push(format!("`{}` : tableau attendu", path.as_str()));
+            push_issue!(issues, "`{}`: expected an array", path.as_str());
             return;
         };
+        if path.depth >= MAX_DEPTH {
+            push_issue!(
+                issues,
+                "`{}`: maximum nesting depth ({MAX_DEPTH}) exceeded",
+                path.as_str()
+            );
+            return;
+        }
         if let Some(min) = self.min {
             if items.len() < min {
-                issues.push(format!("`{}` : au moins {min} élément(s)", path.as_str()));
+                push_issue!(
+                    issues,
+                    "`{}`: must contain at least {min} item(s)",
+                    path.as_str()
+                );
             }
         }
         if let Some(max) = self.max {
             if items.len() > max {
-                issues.push(format!("`{}` : au plus {max} élément(s)", path.as_str()));
+                push_issue!(
+                    issues,
+                    "`{}`: must contain at most {max} item(s)",
+                    path.as_str()
+                );
             }
         }
+        path.depth += 1;
         for (index, item) in items.iter().enumerate() {
-            let mark = path.mark();
-            path.push_index(index);
-            self.inner.validate(path, item, issues);
-            path.truncate(mark);
+            if issues.is_full() {
+                self.inner.validate(path, item, issues);
+            } else {
+                let mark = path.mark();
+                path.push_index(index);
+                self.inner.validate(path, item, issues);
+                path.truncate(mark);
+            }
         }
+        path.depth -= 1;
     }
 
     fn apply_defaults(&self, value: &mut Value) {
@@ -1280,6 +1457,7 @@ impl Schema for Arr {
 /// Publié `{"anyOf": [schéma, {"type": "null"}]}` (la forme JSON Schema
 /// 2020-12) ; la validation accepte `null` sans issue et délègue le reste.
 /// Compose avec n'importe quel schéma : `zod::nullable(zod::string().max(3))`.
+#[derive(Clone)]
 pub struct Nullable {
     inner: Arc<dyn Schema>,
 }
@@ -1302,7 +1480,11 @@ impl Nullable {
 
 impl Schema for Nullable {
     fn json(&self) -> Value {
-        json!({ "anyOf": [self.inner.json(), { "type": "null" }] })
+        let mut schema = json!({ "anyOf": [self.inner.json(), { "type": "null" }] });
+        if let Some(default) = self.inner.default_value() {
+            schema["default"] = default.clone();
+        }
+        schema
     }
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
@@ -1310,6 +1492,10 @@ impl Schema for Nullable {
             return;
         }
         self.inner.validate(path, value, issues);
+    }
+
+    fn default_value(&self) -> Option<&Value> {
+        self.inner.default_value()
     }
 
     fn apply_defaults(&self, value: &mut Value) {
@@ -1328,6 +1514,7 @@ impl Schema for Nullable {
 /// Publiée dans le JSON Schema (`description`) — utile pour documenter un
 /// champ : `zod::object().field("q", zod::describe("requête", zod::string()))`.
 /// La validation délègue intégralement au schéma interne.
+#[derive(Clone)]
 pub struct Described {
     description: String,
     inner: Arc<dyn Schema>,
@@ -1361,6 +1548,10 @@ impl Schema for Described {
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         self.inner.validate(path, value, issues);
+    }
+
+    fn default_value(&self) -> Option<&Value> {
+        self.inner.default_value()
     }
 
     fn apply_defaults(&self, value: &mut Value) {
@@ -1418,7 +1609,7 @@ mod tests {
         let issues = issues_of(&schema, json!({ "a": "oops" }));
         assert_eq!(issues.len(), 2, "{issues:?}");
         assert!(issues[0].contains("arguments.a"));
-        assert!(issues[1].contains("requis"));
+        assert!(issues[1].contains("required"));
     }
 
     #[test]
@@ -1426,7 +1617,7 @@ mod tests {
         let schema = object().field("a", integer()).strict();
         let issues = issues_of(&schema, json!({ "a": 1, "zzz": true }));
         assert_eq!(issues.len(), 1);
-        assert!(issues[0].contains("champ inconnu"));
+        assert!(issues[0].contains("unknown field"));
     }
 
     #[test]
@@ -1434,7 +1625,7 @@ mod tests {
         let schema = object().field("a", integer());
         let issues = issues_of(&schema, json!("not an object"));
         assert_eq!(issues.len(), 1);
-        assert!(issues[0].contains("objet attendu"));
+        assert!(issues[0].contains("expected an object"));
     }
 
     #[test]
@@ -1527,7 +1718,7 @@ mod tests {
         let mut path = Path::root("arguments");
         schema.validate(&mut path, &value, &mut issues);
         assert_eq!(issues.render().len(), MAX_ISSUES + 1);
-        assert!(issues.render().last().unwrap().contains("omis"));
+        assert!(issues.render().last().unwrap().contains("omitted"));
         assert!(!issues.is_empty());
     }
 
@@ -1688,5 +1879,58 @@ mod tests {
         // Validation déléguée intégralement.
         assert!(issues_of(&schema, json!({ "q": "ok" })).is_empty());
         assert!(!issues_of(&schema, json!({ "q": "x" })).is_empty());
+    }
+
+    #[test]
+    fn email_and_url_formats_reject_control_chars_and_rfc_violations() {
+        let email_schema = object().field("e", string().email());
+        for bad_email in [
+            ".a@b.cd",
+            "a.@b.cd",
+            "a..b@b.cd",
+            "a@-b.cd",
+            "a@b-.cd",
+            "a@b.cd\x00",
+            "a@b.cd\x1b[31m",
+            &format!("{}@b.cd", "a".repeat(65)),
+        ] {
+            assert!(
+                !issues_of(&email_schema, json!({ "e": bad_email })).is_empty(),
+                "email invalide accepté : {bad_email:?}"
+            );
+        }
+
+        let url_schema = object().field("u", string().url());
+        for bad_url in [
+            "https://a.example/x\x00",
+            "https://a.example/\x1b[31m",
+            "https://a.example/\x7f",
+            "https://a.example\\path",
+            "https://@/path",
+            "https://:80/path",
+            "https://a.example:0/path",
+            "https://a.example:99999/path",
+            "https://.a.example/path",
+            "https://a..example/path",
+        ] {
+            assert!(
+                !issues_of(&url_schema, json!({ "u": bad_url })).is_empty(),
+                "URL invalide acceptée : {bad_url:?}"
+            );
+        }
+        assert!(issues_of(&url_schema, json!({ "u": "https://[::1]:8080/mcp" })).is_empty());
+    }
+
+    #[test]
+    fn max_depth_guard_rejects_excessive_nesting_without_stack_overflow() {
+        let mut schema: Box<dyn Schema> = Box::new(integer());
+        let mut value = json!(42);
+        for _ in 0..(MAX_DEPTH + 4) {
+            schema = Box::new(array(schema));
+            value = json!([value]);
+        }
+        let issues = issues_of(&schema, value);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("maximum nesting depth"), "{issues:?}");
     }
 }

@@ -48,7 +48,7 @@ fn tool_timeout_cuts_a_slow_handler_into_an_is_error_result() {
         v["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("délai"),
+            .contains("timed out"),
         "message de timeout attendu : {v}"
     );
     // Le résultat timeout reste un résultat : resultType + _meta serverInfo.
@@ -110,7 +110,10 @@ fn tool_timeout_cuts_slow_resource_and_prompt_handlers() {
     );
     assert_eq!(v["error"]["code"], -32000, "{v}");
     assert!(
-        v["error"]["message"].as_str().unwrap().contains("délai"),
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"),
         "{v}"
     );
 
@@ -120,7 +123,10 @@ fn tool_timeout_cuts_slow_resource_and_prompt_handlers() {
     );
     assert_eq!(v["error"]["code"], -32000, "{v}");
     assert!(
-        v["error"]["message"].as_str().unwrap().contains("délai"),
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"),
         "{v}"
     );
 }

@@ -10,53 +10,47 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - **0.x** jusqu'à la conformance officielle MCP verte (suite 2026-07-28, mode serveur, 0 FAILURE) ; la mention **1.0** attend ce jalon.
 - Chaque version publiée est taguée `vX.Y.Z` sur le commit exact dont elle est issue (`.cargo_vcs_info.json` vérifié avant `cargo publish`).
 
-## [0.3.1] - 2026-10-22
+## [Unreleased]
 
-### Ajout — point fort repris de ViteMCP
+### Prévu (suite)
 
-- **Sonde `GET /health`** → `200` « ok » sans JSON-RPC (`HEALTH_ROUTE`, inspiration ViteMCP) : probes k8s/systemd/équilibreur ; compatible keep-alive (la sonde pipelinée ne casse pas la connexion) ; autre méthode → `405` avec `Allow: GET`. `GET /mcp` reste `405`.
+- Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur.
 
-### Comparatif ViteMCP (TypeScript) — 2026-10-22
+## [0.7.0] - 2026-10-25
 
-- Premier face-à-face avec [`@vitemcp/server`](https://github.com/vitemcp/server) — le framework TS ciblant la même spec stateless 2026-07-28. Même serveur démo (4 outils) des deux côtés, client de bench neutre unique (`litemcp-it/examples/bench_remote`), Windows 11 loopback, passes alternées :
-  - keep-alive : **0,09–0,10 ms** vs 1,43–1,73 ms (**~15–18× plus rapide**) ;
-  - p99 : **0,18–0,22 ms** vs 5,4–5,9 ms ;
-  - connexions neuves : **848–1257 conn/s** vs 354–498 conn/s ;
-  - réutilisation : **2000/2000** vs 0/2000 — ViteMCP répond en SSE encadré maintenu ouvert, le client doit rouvrir une connexion par appel séquentiel ; litemcp délimite par `Content-Length` et clôt le flux ;
-  - mémoire après 2 300 requêtes : **5,5 Mo** (0,9 Mo privé) vs ~417 Mo (chaîne de 3 processus Node : 47 + 63 + 306 Mo) — **~75× moins**.
-- Constat de fiabilité : `enableJsonResponse` est déclaré dans les types de `@vitemcp/server` mais sans implémentation dans le code — l'option est un no-op.
-- Banc reproduisible, hors dépôt : un projet TypeScript (`@vitemcp/server` + tsx) d'un côté, le banc externe d'intégration de l'autre (serveur démo 4 outils + client de bench neutre `bench_remote`).
+### Ajout — erreurs d'outil structurées, observabilité et anglais sur le fil
 
-### Performance — lot « le plus léger, le plus rapide »
+- **Erreurs d'outil structurées (`ToolError`, `ErrorCode`)** : un échec d'outil (`CallToolResult::isError`) porte désormais à la fois le message en texte (`content[0].text`) et un objet machine-lisible sous `structuredContent.error` (`code`, `message`, `retryable`, `retryAfterMs` optionnel). Constructeurs par catégorie (`rate_limited`, `timeout`, `upstream`, `invalid_input`, `unauthorized`, `not_found`, `internal`, `unclassified`) ; `From<String>` / `From<&str>` préservent l'ergonomie de `?` sur des erreurs texte ;
+- **Hook d'observabilité (`ServerBuilder::on_call`)** : callback cumulable appelé après le traitement complet de chaque message JSON-RPC avec `CallEvent { method, name, duration, status }` (`CallStatus::Success`, `ToolFailure(ErrorCode)`, `ProtocolError(i64)`, `Notification`). Les paniques de hook sont contenues ;
+- **Messages de validation et de protocole en anglais** : toutes les erreurs envoyées sur le fil (`zod`, `schemars`, JSON-RPC, transport HTTP) sont désormais rédigées en anglais.
 
-- **Latence keep-alive ~35 % meilleure** (A/B dos à dos, même machine et même session : code 0.3.0 0,097–0,111 ms → code optimisé 0,065–0,070 ms/req ; p50 0,061 ms, p99 0,095–0,123 ms) :
-  - réponse HTTP assemblée dans un seul buffer → **un seul write** par réponse (avant : deux syscalls et, avec nodelay, deux paquets) ;
-  - parsing d'en-têtes **zéro allocation** : noms comparés `eq_ignore_ascii_case` (plus de minuscules allouées), `Origin`/`Host` réduits à des verdicts booléens, `Accept`/`Connection` sans chaînes ni `Vec` temporaires ;
-  - ligne de requête et en-têtes lus dans des buffers **réutilisés** sur toute la connexion (keep-alive inclus) ;
-  - **zéro clone des arguments** dans le dispatch : `params` et `id` sont déplacés hors du JSON parsé (`Map::remove`), et handler comme validation reçoivent les arguments par référence — `tool_parse` seul clone encore, pour la désérialisation typée ;
-  - `route` et `allow_origins` partagés par `Arc` (plus de clone par connexion sur le chemin d'accept) ;
-  - `Outgoing.jsonrpc` en `&'static str` (une allocation de moins par réponse).
-- **Binaire release −18,5 %** (483 Ko → 385 Ko) : `lto = "fat"` + `codegen-units = 1` dans le profil release du dépôt (les consommateurs gardent la main sur leur propre profil).
-- **Mémoire de lecture par connexion divisée par deux** : buffer `BufReader` 4 Ko (1 Mio au plafond de 256 connexions) — un corps plus grand que la capacité est lu directement depuis la socket.
-- Bench `examples/bench_backends` : warmup déduit et percentiles **p50/p99** en plus de la moyenne — passes comparables d'une campagne à l'autre.
-- **Confirmation indépendante côté consommateur** : banc externe (`litemcp-it`, serveur démo de 4 outils important le crate depuis crates.io vs `path` local) — keep-alive 0,102–0,108 ms (0.3.0 publié) → **0,087–0,091 ms** (lot en cours), plages sans chevauchement, **~13 % plus rapide** sur ce serveur plus riche ; les 12 tests d'intégration du banc passent à l'identique dans les deux modes.
-- Docs : section « Pourquoi litemcp » réécrite (bibliothèque vs service expliqué simplement, cas d'usage introduits).
+### Correctifs — audit complet du 2026-10-25
 
-### Tests
+- **[P2] Macros `#[tool]` / `#[prompt]` — littéraux par défaut négatifs et validation stricte des littéraux** : `default(offset = -5)` ou `default(temp = -2.5)` générait `-(::serde_json::Value::from(5i64))` qui ne compilait pas (`Value` n'implémente pas `Neg`), et `is_json_literal` acceptait tout `Expr::Lit`/`Expr::Unary` (transformant caractères/octets en `null` ou ignorant `!`). Le signe `-` est désormais parsé dans le littéral numérique (`i64`/`f64`) et les doublons `default(a = 1, a = 2)` sont refusés à la compilation ;
+- **[P2] Macros `#[tool]` / `#[prompt]` — bornes exactes par type entier** : tous les types entiers (`u8`..`u64`, `usize`, `i8`..`i32`, `isize`) publiaient auparavant les bornes `i64` et castaient par `as #ty` (un `-1` passé à un `u64`/`usize` devenait silencieusement `u64::MAX`, `300` sur `u8` devenait `44`). Chaque type publie et applique désormais ses bornes exactes (`.min(…)`/`.max(…)`) ;
+- **[P2] `prompt_typed` et `#[prompt]` — injection des défauts et publication de `arguments` dans `prompts/list`** : `get_prompt` validait le schéma mais n'appelait jamais `schema.apply_defaults(&mut arguments)`, et `prompts/list` n'exposait pas les `PromptArgument` (`name`, `description`, `required`) dérivés du schéma ;
+- **[P2] `zod::describe` et `zod::nullable` — conservation de `default_value()` et propagation récursive** : `Described` et `Nullable` n'implémentaient pas `Schema::default_value()`, ce qui marquait un champ `describe("…", s.default(v))` ou `nullable(s.default(v))` comme `required` et empêchait l'injection du défaut. `Obj::apply_defaults` propage désormais aussi récursivement les défauts internes lorsqu'un objet par défaut est injecté ; `Record::default(v)` et `#[derive(Clone)]` sur `Nullable`/`Described` sont ajoutés ;
+- **[P2] Paniques de handlers sans `tool_timeout`** : lorsque `tool_timeout` valait `None` (défaut), une panique de handler remontait hors de `ServerCore::dispatch` et court-circuitait tous les hooks `on_call`. `ServerCore` attrape désormais les paniques dans `call_tool` et `run_bounded` dans tous les modes (`-32603` avec `id` préservé et notification de `on_call`) ;
+- **[P2] `ServerHandle::shutdown()` sur `0.0.0.0` / `[::]` (Windows)** : lorsque le listener était lié à une adresse non spécifiée (`0.0.0.0:port` ou `[::]:port`), `connect_timeout` vers `0.0.0.0` échouait immédiatement sous Windows (`AddrNotAvailable`) sans réveiller `accept`. `BoundServer::handle()` substitue désormais l'adresse de bouclage (`127.0.0.1` / `::1`) ;
+- **[P3] En-têtes de routage `Mcp-Method` / `Mcp-Name` (SEP-2243)** : vérifiés désormais avant le retour anticipé des notifications, et `Mcp-Name` est exigé cohérent même lorsque `params.name` est omis ou vide sur `tools/call` et `prompts/get` ;
+- **[P3] `zod::Format::Datetime` (`is_datetime`)** : l'offset de fuseau `±HH:MM` vérifie désormais `HH <= 23` et `MM <= 59` (RFC 3339 §5.6) ;
+- **[P3] Messages sur le fil & CI** : traduction des derniers messages français résiduels (`http.rs`, `schemars.rs`), mise en cache `OnceLock` de `resources/list` et `prompts/list`, et publication préalable automatique de `litemcp-macros` dans `.github/workflows/publish.yml`.
 
-- 70 tests au total (19 unitaires JSON-RPC/zod/protocol, 42 HTTP sur vraies sockets, 5 smoke, 4 doctests).
+### Performance & Dépendances — `litemcp-macros` zéro dépendance et chemin chaud
 
-## [0.3.2] - 2026-10-22
+- **`litemcp-macros` 100 % zéro dépendance externe** : suppression complète de `syn`, `quote` et `proc-macro2` dans `litemcp-macros/Cargo.toml` (`[dependencies]` vide — uniquement `proc_macro` fourni par `rustc`) ;
+- **`litemcp-macros` 0.4.0** : la 0.3.0 déjà publiée sur crates.io embarque `syn`/`quote`/`proc-macro2` et ne peut pas être réécrite — le bump est la seule façon de livrer la réécriture zéro dépendance aux consommateurs ;
+- **Sérialisation directe des réponses (`Outgoing::success_vec`)** : élimination de l'arbre `serde_json::Value` intermédiaire (`serde_json::to_value`) sur `tools/call`, `resources/read` et `prompts/get`, suppression des `.clone()` sur les catalogues mis en cache (`tools/list`, `resources/list`, `prompts/list`, `server/discover`) et mise en cache `OnceLock` de `initialize`, `ping` et `_meta` (`serverInfo` précalculé une seule fois à la construction de `ServerCore`) ;
+- **Transport HTTP & JSON-RPC sans allocations superflues** : extraction par déplacement de `method` (`object.remove("method")` dans `jsonrpc.rs`), vérification de `Content-Type` par booléens sans allocation de `String`, réutilisation du buffer `body` sur la connexion keep-alive via `BufRead::fill_buf` (suppression du buffer temporaire `chunk = vec![0u8; …]`), et pré-allocation de capacité dans `zod::Path::root`.
 
-### Ajout — anti-tampon SSE (réponse au problème des VPS derrière un proxy)
+### Durcissement — plafonds de ressources
 
-- **En-têtes anti-tampon sur toute réponse SSE** (`SSE_ANTI_BUFFERING`) : `X-Accel-Buffering: no` — la directive **par réponse** que nginx honore même quand `proxy_buffering` est actif globalement — et `Cache-Control: no-cache, no-transform`. Le symptôme « les événements s'empilent jusqu'au seuil du buffer » ne peut de toute façon pas se produire (SSE request-scoped : un événement, `Connection: close`, `Content-Length` explicite — un proxy pousse toujours une réponse terminée) ; les en-têtes ferment le dossier pour les proxies les plus zélés. JSON non affecté (2 tests : présents en SSE, absents en JSON).
-- **Choix architectural documenté** : **pas de SSE longue durée** (progress, notifications serveur→client) — le mode stateless ne tient aucun flux ouvert ; documenté dans le code (contrat : tout écrivain SSE flush après chaque événement et porte `SSE_ANTI_BUFFERING`) et dans le README.
-- README : nouvelle section « Hébergement VPS & proxies » (explication du tamponnage, recette nginx, repli JSON officiel, choix architectural), FAQ « Pourquoi pas de WebSocket ? » (choix architectural : ~1–2 % de gain au mieux, proxies hostiles, sessions), table Configuration avec la sonde `/health`.
+- **`MAX_INFLIGHT_HANDLERS` (256)** : quand `tool_timeout` est configuré, un handler au-delà du plafond de threads simultanés rend `rate_limited` (outil) ou `-32000` (ressource/prompt) au lieu de créer un thread noyau ; le slot reste réservé jusqu'à la terminaison effective du thread détaché (y compris après timeout) ;
+- **`MAX_RESPONSE_BYTES` (16 Mio)** : une réponse JSON-RPC sérialisée qui dépasse ce plafond est remplacée par `-32603` (« response size … exceeds maximum … ») — un handler qui rend une valeur démesurée ne peut plus pousser un corps illimité.
 
 ### Tests
 
-- 72 tests au total (19 unitaires JSON-RPC/zod/protocol, 44 HTTP sur vraies sockets, 5 smoke, 4 doctests).
+- **230 tests** au total (56 unitaires dont le plafond d'inflight, 19 `audit_2026_10_25`, 15 `http_security_audit`, 10 `audit_2026_10_24`, 11 `zod_gaps_2026_10_24`, 9 features, 3 fuzz proptest, 81 HTTP sur vraies sockets dont le plafond de réponse, 9 macros, 3 schemars, 5 smoke, 9 doctests — 3 doctests `ignore`).
 
 ## [0.6.0] - 2026-10-24
 
@@ -108,13 +102,6 @@ Quatre manques signalés à l'usage, tous comblés :
 - **`Content-Length` avec zéros initiaux** (`0002`) accepté (P3, conformité RFC 9112 §6.3 : la valeur est un entier, `0002` == 2) ; `+2` est refusé (`400`) ;
 - **Pas de plafond sur la taille d'une réponse** (Info) : une sortie d'outil de 4 Mio est servie en entier (`Content-Length` explicite, mémoire proportionnelle) — le plafond de 1 Mio porte sur le corps **de requête** ;
 - **`output_schema` exige un schéma `'static`** (Info) : un schéma construit à partir d'une configuration runtime (durée de vie courte) doit être possédé (`Box`/`Arc`) pour être attaché — les implémentations `Box`/`Arc`/`&S` facilitent cette possession.
-
-## [Unreleased]
-
-### Prévu (suite)
-
-- Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur.
-- `zod::record(inner)` (dictionnaires `{"clé": valeur}`).
 
 ## [0.5.0] - 2026-10-24
 
@@ -188,7 +175,6 @@ Audit complet (statique + sondes dynamiques + vérification du changelog officie
 
 - Avec le lot « gros ROI » ci-dessus : **128 tests au total** (27 unitaires, 8 features, 80 HTTP sur vraies sockets, 3 macros, 5 smoke, 5 doctests) — 15 nouveaux pour verrouiller les cinq fonctionnalités (timeout, outputSchema, resources, prompts, arrêt propre, macro).
 
-
 ## [0.3.3] - 2026-10-23
 
 ### Conformité MCP 2026-07-28 — la spec est maintenant implémentée **entièrement**
@@ -227,6 +213,54 @@ Audit statique (code intégral) + revue indépendante croisée + **vérification
 ### Tests
 
 - **109 tests au total** (27 unitaires JSON-RPC/zod/protocol, 73 HTTP sur vraies sockets, 5 smoke, 4 doctests) — 29 nouveaux, un par correctif ci-dessus.
+
+## [0.3.2] - 2026-10-22
+
+### Ajout — anti-tampon SSE (réponse au problème des VPS derrière un proxy)
+
+- **En-têtes anti-tampon sur toute réponse SSE** (`SSE_ANTI_BUFFERING`) : `X-Accel-Buffering: no` — la directive **par réponse** que nginx honore même quand `proxy_buffering` est actif globalement — et `Cache-Control: no-cache, no-transform`. Le symptôme « les événements s'empilent jusqu'au seuil du buffer » ne peut de toute façon pas se produire (SSE request-scoped : un événement, `Connection: close`, `Content-Length` explicite — un proxy pousse toujours une réponse terminée) ; les en-têtes ferment le dossier pour les proxies les plus zélés. JSON non affecté (2 tests : présents en SSE, absents en JSON).
+- **Choix architectural documenté** : **pas de SSE longue durée** (progress, notifications serveur→client) — le mode stateless ne tient aucun flux ouvert ; documenté dans le code (contrat : tout écrivain SSE flush après chaque événement et porte `SSE_ANTI_BUFFERING`) et dans le README.
+- README : nouvelle section « Hébergement VPS & proxies » (explication du tamponnage, recette nginx, repli JSON officiel, choix architectural), FAQ « Pourquoi pas de WebSocket ? » (choix architectural : ~1–2 % de gain au mieux, proxies hostiles, sessions), table Configuration avec la sonde `/health`.
+
+### Tests
+
+- 72 tests au total (19 unitaires JSON-RPC/zod/protocol, 44 HTTP sur vraies sockets, 5 smoke, 4 doctests).
+
+## [0.3.1] - 2026-10-22
+
+### Ajout — point fort repris de ViteMCP
+
+- **Sonde `GET /health`** → `200` « ok » sans JSON-RPC (`HEALTH_ROUTE`, inspiration ViteMCP) : probes k8s/systemd/équilibreur ; compatible keep-alive (la sonde pipelinée ne casse pas la connexion) ; autre méthode → `405` avec `Allow: GET`. `GET /mcp` reste `405`.
+
+### Comparatif ViteMCP (TypeScript) — 2026-10-22
+
+- Premier face-à-face avec [`@vitemcp/server`](https://github.com/vitemcp/server) — le framework TS ciblant la même spec stateless 2026-07-28. Même serveur démo (4 outils) des deux côtés, client de bench neutre unique (`litemcp-it/examples/bench_remote`), Windows 11 loopback, passes alternées :
+  - keep-alive : **0,09–0,10 ms** vs 1,43–1,73 ms (**~15–18× plus rapide**) ;
+  - p99 : **0,18–0,22 ms** vs 5,4–5,9 ms ;
+  - connexions neuves : **848–1257 conn/s** vs 354–498 conn/s ;
+  - réutilisation : **2000/2000** vs 0/2000 — ViteMCP répond en SSE encadré maintenu ouvert, le client doit rouvrir une connexion par appel séquentiel ; litemcp délimite par `Content-Length` et clôt le flux ;
+  - mémoire après 2 300 requêtes : **5,5 Mo** (0,9 Mo privé) vs ~417 Mo (chaîne de 3 processus Node : 47 + 63 + 306 Mo) — **~75× moins**.
+- Constat de fiabilité : `enableJsonResponse` est déclaré dans les types de `@vitemcp/server` mais sans implémentation dans le code — l'option est un no-op.
+- Banc reproduisible, hors dépôt : un projet TypeScript (`@vitemcp/server` + tsx) d'un côté, le banc externe d'intégration de l'autre (serveur démo 4 outils + client de bench neutre `bench_remote`).
+
+### Performance — lot « le plus léger, le plus rapide »
+
+- **Latence keep-alive ~35 % meilleure** (A/B dos à dos, même machine et même session : code 0.3.0 0,097–0,111 ms → code optimisé 0,065–0,070 ms/req ; p50 0,061 ms, p99 0,095–0,123 ms) :
+  - réponse HTTP assemblée dans un seul buffer → **un seul write** par réponse (avant : deux syscalls et, avec nodelay, deux paquets) ;
+  - parsing d'en-têtes **zéro allocation** : noms comparés `eq_ignore_ascii_case` (plus de minuscules allouées), `Origin`/`Host` réduits à des verdicts booléens, `Accept`/`Connection` sans chaînes ni `Vec` temporaires ;
+  - ligne de requête et en-têtes lus dans des buffers **réutilisés** sur toute la connexion (keep-alive inclus) ;
+  - **zéro clone des arguments** dans le dispatch : `params` et `id` sont déplacés hors du JSON parsé (`Map::remove`), et handler comme validation reçoivent les arguments par référence — `tool_parse` seul clone encore, pour la désérialisation typée ;
+  - `route` et `allow_origins` partagés par `Arc` (plus de clone par connexion sur le chemin d'accept) ;
+  - `Outgoing.jsonrpc` en `&'static str` (une allocation de moins par réponse).
+- **Binaire release −18,5 %** (483 Ko → 385 Ko) : `lto = "fat"` + `codegen-units = 1` dans le profil release du dépôt (les consommateurs gardent la main sur leur propre profil).
+- **Mémoire de lecture par connexion divisée par deux** : buffer `BufReader` 4 Ko (1 Mio au plafond de 256 connexions) — un corps plus grand que la capacité est lu directement depuis la socket.
+- Bench `examples/bench_backends` : warmup déduit et percentiles **p50/p99** en plus de la moyenne — passes comparables d'une campagne à l'autre.
+- **Confirmation indépendante côté consommateur** : banc externe (`litemcp-it`, serveur démo de 4 outils important le crate depuis crates.io vs `path` local) — keep-alive 0,102–0,108 ms (0.3.0 publié) → **0,087–0,091 ms** (lot en cours), plages sans chevauchement, **~13 % plus rapide** sur ce serveur plus riche ; les 12 tests d'intégration du banc passent à l'identique dans les deux modes.
+- Docs : section « Pourquoi litemcp » réécrite (bibliothèque vs service expliqué simplement, cas d'usage introduits).
+
+### Tests
+
+- 70 tests au total (19 unitaires JSON-RPC/zod/protocol, 42 HTTP sur vraies sockets, 5 smoke, 4 doctests).
 
 ## [0.3.0] - 2026-10-22
 
@@ -332,7 +366,10 @@ Audit statique (code intégral) + revue indépendante croisée + **vérification
 - GitHub : dépôt [DeamonDev888/litemcp](https://github.com/DeamonDev888/litemcp), tag `v0.1.0`, release, CI verte (fmt / clippy / test / doc).
 - Token API crates.io stocké dans `~/.cargo/credentials.toml` (hors repo), garde `.cargo/` au `.gitignore`.
 
-[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/DeamonDev888/litemcp/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/DeamonDev888/litemcp/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/DeamonDev888/litemcp/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/DeamonDev888/litemcp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/DeamonDev888/litemcp/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/DeamonDev888/litemcp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/DeamonDev888/litemcp/compare/v0.3.3...v0.4.0

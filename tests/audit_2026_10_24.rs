@@ -209,7 +209,7 @@ fn action_notification_is_refused_explicitly() {
         v["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("notification refusée"),
+            .contains("notification rejected"),
         "le message doit expliciter le refus : {v}"
     );
     assert!(

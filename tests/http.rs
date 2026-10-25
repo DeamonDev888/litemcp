@@ -420,7 +420,7 @@ fn typed_tool_rejects_invalid_arguments_without_running_handler() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|i| i.as_str().unwrap().contains("requis"))
+            .any(|i| i.as_str().unwrap().contains("required"))
     );
 }
 
@@ -712,7 +712,7 @@ fn over_capacity_connections_get_503() {
     let mut raw = String::new();
     second.read_to_string(&mut raw).unwrap();
     assert!(raw.contains("HTTP/1.1 503"), "{raw:?}");
-    assert!(raw.contains("trop de connexions"), "{raw:?}");
+    assert!(raw.contains("too many connections"), "{raw:?}");
     drop(first);
 }
 
@@ -1343,7 +1343,7 @@ fn saturated_server_delivers_the_503_to_a_client_that_wrote_first() {
     );
     // Le corps JSON complet doit être là (pas seulement la ligne de statut).
     assert!(
-        raw.contains("trop de connexions"),
+        raw.contains("too many connections"),
         "le corps du 503 doit être complet : {raw:?}"
     );
 }
@@ -1661,7 +1661,7 @@ fn tool_results_identify_the_server_in_meta() {
     // Un échec d'exécution (`isError: true`) reste un `result` : identifié
     // lui aussi.
     let bound = ServerBuilder::new("durci", "0.2.0")
-        .tool("echoue", "échoue exprès", |_args| Err("échec".to_string()))
+        .tool("echoue", "échoue exprès", |_args| Err("échec".into()))
         .bind("127.0.0.1:0")
         .unwrap();
     let addr = bound.local_addr().unwrap();
@@ -1869,4 +1869,34 @@ fn resources_and_prompts_are_served_over_http() {
     assert!(capabilities["tools"].is_object(), "{v}");
     assert!(capabilities["resources"].is_object(), "{v}");
     assert!(capabilities["prompts"].is_object(), "{v}");
+}
+
+/// Une réponse JSON-RPC sérialisée qui dépasse `MAX_RESPONSE_BYTES` (16 Mio) est
+/// remplacée par une erreur `-32603` : le serveur ne pousse jamais un corps
+/// illimité, même si un handler rend une valeur énorme.
+#[test]
+fn response_larger_than_16_mib_is_replaced_by_internal_error() {
+    let bound = ServerBuilder::new("gros", "0.1.0")
+        .tool("blob", "Rend une chaîne énorme", |_args| {
+            Ok(Value::String("x".repeat(17 * 1024 * 1024)))
+        })
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"blob","arguments":{}}}"#,
+        "application/json",
+        None,
+    );
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], -32603, "{v}");
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("exceeds maximum"),
+        "message inattendu : {message}"
+    );
 }

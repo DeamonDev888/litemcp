@@ -1,9 +1,9 @@
 [package]
 name = "litemcp-macros"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Macros procédurales de litemcp (#[tool]) — feature « macros » du crate litemcp."
+description = "Macros procédurales de LiteMCP (#[tool]/#[resource]/#[prompt]) — feature « macros » du crate litemcp."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DeamonDev888/litemcp"
 
@@ -11,6 +11,3 @@ repository = "https://github.com/DeamonDev888/litemcp"
 proc-macro = true
 
 [dependencies]
-proc-macro2 = "1"
-quote = "1"
-syn = { version = "2", features = ["full"] }

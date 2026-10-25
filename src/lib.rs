@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! # litemcp
+//! # LiteMCP
 //!
 //! Le framework MCP (Model Context Protocol) le plus léger pour Rust :
 //! **Streamable HTTP stateless sur un socket bindé — zéro runtime async,
@@ -38,6 +38,19 @@
 //! La feature `macros` ajoute `#[tool]` : le schéma d'entrée est dérivé
 //! des types des paramètres d'une fonction ordinaire.
 //!
+//! **Erreurs structurées** ([`ToolError`](crate::error)) : un échec d'outil
+//! classé (`rate_limited`, `upstream`, `timeout`…) avec politique de
+//! retente (`retryable`, `retryAfterMs`) part sur le fil sous
+//! `structuredContent.error` — le client agent réagit programmatiquement
+//! au lieu de parser la prose (les `Err(String)` restent acceptés).
+//! Tous les messages destinés aux clients (validation, protocole, HTTP)
+//! sont **en anglais**.
+//!
+//! **Observabilité** ([`on_call`](crate::server::ServerBuilder::on_call)) :
+//! un callback par message dispatché — méthode, outil, durée, verdict —
+//! pour compteurs, latence et taux d'erreur sans instrumenter votre
+//! client.
+//!
 //! Spec cible : MCP **2026-07-28** — protocole **stateless**, sans handshake :
 //! chaque message est un `POST /mcp`, la réponse arrive en `application/json`
 //! (ou en `text/event-stream` si le client ne demande que du SSE).
@@ -69,11 +82,19 @@
 //!         let b = args["b"].as_i64().ok_or("b manquant")?;
 //!         Ok(serde_json::json!({ "somme": a + b }))
 //!     })
+//!     .tool("heavy", "Peut manquer de quota", |_args| {
+//!         Err(ToolError::rate_limited("quota exhausted").retry_after_ms(500))
+//!     })
+//!     .on_call(|event| {
+//!         eprintln!("{} {} -> {:?} in {:?}", event.method,
+//!             event.name.unwrap_or("-"), event.status, event.duration);
+//!     })
 //!     .bind("127.0.0.1:8080")?   // socket bindé — un thread par connexion
 //!     .serve()?;                 // bloque : POST /mcp → JSON ou SSE
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+pub mod error;
 pub mod http;
 pub mod jsonrpc;
 /// Macros `#[tool]`/`#[resource]`/`#[prompt]` (feature `macros`) — voir
@@ -89,7 +110,8 @@ pub mod schemars;
 pub mod server;
 pub mod zod;
 
-pub use server::{ServerBuilder, ServerCore, ToolResult};
+pub use error::{ErrorCode, ToolError};
+pub use server::{CallEvent, CallStatus, ServerBuilder, ServerCore, ToolResult};
 
 /// Version du crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -97,15 +119,16 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Tout ce qu'il faut pour écrire un serveur en quelques lignes.
 pub mod prelude {
     pub use crate::VERSION;
+    pub use crate::error::{ErrorCode, ToolError};
     pub use crate::http::ServerHandle;
     #[cfg(feature = "macros")]
     pub use crate::macros::{prompt, resource, tool};
     pub use crate::protocol::{
-        CacheScope, PROTOCOL_VERSION, PromptMessage, ResultType, SUPPORTED_VERSIONS,
-        ToolAnnotations,
+        CacheScope, PROTOCOL_VERSION, PromptArgument, PromptMessage, ResultType,
+        SUPPORTED_VERSIONS, ToolAnnotations,
     };
     #[cfg(feature = "schemars")]
     pub use crate::schemars::{from_json_schema, from_schemars};
-    pub use crate::server::{McpHeaders, ServerBuilder, ToolResult};
-    pub use crate::zod;
+    pub use crate::server::{CallEvent, CallStatus, McpHeaders, ServerBuilder, ToolResult};
+    pub use crate::zod::{self, Schema};
 }

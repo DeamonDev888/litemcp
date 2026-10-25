@@ -1,4 +1,4 @@
-# litemcp — Roadmap
+# LiteMCP — Roadmap
 
 > **Pivot du 2026-10-21 (décision opérateur)** : **HTTP-only. Streamable HTTP
 > est l'unique transport.**
@@ -11,7 +11,7 @@
 
 ## 1. Positionnement
 
-| | rmcp (officiel) | fastmcp_rust | **litemcp** |
+| | rmcp (officiel) | fastmcp_rust | **LiteMCP** |
 |---|---|---|---|
 | Runtime | tokio + hyper + tower | asupersync (maison, nightly) | **aucun** (threads bloquants `std`) |
 | Toolchain | stable | nightly épinglé | **stable, MSRV 1.85** |

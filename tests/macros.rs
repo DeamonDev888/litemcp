@@ -318,3 +318,124 @@ fn macro_prompt_validates_and_renders() {
         );
     }
 }
+
+// --- Audit 2026-10-25 : littéraux négatifs, bornes d'entiers, défauts de prompt ---
+
+#[tool(
+    description = "Décalage avec défauts négatifs",
+    default(offset = -5, temperature = -2.5)
+)]
+fn decalage(offset: i32, temperature: f64) -> litemcp::ToolResult {
+    Ok(json!({ "offset": offset, "temperature": temperature }))
+}
+
+#[tool(description = "Bornes exactes par type entier")]
+fn bornes_entiers(octet: u8, court: i16, taille: usize) -> litemcp::ToolResult {
+    Ok(json!({ "octet": octet, "court": court, "taille": taille }))
+}
+
+#[prompt(
+    description = "Résumé avec valeurs par défaut",
+    default(ton = "concis", profondeur = -1)
+)]
+fn resume(sujet: String, ton: String, profondeur: i32) -> Result<Vec<PromptMessage>, String> {
+    Ok(vec![PromptMessage::user(format!(
+        "{sujet} ({ton}, {profondeur})"
+    ))])
+}
+
+#[test]
+fn macro_negative_default_literals_compile_and_apply() {
+    let core = ServerBuilder::new("m", "0.1.0")
+        .with_tool(register_decalage)
+        .core();
+
+    let list = call(&core, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+    let schema = &list["result"]["tools"][0]["inputSchema"];
+    assert_eq!(schema["properties"]["offset"]["default"], json!(-5));
+    assert_eq!(schema["properties"]["temperature"]["default"], json!(-2.5));
+
+    let v = call_tool(&core, 2, "decalage", json!({}));
+    assert_eq!(v["result"]["structuredContent"]["offset"], json!(-5));
+    assert_eq!(v["result"]["structuredContent"]["temperature"], json!(-2.5));
+
+    let v2 = call_tool(
+        &core,
+        3,
+        "decalage",
+        json!({ "offset": -42, "temperature": 1.25 }),
+    );
+    assert_eq!(v2["result"]["structuredContent"]["offset"], json!(-42));
+    assert_eq!(
+        v2["result"]["structuredContent"]["temperature"],
+        json!(1.25)
+    );
+}
+
+#[test]
+fn macro_integer_parameter_bounds_prevent_silent_truncation_and_wrapping() {
+    let core = ServerBuilder::new("m", "0.1.0")
+        .with_tool(register_bornes_entiers)
+        .core();
+
+    let list = call(&core, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+    let props = &list["result"]["tools"][0]["inputSchema"]["properties"];
+    assert_eq!(props["octet"]["minimum"], json!(0));
+    assert_eq!(props["octet"]["maximum"], json!(255));
+    assert_eq!(props["court"]["minimum"], json!(i16::MIN));
+    assert_eq!(props["court"]["maximum"], json!(i16::MAX));
+    assert_eq!(props["taille"]["minimum"], json!(0));
+
+    // Valeurs hors bornes du type Rust cible (ex. -1 sur u8/usize, 300 sur u8,
+    // 40000 sur i16) : refusées en -32602, jamais tronquées par `as #ty`.
+    for bad in [
+        json!({ "octet": -1, "court": 0, "taille": 1 }),
+        json!({ "octet": 300, "court": 0, "taille": 1 }),
+        json!({ "octet": 1, "court": 40_000, "taille": 1 }),
+        json!({ "octet": 1, "court": 0, "taille": -1 }),
+    ] {
+        let v = call_tool(&core, 2, "bornes_entiers", bad.clone());
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "doit être refusé : {bad} -> {v}"
+        );
+    }
+
+    // Valeurs dans les bornes : acceptées telles quelles.
+    let ok = call_tool(
+        &core,
+        3,
+        "bornes_entiers",
+        json!({ "octet": 255, "court": -32_768, "taille": 1024 }),
+    );
+    assert_eq!(
+        ok["result"]["structuredContent"],
+        json!({ "octet": 255, "court": -32_768, "taille": 1024 })
+    );
+}
+
+#[test]
+fn macro_prompt_default_is_applied_and_arguments_are_published_in_list() {
+    let core = ServerBuilder::new("m", "0.1.0")
+        .with_tool(register_resume)
+        .core();
+
+    let list = call(&core, r#"{"jsonrpc":"2.0","id":1,"method":"prompts/list"}"#);
+    let args = list["result"]["prompts"][0]["arguments"]
+        .as_array()
+        .expect("arguments publiés dans prompts/list");
+    assert_eq!(args.len(), 3, "{list}");
+    let sujet = args.iter().find(|a| a["name"] == "sujet").unwrap();
+    let ton = args.iter().find(|a| a["name"] == "ton").unwrap();
+    assert_eq!(sujet["required"], json!(true));
+    assert_eq!(ton["required"], json!(false));
+
+    let v = call(
+        &core,
+        r#"{"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":"resume","arguments":{"sujet":"MCP"}}}"#,
+    );
+    assert_eq!(
+        v["result"]["messages"][0]["content"]["text"], "MCP (concis, -1)",
+        "{v}"
+    );
+}

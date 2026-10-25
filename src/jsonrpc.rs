@@ -158,6 +158,15 @@ pub struct Outgoing {
     error: Option<ErrorObject>,
 }
 
+/// Vue empruntée d'une réponse de succès — évite de cloner `id` ou de
+/// passer par un `serde_json::Value` intermédiaire lors de la sérialisation.
+#[derive(Serialize)]
+struct OutgoingSuccessRef<'a, T: Serialize + ?Sized> {
+    jsonrpc: &'static str,
+    id: &'a Value,
+    result: &'a T,
+}
+
 impl Outgoing {
     pub fn success(id: Value, result: Value) -> Self {
         Self {
@@ -166,6 +175,20 @@ impl Outgoing {
             result: Some(result),
             error: None,
         }
+    }
+
+    /// Sérialise directement une réponse de succès en octets JSON sans
+    /// cloner `id` ni allouer de `serde_json::Value` intermédiaire.
+    #[must_use]
+    pub fn success_vec<T: Serialize + ?Sized>(id: &Value, result: &T) -> Vec<u8> {
+        serde_json::to_vec(&OutgoingSuccessRef {
+            jsonrpc: "2.0",
+            id,
+            result,
+        })
+        .unwrap_or_else(|_| {
+            br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal"}}"#.to_vec()
+        })
     }
 
     pub fn failure(id: Value, error: ErrorObject) -> Self {
@@ -181,7 +204,7 @@ impl Outgoing {
     pub fn parse_error() -> Self {
         Self::failure(
             Value::Null,
-            ErrorObject::new(ErrorObject::PARSE_ERROR, "JSON invalide"),
+            ErrorObject::new(ErrorObject::PARSE_ERROR, "invalid JSON"),
         )
     }
 
@@ -218,7 +241,7 @@ pub fn parse_incoming(body: &[u8]) -> Result<Incoming, ParseFail> {
     let Some(object) = value.as_object_mut() else {
         // Lot (tableau) ou primitive : MCP n'envoie jamais de batch — requête invalide.
         return Err(ParseFail::invalid(
-            "objet attendu (les lots ne sont pas supportés)",
+            "expected a JSON object (batches are not supported)",
         ));
     };
 
@@ -232,9 +255,7 @@ pub fn parse_incoming(body: &[u8]) -> Result<Incoming, ParseFail> {
         Some(raw) => match serde_json::from_value::<RequestId>(raw) {
             Ok(parsed) => id = Some(parsed),
             Err(_) => {
-                return Err(ParseFail::invalid(
-                    "id doit être un nombre, une chaîne ou null",
-                ));
+                return Err(ParseFail::invalid("id must be a number, a string, or null"));
             }
         },
     }
@@ -242,19 +263,16 @@ pub fn parse_incoming(body: &[u8]) -> Result<Incoming, ParseFail> {
     match object.get("jsonrpc") {
         Some(Value::String(version)) if version == "2.0" => {}
         _ => {
-            return Err(ParseFail::invalid_with_id(
-                "jsonrpc doit être \"2.0\"",
-                id.clone(),
-            ));
+            return Err(ParseFail::invalid_with_id("jsonrpc must be \"2.0\"", id));
         }
     }
 
-    let method = match object.get("method") {
-        Some(Value::String(method)) => method.clone(),
+    let method = match object.remove("method") {
+        Some(Value::String(method)) => method,
         _ => {
             return Err(ParseFail::invalid_with_id(
-                "method (chaîne) requis",
-                id.clone(),
+                "method (string) is required",
+                id,
             ));
         }
     };
@@ -267,10 +285,7 @@ pub fn parse_incoming(body: &[u8]) -> Result<Incoming, ParseFail> {
         None => None,
         Some(params) if params.is_object() => Some(params),
         Some(_) => {
-            return Err(ParseFail::invalid_with_id(
-                "params doit être un objet",
-                id.clone(),
-            ));
+            return Err(ParseFail::invalid_with_id("params must be an object", id));
         }
     };
 

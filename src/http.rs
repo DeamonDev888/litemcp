@@ -184,10 +184,21 @@ impl BoundServer {
     /// ```
     #[must_use]
     pub fn handle(&self) -> ServerHandle {
-        let addr = self
+        let mut addr = self
             .listener
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
+        // Un listener lié sur `0.0.0.0` ou `[::]` renvoie une IP non
+        // spécifiée : sous Windows, `TcpStream::connect_timeout` vers
+        // `0.0.0.0:port` échoue en `AddrNotAvailable` sans réveiller
+        // `accept`. On substitue donc l'adresse de bouclage locale.
+        if addr.ip().is_unspecified() {
+            let loopback = match addr {
+                SocketAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                SocketAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            };
+            addr.set_ip(loopback);
+        }
         ServerHandle {
             shutdown: Arc::clone(&self.shutdown),
             addr,
@@ -252,7 +263,7 @@ impl BoundServer {
                                         "503 Service Unavailable",
                                         "",
                                         "application/json",
-                                        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"trop de connexions"}}"#,
+                                        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"too many connections"}}"#,
                                         false,
                                         false,
                                     );
@@ -287,7 +298,7 @@ impl BoundServer {
                     "503 Service Unavailable",
                     "",
                     "application/json",
-                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"moteur sature"}}"#,
+                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"server saturated"}}"#,
                     false,
                     false,
                 );
@@ -307,6 +318,8 @@ impl BoundServer {
                 self.live_connections.fetch_sub(1, Ordering::Relaxed);
                 continue;
             };
+            let read_timeout = self.read_timeout;
+            let connection_ttl = self.connection_ttl;
             let spawned = std::thread::Builder::new()
                 .name("litemcp-conn".into())
                 .spawn(move || {
@@ -322,7 +335,8 @@ impl BoundServer {
                         &core,
                         &route,
                         &allow_origins,
-                        self.connection_ttl,
+                        read_timeout,
+                        connection_ttl,
                         &shutdown,
                     );
                 });
@@ -336,7 +350,7 @@ impl BoundServer {
                     "503 Service Unavailable",
                     "",
                     "application/json",
-                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"serveur sature"}}"#,
+                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"server saturated"}}"#,
                     false,
                     false,
                 );
@@ -425,6 +439,29 @@ enum LineFail {
     Closed,
 }
 
+/// Ajuste le timeout de lecture de la socket si la `deadline` résiduelle
+/// est plus courte que `read_timeout`.
+///
+/// Sur le chemin chaud nominal (`remaining >= read_timeout`), aucun syscall
+/// n'est émis. Lorsque la deadline de requête ou le `connection_ttl` approche,
+/// la lecture bloquante ne peut plus déborder de `read_timeout` au-delà de
+/// l'échéance.
+fn tighten_read_timeout(
+    stream: &TcpStream,
+    read_timeout: Duration,
+    deadline: Instant,
+) -> Option<()> {
+    let now = Instant::now();
+    if now >= deadline {
+        return None;
+    }
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining < read_timeout {
+        let _ = stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))));
+    }
+    Some(())
+}
+
 /// Lit une ligne (jusqu'à `\n` inclus) dans `out` — sans jamais la dépasser
 /// `cap` octets.
 ///
@@ -440,12 +477,13 @@ fn read_line_capped(
     out: &mut String,
     scratch: &mut Vec<u8>,
     cap: usize,
+    read_timeout: Duration,
     deadline: Instant,
 ) -> Result<(), LineFail> {
     out.clear();
     scratch.clear();
     loop {
-        if Instant::now() >= deadline {
+        if tighten_read_timeout(reader.get_ref(), read_timeout, deadline).is_none() {
             return Err(LineFail::Slow);
         }
         let available = match reader.fill_buf() {
@@ -473,9 +511,7 @@ fn read_line_capped(
             return match std::str::from_utf8(scratch) {
                 Ok(text) => {
                     // **CRLF strict** (RFC 9112 §2.2 : la fin de ligne est
-                    // CRLF). Un LF seul (« httpoxy ») ou un double CR
-                    // (`\r\r\n`) seraient lus différemment par un proxy
-                    // strict → divergence de parsing.
+                    // CRLF). Un LF seul (« httpoxy ») est coupé immédiatement.
                     if !text.ends_with("\r\n") {
                         return Err(LineFail::Closed);
                     }
@@ -499,6 +535,7 @@ fn handle_connection(
     core: &ServerCore,
     route: &str,
     allow_origins: &[String],
+    read_timeout: Duration,
     connection_ttl: Duration,
     shutdown: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
@@ -509,12 +546,25 @@ fn handle_connection(
     let mut reader = BufReader::with_capacity(4 * 1024, stream.try_clone()?);
     let mut stream = stream;
     // Buffers réutilisés sur toute la connexion (keep-alive inclus) : le
-    // chemin chaud n'alloue que le corps, l'en-tête de réponse et la
-    // réplique JSON-RPC.
+    // chemin chaud n'alloue que l'en-tête de réponse et la réplique JSON-RPC.
     let mut line = String::new();
     let mut scratch = Vec::new();
+    let mut body = Vec::new();
     // Instant d'ouverture de la connexion : borne sa durée de vie totale.
     let connection_started = Instant::now();
+    let connection_deadline = if connection_ttl.is_zero() {
+        None
+    } else {
+        Some(connection_started + connection_ttl)
+    };
+    // Budget total d'une requête : proportionnel à `read_timeout` (×2, borné
+    // à `REQUEST_DEADLINE` = 60 s). Un serveur configuré avec un
+    // `read_timeout` court (ex. 400 ms) coupe aussi un client qui dribble
+    // sous `read_timeout` en 800 ms au lieu d'attendre 60 s.
+    let request_budget = read_timeout
+        .saturating_mul(2)
+        .min(REQUEST_DEADLINE)
+        .max(read_timeout);
     loop {
         // Arrêt demandé : la connexion se ferme **entre deux requêtes** —
         // celle en cours a terminé proprement, la suivante ne démarre pas.
@@ -529,22 +579,35 @@ fn handle_connection(
         //
         // TTL nul = pas de TTL (désactivé), comme documenté sur
         // [`crate::server::ServerBuilder::connection_ttl`].
-        if !connection_ttl.is_zero() && connection_started.elapsed() >= connection_ttl {
-            break;
+        let now = Instant::now();
+        if let Some(conn_end) = connection_deadline {
+            if now >= conn_end {
+                break;
+            }
         }
-        let deadline = Instant::now() + REQUEST_DEADLINE;
+        let mut deadline = now + request_budget;
+        if let Some(conn_end) = connection_deadline {
+            if conn_end < deadline {
+                deadline = conn_end;
+            }
+        }
 
         // Ligne de requête — bornée, deadline globale.
-        match read_line_capped(&mut reader, &mut line, &mut scratch, MAX_LINE, deadline) {
+        match read_line_capped(
+            &mut reader,
+            &mut line,
+            &mut scratch,
+            MAX_LINE,
+            read_timeout,
+            deadline,
+        ) {
             Ok(()) => {}
             Err(LineFail::TooLong) => {
-                respond(
+                respond_error(
                     &mut stream,
                     "431 Request Header Fields Too Large",
+                    "line too long",
                     "",
-                    "application/json",
-                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"ligne trop longue"}}"#,
-                    false,
                     false,
                 )?;
                 return Ok(());
@@ -552,15 +615,12 @@ fn handle_connection(
             // slowloris (timeout OU deadline globale) ou coupure : sans réponse
             Err(_) => return Ok(()),
         }
-        // RFC 9112 §3 : la ligne de requête n'accepte que des espaces ASCII
-        // (SP) comme séparateurs. `split_ascii_whitespace` inclurait aussi
-        // `\t`, `\n`, `\r`, `\x0b`, `\x0c` — un proxy strict (RFC 9112 §3
-        // n'autorise que SP) lirait la requête différemment → divergence de
-        // parsing. On découpe donc explicitement sur SP.
+        // RFC 9112 §3 : la ligne de requête n'accepte qu'un **unique** espace
+        // ASCII (SP) entre ses trois jetons (`method SP request-target SP
+        // HTTP-version`), sans espace initial ni final.
         //
         // Le CRLF final est retiré **exactement une fois** avant le
-        // découpage (sinon il resterait collé au dernier jeton :
-        // `HTTP/1.1\r\n`). Un CR ou LF résiduel *à l'intérieur* de la ligne
+        // découpage. Un CR ou LF résiduel *à l'intérieur* de la ligne
         // est refusé : `GET /health HTTP/1.1\r\r\n` est lu différemment par
         // un proxy strict (RFC 9112 §2.2 — fin de ligne = CRLF unique).
         let request_line = line.strip_suffix("\r\n").unwrap_or(&line);
@@ -568,13 +628,16 @@ fn handle_connection(
             respond_error(
                 &mut stream,
                 "400 Bad Request",
-                "fin de ligne invalide dans la ligne de requête",
+                "invalid line ending in the request line",
                 "",
                 false,
             )?;
             return Ok(());
         }
-        let mut parts = request_line.split(' ').filter(|part| !part.is_empty());
+        // Pas de `.filter(|p| !p.is_empty())` : un espace initial, final ou
+        // doublé (`POST  /mcp HTTP/1.1`) produit un jeton vide et doit être
+        // refusé en 400 (RFC 9112 §3).
+        let mut parts = request_line.split(' ');
         let verb = parts.next().unwrap_or("");
         let full_path = parts.next().unwrap_or("");
         let version = parts.next().unwrap_or("");
@@ -584,7 +647,7 @@ fn handle_connection(
             respond_error(
                 &mut stream,
                 "400 Bad Request",
-                "ligne de requête invalide",
+                "malformed request line",
                 "",
                 verb == "HEAD",
             )?;
@@ -602,7 +665,20 @@ fn handle_connection(
             respond_error(
                 &mut stream,
                 "400 Bad Request",
-                "caractère de contrôle dans la ligne de requête",
+                "control character in the request line",
+                "",
+                verb == "HEAD",
+            )?;
+            return Ok(());
+        }
+        // RFC 9110 §9.1 : `method = token` (`1*tchar`) ; RFC 9112 §3.2.1 :
+        // `origin-form = absolute-path [ "?" query ]` commençant par `/`, en
+        // ASCII visible et sans fragment `#`.
+        if !is_valid_token(verb) || !is_valid_request_target(full_path) {
+            respond_error(
+                &mut stream,
+                "400 Bad Request",
+                "malformed request line",
                 "",
                 verb == "HEAD",
             )?;
@@ -615,7 +691,7 @@ fn handle_connection(
             respond_error(
                 &mut stream,
                 "505 HTTP Version Not Supported",
-                "version HTTP non supportée",
+                "unsupported HTTP version",
                 "",
                 verb == "HEAD",
             )?;
@@ -636,22 +712,29 @@ fn handle_connection(
         let mut malformed_length = false;
         let mut duplicate_length = false;
         let mut transfer_encoding = false;
-        // Origin/Host sans allocation : seul le verdict est conservé, jamais
-        // la valeur — le garde ne compare qu'avec la liste autorisée.
+        // Origin/Host/Sec-Fetch-Site sans allocation : seul le verdict est
+        // conservé, jamais la valeur.
         let mut origin_seen = false;
         let mut origin_duplicate = false;
+        let mut origin_malformed = false;
         let mut origin_allowed = false;
+        let mut sec_fetch_site_seen = false;
+        let mut sec_fetch_site_duplicate = false;
+        let mut sec_fetch_site_cross = false;
         let mut host_seen = false;
         let mut host_duplicate = false;
+        let mut host_invalid = false;
         let mut accept_json = false;
         let mut accept_sse = false;
         let mut expect_continue = false;
-        // `Content-Type` de la requête — vérifié sur les routes POST.
-        let mut content_type: Option<String> = None;
-        // En-têtes à valeur unique vus une première fois (pour refuser les
-        // doublons : un proxy combine ou retient la première valeur, nous la
-        // dernière — le verdict ne doit pas dépendre de l'ordre).
+        let mut expect_invalid = false;
+        // `Content-Type` et `Content-Encoding` de la requête — vérifiés sans
+        // allocation (seuls la présence et le verdict sont retenus).
+        let mut content_type_seen = false;
+        let mut content_type_json = false;
         let mut content_type_duplicate = false;
+        let mut content_encoding_seen = false;
+        let mut content_encoding_duplicate = false;
         // En-têtes de routage MCP 2026-07-28 (SEP-2243) — optionnels chez
         // nous (compatibilité), mais vérifiés s'ils sont présents.
         let mut mcp_method: Option<String> = None;
@@ -665,25 +748,50 @@ fn handle_connection(
         let mut close = http10; // HTTP/1.0 : fermeture par défaut
         let mut header_count = 0usize;
         loop {
-            match read_line_capped(&mut reader, &mut line, &mut scratch, MAX_LINE, deadline) {
+            match read_line_capped(
+                &mut reader,
+                &mut line,
+                &mut scratch,
+                MAX_LINE,
+                read_timeout,
+                deadline,
+            ) {
                 Ok(()) => {}
                 Err(LineFail::TooLong) => {
-                    respond(
+                    respond_error(
                         &mut stream,
                         "431 Request Header Fields Too Large",
+                        "line too long",
                         "",
-                        "application/json",
-                        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"ligne trop longue"}}"#.as_bytes(),
-                        false,
                         is_head,
                     )?;
                     return Ok(());
                 }
                 Err(_) => return Ok(()),
             }
-            let header = line.trim_end();
+            // **Attention sécurité (anti-smuggling)** : on retire uniquement
+            // le suffixe `\r\n` exact (jamais `.trim_end()`). Avec
+            // `trim_end()`, une ligne composée d'espaces ou de tabulations
+            // (`" \r\n"` ou `"\t\r\n"`) devenait vide *avant* le contrôle
+            // `obs-fold` et terminait prématurément les en-têtes côté
+            // serveur tandis qu'un proxy amont continuait à lire les
+            // en-têtes suivants.
+            let header = line.strip_suffix("\r\n").unwrap_or(&line);
             if header.is_empty() {
                 break;
+            }
+            // Aucun `\r` ou `\n` résiduel n'est admis à l'intérieur d'une
+            // ligne d'en-tête (`X: a\rTransfer-Encoding: chunked\r\n` ou
+            // `\r\r\n` créeraient une divergence de découpage avec un proxy).
+            if header.contains(['\r', '\n']) {
+                respond_error(
+                    &mut stream,
+                    "400 Bad Request",
+                    "invalid line ending in header",
+                    "",
+                    is_head,
+                )?;
+                return Ok(());
             }
             // obs-fold (RFC 9112 §5.2, obsolète) : une ligne de continuation
             // serait susceptible d'être réassemblée différemment par un proxy
@@ -692,7 +800,7 @@ fn handle_connection(
                 respond_error(
                     &mut stream,
                     "400 Bad Request",
-                    "ligne d'en-tête obsolète (obs-fold)",
+                    "obsolete header line folding (obs-fold)",
                     "",
                     is_head,
                 )?;
@@ -700,18 +808,16 @@ fn handle_connection(
             }
             header_count += 1;
             if header_count > MAX_HEADERS {
-                respond(
+                respond_error(
                     &mut stream,
                     "431 Request Header Fields Too Large",
+                    "too many headers",
                     "",
-                    "application/json",
-                    r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"trop d'en-têtes"}}"#.as_bytes(),
-                    false,
                     is_head,
                 )?;
                 return Ok(());
             }
-            if let Some((name_raw, value)) = header.split_once(':') {
+            if let Some((name_raw, value_raw)) = header.split_once(':') {
                 // RFC 9112 §5.1 : aucun espace entre le nom de champ et le
                 // deux-points — une telle ligne est lue autrement par un
                 // proxy strict (désynchronisation potentielle), refus net.
@@ -719,26 +825,52 @@ fn handle_connection(
                     respond_error(
                         &mut stream,
                         "400 Bad Request",
-                        "espace avant deux-points",
+                        "whitespace before colon",
                         "",
                         is_head,
                     )?;
                     return Ok(());
                 }
-                // Comparaison insensible à la casse sans réallouer le nom ni
-                // la valeur — le chemin d'en-têtes n'alloue rien.
-                let name = name_raw.trim();
-                let value = value.trim();
-                if name.is_empty() {
+                if name_raw.is_empty() {
                     respond_error(
                         &mut stream,
                         "400 Bad Request",
-                        "nom d'en-tête vide",
+                        "empty header name",
                         "",
                         is_head,
                     )?;
                     return Ok(());
                 }
+                // RFC 9110 §5.1 / §5.6.2 : `field-name = token` (`1*tchar`).
+                // Tout espace Unicode, caractère de contrôle ou délimiteur
+                // dans le nom d'en-tête est refusé sans ambiguïté.
+                if !is_valid_token(name_raw) {
+                    respond_error(
+                        &mut stream,
+                        "400 Bad Request",
+                        "invalid header name",
+                        "",
+                        is_head,
+                    )?;
+                    return Ok(());
+                }
+                // RFC 9110 §5.5 : aucun caractère de contrôle (NUL, VT, FF,
+                // DEL, contrôles C0/C1 hors HTAB) n'est autorisé dans une
+                // valeur d'en-tête, et seul l'OWS HTTP (`SP` / `HTAB`) est
+                // retiré aux extrémités (jamais `.trim()` qui absorberait
+                // `\x0b`, `\x0c` ou des espaces Unicode `\u{00a0}`).
+                if !is_valid_field_value(value_raw) {
+                    respond_error(
+                        &mut stream,
+                        "400 Bad Request",
+                        "control character in header value",
+                        "",
+                        is_head,
+                    )?;
+                    return Ok(());
+                }
+                let name = name_raw;
+                let value = trim_ows(value_raw);
                 if name.eq_ignore_ascii_case("content-length") {
                     if saw_content_length {
                         duplicate_length = true;
@@ -762,32 +894,52 @@ fn handle_connection(
                         origin_duplicate = true;
                     } else {
                         origin_seen = true;
-                        origin_allowed =
-                            allow_origins.iter().any(|o| o.eq_ignore_ascii_case(value));
+                        if !is_valid_origin_syntax(value) {
+                            origin_malformed = true;
+                        } else {
+                            // `Origin: null` (iframe sandboxée / data: URI) est
+                            // une origine opaque forgeable depuis n'importe quel
+                            // site tiers : jamais autorisée, même si `"null"`
+                            // figurait par erreur dans `allow_origins`.
+                            origin_allowed = !value.eq_ignore_ascii_case("null")
+                                && allow_origins.iter().any(|o| o.eq_ignore_ascii_case(value));
+                        }
+                    }
+                } else if name.eq_ignore_ascii_case("sec-fetch-site") {
+                    if sec_fetch_site_seen {
+                        sec_fetch_site_duplicate = true;
+                    } else {
+                        sec_fetch_site_seen = true;
+                        sec_fetch_site_cross = value.eq_ignore_ascii_case("cross-site");
                     }
                 } else if name.eq_ignore_ascii_case("host") {
                     if host_seen {
                         host_duplicate = true;
                     } else {
                         host_seen = true;
+                        if !is_valid_host(value) {
+                            host_invalid = true;
+                        }
                     }
                 } else if name.eq_ignore_ascii_case("accept") {
                     // Correspondance **par jeton exact** : `Accept:
                     // text/event-stream-x` ne doit pas être pris pour
-                    // `text/event-stream` (une correspondance par
-                    // sous-chaîne créait une divergence avec un proxy
-                    // strict et pouvait basculer la réponse en SSE).
-                    //
-                    // Les paramètres de media type sont ignorés :
-                    // `application/json; charset=utf-8` contient bien le
-                    // jeton `application/json` (RFC 9110 §12.5.1).
+                    // `text/event-stream`. Un paramètre `q=0` disqualifie le
+                    // type de média (RFC 9110 §12.5.1).
                     accept_json |= header_has_media_type(value, "application/json");
                     accept_sse |= header_has_media_type(value, "text/event-stream");
                 } else if name.eq_ignore_ascii_case("content-type") {
-                    if content_type.is_some() {
+                    if content_type_seen {
                         content_type_duplicate = true;
                     } else {
-                        content_type = Some(value.to_string());
+                        content_type_seen = true;
+                        content_type_json = is_json_content_type(value);
+                    }
+                } else if name.eq_ignore_ascii_case("content-encoding") {
+                    if content_encoding_seen {
+                        content_encoding_duplicate = true;
+                    } else {
+                        content_encoding_seen = true;
                     }
                 } else if name.eq_ignore_ascii_case("mcp-method") {
                     if mcp_method.is_some() {
@@ -805,7 +957,7 @@ fn handle_connection(
                     let mut has_close = false;
                     let mut has_keep_alive = false;
                     for token in value.split(',') {
-                        let token = token.trim();
+                        let token = trim_ows(token);
                         if token.eq_ignore_ascii_case("close") {
                             has_close = true;
                         } else if token.eq_ignore_ascii_case("keep-alive") {
@@ -828,10 +980,17 @@ fn handle_connection(
                             close = false;
                         }
                     }
-                } else if name.eq_ignore_ascii_case("expect")
-                    && header_has_token(value, "100-continue")
-                {
-                    expect_continue = true;
+                } else if name.eq_ignore_ascii_case("expect") {
+                    // RFC 9110 §10.1.1 : toute attente autre que `100-continue`
+                    // DOIT recevoir `417 Expectation Failed`.
+                    if parse_expect_100_continue(value) {
+                        if !expect_invalid {
+                            expect_continue = true;
+                        }
+                    } else {
+                        expect_invalid = true;
+                        expect_continue = false;
+                    }
                 }
             } else {
                 // RFC 9112 §5 : une ligne d'en-tête sans deux-points est
@@ -840,7 +999,7 @@ fn handle_connection(
                 respond_error(
                     &mut stream,
                     "400 Bad Request",
-                    "en-tête malformé",
+                    "malformed header",
                     "",
                     is_head,
                 )?;
@@ -848,67 +1007,96 @@ fn handle_connection(
             }
         }
 
-        // En-tete `Origin` duplique : requete ambigue (contournement possible
-        // de la garde DNS-rebinding) - refus 400.
+        // En-tete `Origin` duplique ou syntaxiquement invalide : refus 400.
         if origin_duplicate {
             respond_error(
                 &mut stream,
                 "400 Bad Request",
-                "en-tete Origin duplique",
+                "duplicated Origin header",
                 "",
                 is_head,
             )?;
             return Ok(());
         }
-
-        // En-têtes à valeur unique dupliqués (`Content-Type`, `Mcp-Method`,
-        // `Mcp-Name`) : requête ambiguë — nous retenions la DERNIÈRE valeur,
-        // un proxy qui combine ou retient la première lirait autrement.
-        // `Content-Type: application/json` puis `text/plain` était refusé
-        // (415) dans un ordre et accepté dans l'autre ; un gateway qui route
-        // sur le PREMIER `Mcp-Method` divergeait du contrôle fait sur le
-        // dernier. Refus net, comme `Origin` et `Host`.
-        if content_type_duplicate || mcp_method_duplicate || mcp_name_duplicate {
+        if origin_malformed {
             respond_error(
                 &mut stream,
                 "400 Bad Request",
-                "en-tête à valeur unique dupliqué",
+                "malformed Origin header",
                 "",
                 is_head,
             )?;
             return Ok(());
         }
 
-        // Garde DNS-rebinding : un navigateur qui parle au serveur envoie un
-        // `Origin` ; par défaut on refuse, sauf origines explicitement permises.
-        if origin_seen && !origin_allowed {
-            respond_error(&mut stream, "403 Forbidden", "origin refusée", "", is_head)?;
+        // En-têtes à valeur unique dupliqués (`Content-Type`,
+        // `Content-Encoding`, `Sec-Fetch-Site`, `Mcp-Method`, `Mcp-Name`) :
+        // requête ambiguë — refus net 400.
+        if content_type_duplicate
+            || content_encoding_duplicate
+            || sec_fetch_site_duplicate
+            || mcp_method_duplicate
+            || mcp_name_duplicate
+        {
+            respond_error(
+                &mut stream,
+                "400 Bad Request",
+                "duplicated single-value header",
+                "",
+                is_head,
+            )?;
             return Ok(());
         }
 
-        // RFC 9112 §3.2 : `Host` obligatoire — et unique — en HTTP/1.1.
-        // HTTP/1.0 en est dispensé (le champ y est facultatif).
-        if !http10 {
-            if !host_seen {
-                respond_error(
-                    &mut stream,
-                    "400 Bad Request",
-                    "en-tête Host requis",
-                    "",
-                    is_head,
-                )?;
-                return Ok(());
-            }
-            if host_duplicate {
-                respond_error(
-                    &mut stream,
-                    "400 Bad Request",
-                    "en-tête Host dupliqué",
-                    "",
-                    is_head,
-                )?;
-                return Ok(());
-            }
+        // Garde DNS-rebinding & Fetch Metadata :
+        // 1) tout `Origin` non autorisé (ou `Origin: null`) → 403 ;
+        // 2) `Sec-Fetch-Site: cross-site` sans `Origin` explicitement
+        //    autorisé → 403 (défense en profondeur si `Origin` est omis).
+        if (origin_seen && !origin_allowed)
+            || (sec_fetch_site_cross && !(origin_seen && origin_allowed))
+        {
+            respond_error(
+                &mut stream,
+                "403 Forbidden",
+                "origin not allowed",
+                "",
+                is_head,
+            )?;
+            return Ok(());
+        }
+
+        // RFC 9112 §3.2 : `Host` obligatoire en HTTP/1.1 ; et sur toute
+        // version HTTP, un `Host` dupliqué ou de valeur invalide DOIT être
+        // refusé en 400.
+        if !http10 && !host_seen {
+            respond_error(
+                &mut stream,
+                "400 Bad Request",
+                "Host header required",
+                "",
+                is_head,
+            )?;
+            return Ok(());
+        }
+        if host_duplicate {
+            respond_error(
+                &mut stream,
+                "400 Bad Request",
+                "duplicated Host header",
+                "",
+                is_head,
+            )?;
+            return Ok(());
+        }
+        if host_invalid {
+            respond_error(
+                &mut stream,
+                "400 Bad Request",
+                "invalid Host header",
+                "",
+                is_head,
+            )?;
+            return Ok(());
         }
 
         // Anti request-smuggling : TE présent ou CL dupliqué = requête
@@ -923,7 +1111,20 @@ fn handle_connection(
             respond_error(
                 &mut stream,
                 "400 Bad Request",
-                "encodage de requête ambigu",
+                "ambiguous request framing",
+                "",
+                is_head,
+            )?;
+            return Ok(());
+        }
+
+        // RFC 9110 §10.1.1 : un en-tête `Expect` portant une valeur autre
+        // que `100-continue` DOIT être refusé en `417 Expectation Failed`.
+        if expect_invalid {
+            respond_error(
+                &mut stream,
+                "417 Expectation Failed",
+                "unsupported Expect header",
                 "",
                 is_head,
             )?;
@@ -941,7 +1142,7 @@ fn handle_connection(
                 respond_error(
                     &mut stream,
                     "400 Bad Request",
-                    "Content-Length invalide",
+                    "invalid Content-Length",
                     "",
                     is_head,
                 )?;
@@ -956,7 +1157,7 @@ fn handle_connection(
                     respond_error(
                         &mut stream,
                         "411 Length Required",
-                        "Content-Length requis",
+                        "Content-Length required",
                         "",
                         is_head,
                     )?;
@@ -970,7 +1171,7 @@ fn handle_connection(
             respond_error(
                 &mut stream,
                 "413 Payload Too Large",
-                "corps trop volumineux",
+                "body too large",
                 "",
                 is_head,
             )?;
@@ -991,11 +1192,11 @@ fn handle_connection(
                 // sonde ne traite pas) provoquerait un blocage croisé.
                 // Refuser est aussi la seule façon d'être sûr qu'aucun
                 // reliquat ne devienne la requête suivante (désync de file).
-                if len != 0 {
+                if len != 0 || content_encoding_seen {
                     respond_error(
                         &mut stream,
                         "400 Bad Request",
-                        "corps non admis sur la sonde de vie",
+                        "body not allowed on the health probe",
                         "",
                         is_head,
                     )?;
@@ -1018,7 +1219,7 @@ fn handle_connection(
             respond_error(
                 &mut stream,
                 "405 Method Not Allowed",
-                "GET ou HEAD uniquement",
+                "GET or HEAD only",
                 "Allow: GET, HEAD\r\n",
                 is_head,
             )?;
@@ -1026,7 +1227,7 @@ fn handle_connection(
         }
 
         if !route_matched {
-            respond_error(&mut stream, "404 Not Found", "route inconnue", "", is_head)?;
+            respond_error(&mut stream, "404 Not Found", "unknown route", "", is_head)?;
             return Ok(());
         }
 
@@ -1034,73 +1235,83 @@ fn handle_connection(
             respond_error(
                 &mut stream,
                 "405 Method Not Allowed",
-                "POST uniquement",
+                "POST only",
                 "Allow: POST\r\n",
                 is_head,
             )?;
             return Ok(());
         }
 
-        // `Content-Type` : la spec MCP exige `application/json` sur les POST
-        // Streamable HTTP. Un `text/plain` serait traité comme du JSON
-        // (source de confusion de type). Absent → accepté (certains
-        // clients legacy n'envoient pas l'en-tête).
-        if let Some(value) = &content_type {
-            let media_type = value
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            if media_type != "application/json" {
-                respond_error(
-                    &mut stream,
-                    "415 Unsupported Media Type",
-                    "Content-Type attendu : application/json",
-                    "",
-                    is_head,
-                )?;
-                return Ok(());
-            }
+        // `Content-Encoding` : aucune compression de requête n'est supportée.
+        // Ignorer `Content-Encoding: gzip` permettrait de traverser un WAF
+        // en envoyant du JSON brut sous une annonce de compression (RFC 9110
+        // §15.5.16 → 415).
+        if content_encoding_seen {
+            respond_error(
+                &mut stream,
+                "415 Unsupported Media Type",
+                "Content-Encoding is not supported",
+                "",
+                is_head,
+            )?;
+            return Ok(());
         }
 
-        // `Expect: 100-continue` : le client attend notre feu vert avant
-        // d'envoyer le corps — on l'envoie, puis on lit le corps.
-        if expect_continue && len > 0 {
+        // `Content-Type` : la spec MCP exige `application/json` sur les POST
+        // Streamable HTTP. Un `text/plain` ou un `charset` non-UTF-8 serait
+        // traité comme du JSON UTF-8 (source de confusion de type). Absent →
+        // accepté (certains clients legacy n'envoient pas l'en-tête).
+        if content_type_seen && !content_type_json {
+            respond_error(
+                &mut stream,
+                "415 Unsupported Media Type",
+                "expected Content-Type: application/json",
+                "",
+                is_head,
+            )?;
+            return Ok(());
+        }
+
+        // `Expect: 100-continue` : le client HTTP/1.1 attend notre feu vert
+        // avant d'envoyer le corps — on l'envoie, puis on lit le corps.
+        // RFC 9110 §10.1.1 : jamais de `100 Continue` vers un client HTTP/1.0
+        // (qui lirait l'intermédiaire 1xx comme la réponse finale → désync).
+        if expect_continue && !http10 && len > 0 {
             stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
             stream.flush()?;
         }
 
-        // Lecture du corps **par tranches** : un buffer de 64 Ko réutilisé
-        // au lieu d'une pré-allocation de `len` octets. Un client qui
-        // annonce `Content-Length: 1048576` sans envoyer de corps ne
-        // coûte plus 1 Mio de commit — l'amplification mémoire passe de
-        // ×9 800 à ×1.
-        let body = match read_body(&mut reader, len, deadline) {
-            Ok(body) => body,
-            Err(_) => {
-                // Corps incomplet à mi-chemin : on tente une réponse 400
-                // puis on ferme — aucun octet résiduel ne doit être
-                // réinterprété comme une requête suivante.
-                let _ = respond_error(
-                    &mut stream,
-                    "400 Bad Request",
-                    "corps tronque ou trop lent",
-                    "",
-                    false,
-                );
-                return Ok(());
-            }
-        };
+        // Lecture du corps **par tranches** dans le buffer `body` réutilisé :
+        // aucune pré-allocation de `len` octets au-delà de `BODY_CHUNK` et
+        // zéro copie intermédiaire depuis `BufReader`. Un client qui annonce
+        // `Content-Length: 1048576` sans envoyer de corps ne coûte plus 1 Mio
+        // de commit — l'amplification mémoire passe de ×9 800 à ×1.
+        if read_body(&mut reader, &mut body, len, read_timeout, deadline).is_err() {
+            // Corps incomplet à mi-chemin : on tente une réponse 400
+            // puis on ferme — aucun octet résiduel ne doit être
+            // réinterprété comme une requête suivante.
+            let _ = respond_error(
+                &mut stream,
+                "400 Bad Request",
+                "truncated or slow request body",
+                "",
+                false,
+            );
+            return Ok(());
+        }
 
         let dispatch_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             // En-têtes de routage MCP (SEP-2243) — optionnels, mais
             // vérifiés s'ils sont présents.
-            let headers = crate::server::McpHeaders {
-                method: mcp_method.clone(),
-                name: mcp_name.clone(),
-            };
-            core.dispatch_with_headers(&body, Some(&headers))
+            if mcp_method.is_none() && mcp_name.is_none() {
+                core.dispatch_with_headers(&body, None)
+            } else {
+                let headers = crate::server::McpHeaders {
+                    method: mcp_method,
+                    name: mcp_name,
+                };
+                core.dispatch_with_headers(&body, Some(&headers))
+            }
         }));
 
         let reply = match dispatch_result {
@@ -1134,7 +1345,7 @@ fn handle_connection(
                 let payload = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": request_id,
-                    "error": { "code": -32603, "message": "erreur interne" }
+                    "error": { "code": -32603, "message": "internal error" }
                 });
                 respond(
                     &mut stream,
@@ -1145,6 +1356,7 @@ fn handle_connection(
                     false,
                     false,
                 )?;
+                shutdown_gracefully(&mut stream);
                 return Ok(());
             }
         };
@@ -1163,10 +1375,7 @@ fn handle_connection(
         // CHAQUE événement (`respond` fait `write_all` + `flush`) et porter
         // [`SSE_ANTI_BUFFERING`].
         if accept_sse && !accept_json {
-            let mut event = Vec::with_capacity(reply.len() + 8);
-            event.extend_from_slice(b"data: ");
-            event.extend_from_slice(&reply);
-            event.extend_from_slice(b"\n\n");
+            let event = format_sse_event(&reply);
             respond(
                 &mut stream,
                 "200 OK",
@@ -1176,6 +1385,7 @@ fn handle_connection(
                 false,
                 false,
             )?;
+            shutdown_gracefully(&mut stream);
             break; // un seul événement de réponse, puis clôture
         }
 
@@ -1189,6 +1399,7 @@ fn handle_connection(
             false,
         )?;
         if close {
+            let _ = stream.shutdown(std::net::Shutdown::Write);
             break;
         }
     }
@@ -1221,7 +1432,8 @@ fn respond_error(
     // Fermeture propre systématique : on envoie un FIN **et** on vide le
     // tampon de réception avant le close — sinon le noyau émet un RST avec
     // des octets non lus, RST qui purge chez le client la réponse qu'on
-    // vient d'écrire (404/415 perdus quand le corps n'a pas été consommé).
+    // vient d'écrire (404/415/431 perdus quand la requête n'a pas été
+    // intégralement consommée).
     shutdown_gracefully(stream);
     Ok(())
 }
@@ -1236,46 +1448,52 @@ fn error_payload(message: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Lit un corps de `len` octets **par tranches**.
+/// Lit un corps de `len` octets **par tranches** dans `body`.
 ///
-/// Le buffer de lecture est borné à [`BODY_CHUNK`] (64 Kio) et réutilisé :
-/// la mémoire allouée par requête est proportionnelle aux octets
-/// **effectivement reçus**, pas au `Content-Length` annoncé. Un client qui
-/// annonce 1 Mio et n'envoie rien ne consomme donc plus 1 Mio de commit
-/// (amplification ×9 800 → ×1).
-///
-/// Le résultat est concaténé dans un unique `Vec` de la taille exacte — le
-/// dispatch JSON-RPC a besoin d'un slice contigu.
+/// La capacité initiale est bornée à [`BODY_CHUNK`] (64 Kio) et `body` est
+/// réutilisé sur la connexion keep-alive : la mémoire engagée par requête
+/// reste proportionnelle aux octets **effectivement reçus**, pas au
+/// `Content-Length` annoncé. Un client qui annonce 1 Mio et n'envoie rien ne
+/// consomme donc plus 1 Mio de commit (amplification ×9 800 → ×1).
 fn read_body(
     reader: &mut BufReader<TcpStream>,
+    body: &mut Vec<u8>,
     len: usize,
+    read_timeout: Duration,
     deadline: Instant,
-) -> std::io::Result<Vec<u8>> {
-    if len == 0 {
-        return Ok(Vec::new());
+) -> std::io::Result<()> {
+    body.clear();
+    if body.capacity() > BODY_CHUNK && len <= BODY_CHUNK {
+        body.shrink_to(BODY_CHUNK);
     }
-    let mut body = Vec::with_capacity(len.min(BODY_CHUNK));
-    let mut chunk = vec![0u8; BODY_CHUNK.min(len)];
+    if len == 0 {
+        return Ok(());
+    }
+    let initial = len.min(BODY_CHUNK);
+    if body.capacity() < initial {
+        body.reserve(initial - body.capacity());
+    }
     let mut remaining = len;
     while remaining > 0 {
-        let wanted = remaining.min(chunk.len());
-        if Instant::now() >= deadline {
+        if tighten_read_timeout(reader.get_ref(), read_timeout, deadline).is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "deadline dépassée",
+                "deadline exceeded",
             ));
         }
-        let n = reader.read(&mut chunk[..wanted])?;
-        if n == 0 {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "corps tronqué",
+                "truncated body",
             ));
         }
-        body.extend_from_slice(&chunk[..n]);
-        remaining -= n;
+        let take = remaining.min(available.len());
+        body.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        remaining -= take;
     }
-    Ok(body)
+    Ok(())
 }
 
 fn respond(
@@ -1309,16 +1527,233 @@ fn respond(
     stream.flush()
 }
 
+/// Formate une charge utile en événement SSE (`data: ...\n\n`) en
+/// neutralisant tout `\r` ou `\n` éventuel (défense en profondeur contre
+/// l'injection de champs SSE `event:` / `id:` / `retry:`).
+fn format_sse_event(reply: &[u8]) -> Vec<u8> {
+    let mut event = Vec::with_capacity(reply.len() + 8);
+    for (idx, line) in reply.split(|&b| b == b'\n').enumerate() {
+        if idx > 0 {
+            event.push(b'\n');
+        }
+        event.extend_from_slice(b"data: ");
+        for &byte in line {
+            if byte != b'\r' {
+                event.push(byte);
+            }
+        }
+    }
+    event.extend_from_slice(b"\n\n");
+    event
+}
+
 /// Extrait l'`id` JSON-RPC d'un corps de requête — *best-effort*.
 ///
 /// Utilisé pour reprendre l'`id` dans la réponse d'erreur de panique : sans
 /// lui, le client ne peut pas corréler la réponse (JSON-RPC 2.0 §5).
-/// Un corps illisible ou sans `id` → `null`.
+/// Un corps illisible ou un `id` de type interdit (booléen, tableau, objet,
+/// flottant) → `null`.
 fn extract_request_id(body: &[u8]) -> serde_json::Value {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| value.get("id").cloned())
+        .filter(|id| match id {
+            serde_json::Value::String(_) => true,
+            serde_json::Value::Number(n) => n.is_i64() || n.is_u64(),
+            _ => false,
+        })
         .unwrap_or(serde_json::Value::Null)
+}
+
+/// Caractère de jeton HTTP (`tchar`, RFC 9110 §5.6.2).
+fn is_tchar(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+            | b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z'
+    )
+}
+
+/// Vrai si `s` est un jeton HTTP valide (`1*tchar`, RFC 9110 §5.6.2).
+fn is_valid_token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(is_tchar)
+}
+
+/// Vrai si `target` est une cible de requête `origin-form` valide
+/// (`absolute-path [ "?" query ]`, RFC 9112 §3.2.1), en ASCII visible et
+/// sans fragment `#`.
+fn is_valid_request_target(target: &str) -> bool {
+    target.starts_with('/')
+        && target
+            .bytes()
+            .all(|b| (0x21..=0x7e).contains(&b) && b != b'#')
+}
+
+/// Retire uniquement l'OWS HTTP (`SP` 0x20 et `HTAB` 0x09 — RFC 9110 §5.6.3).
+///
+/// Contrairement à `str::trim()`, ne retire ni `\x0b` (VT), ni `\x0c` (FF),
+/// ni `\r`/`\n`, ni les espaces Unicode (`\u{00a0}`, etc.).
+fn trim_ows(s: &str) -> &str {
+    s.trim_matches([' ', '\t'])
+}
+
+/// Vrai si la valeur d'en-tête respecte RFC 9110 §5.5 (aucun caractère de
+/// contrôle C0/C1 ni DEL `0x7F`, seul `HTAB` est admis avec les octets
+/// visibles).
+fn is_valid_field_value(s: &str) -> bool {
+    !s.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+        && !s.chars().any(|c| c != '\t' && c.is_control())
+}
+
+/// Vrai si l'en-tête `Host` est syntaxiquement valide (`uri-host [ ":" port ]`,
+/// RFC 9112 §3.2 / RFC 3986 §3.2.2) : non vide, sans userinfo (`@`), sans
+/// chemin/requête/fragment (`/`, `\`, `?`, `#`), sans espace, et avec un
+/// port `u16` valide s'il est présent.
+fn is_valid_host(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let port_opt = if let Some(rest) = value.strip_prefix('[') {
+        let Some((ipv6, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if ipv6.is_empty()
+            || !ipv6
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        {
+            return false;
+        }
+        if after.is_empty() {
+            None
+        } else if let Some(port) = after.strip_prefix(':') {
+            Some(port)
+        } else {
+            return false;
+        }
+    } else {
+        match value.split_once(':') {
+            Some((host, port)) => {
+                if !is_valid_reg_name(host) {
+                    return false;
+                }
+                Some(port)
+            }
+            None => {
+                if !is_valid_reg_name(value) {
+                    return false;
+                }
+                None
+            }
+        }
+    };
+    if let Some(port) = port_opt {
+        if port.is_empty()
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_valid_reg_name(host: &str) -> bool {
+    !host.is_empty()
+        && host.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b'%'
+                )
+        })
+}
+
+/// Vrai si la valeur `Origin` a une syntaxe RFC 6454 valide (`"null"` ou
+/// `scheme "://" host [ ":" port ]` sans chemin, query, fragment, userinfo
+/// ni espace).
+fn is_valid_origin_syntax(value: &str) -> bool {
+    if value.is_empty() || value.bytes().any(|b| b <= b' ' || b >= 0x7f) {
+        return false;
+    }
+    if value.eq_ignore_ascii_case("null") {
+        return true;
+    }
+    let Some((scheme, authority)) = value.split_once("://") else {
+        return false;
+    };
+    if scheme.is_empty()
+        || !scheme.bytes().next().unwrap_or(b'0').is_ascii_alphabetic()
+        || !scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return false;
+    }
+    is_valid_host(authority)
+}
+
+/// Vrai si `Content-Type` désigne `application/json` (sans second type
+/// séparé par une virgule, et avec `charset=utf-8` si le paramètre `charset`
+/// est présent).
+fn is_json_content_type(value: &str) -> bool {
+    if value.contains(',') {
+        return false;
+    }
+    let mut parts = value.split(';');
+    let Some(mime) = parts.next() else {
+        return false;
+    };
+    if !trim_ows(mime).eq_ignore_ascii_case("application/json") {
+        return false;
+    }
+    for param in parts {
+        let param = trim_ows(param);
+        if param.is_empty() {
+            return false;
+        }
+        let Some((k, v)) = param.split_once('=') else {
+            return false;
+        };
+        let k = trim_ows(k);
+        let v = trim_ows(v).trim_matches('"');
+        if k.is_empty() || v.is_empty() || !is_valid_token(k) {
+            return false;
+        }
+        if k.eq_ignore_ascii_case("charset") && !v.eq_ignore_ascii_case("utf-8") {
+            return false;
+        }
+    }
+    true
+}
+
+/// Vrai si l'en-tête `Expect` ne contient que le jeton `100-continue`
+/// (RFC 9110 §10.1.1).
+fn parse_expect_100_continue(value: &str) -> bool {
+    let mut saw_100 = false;
+    for part in value.split(',') {
+        let token = trim_ows(part);
+        if token.eq_ignore_ascii_case("100-continue") {
+            saw_100 = true;
+        } else {
+            return false;
+        }
+    }
+    saw_100
 }
 
 /// Vrai si l'en-tête contient le **jeton exact** `token`.
@@ -1328,24 +1763,430 @@ fn extract_request_id(body: &[u8]) -> serde_json::Value {
 /// le jeton `text/event-stream`. Une correspondance par sous-chaîne créait
 /// une divergence de parsing avec un proxy strict (et pouvait faire basculer
 /// la réponse en SSE à tort).
+#[cfg(test)]
 fn header_has_token(value: &str, token: &str) -> bool {
     value
         .split(',')
-        .map(|part| part.trim())
+        .map(trim_ows)
         .any(|part| part.eq_ignore_ascii_case(token))
 }
 
-/// Vrai si l'en-tête contient le **type de media** `media_type`.
+/// Vrai si l'en-tête contient le **type de media** `media_type` avec un
+/// poids non nul (`q != 0`).
 ///
 /// Comme [`header_has_token`], mais les paramètres du type de media sont
-/// ignorés : `application/json; charset=utf-8` contient bien le type
-/// `application/json` (RFC 9110 §12.5.1 — *« media type parameters »*).
+/// analysés : `application/json; charset=utf-8` contient bien le type
+/// `application/json`, tandis que `text/event-stream;q=0` est refusé
+/// (RFC 9110 §12.5.1).
 fn header_has_media_type(value: &str, media_type: &str) -> bool {
-    value.split(',').map(|part| part.trim()).any(|part| {
-        part.split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .eq_ignore_ascii_case(media_type)
+    value.split(',').map(trim_ows).any(|part| {
+        let mut segments = part.split(';');
+        let Some(mime) = segments.next() else {
+            return false;
+        };
+        if !trim_ows(mime).eq_ignore_ascii_case(media_type) {
+            return false;
+        }
+        for param in segments {
+            if let Some((k, v)) = trim_ows(param).split_once('=') {
+                if trim_ows(k).eq_ignore_ascii_case("q") && is_zero_qvalue(trim_ows(v)) {
+                    return false;
+                }
+            }
+        }
+        true
     })
+}
+
+fn is_zero_qvalue(v: &str) -> bool {
+    matches!(v, "0" | "0." | "0.0" | "0.00" | "0.000")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tchar_and_token_validation_follows_rfc9110() {
+        assert!(is_valid_token("GET"));
+        assert!(is_valid_token("POST"));
+        assert!(is_valid_token("Content-Length"));
+        assert!(is_valid_token("X-Custom_Header!#$%&'*+-.^`|~123"));
+
+        assert!(!is_valid_token(""));
+        assert!(!is_valid_token("Host "));
+        assert!(!is_valid_token(" Host"));
+        assert!(!is_valid_token("Host\t"));
+        assert!(!is_valid_token("Host\u{00a0}"));
+        assert!(!is_valid_token("Host:Name"));
+        assert!(!is_valid_token("Host/Name"));
+        assert!(!is_valid_token("Host\x00Name"));
+        assert!(!is_valid_token("Host\x7f"));
+        assert!(!is_valid_token("Été"));
+    }
+
+    #[test]
+    fn request_target_validation_enforces_origin_form_without_fragments() {
+        assert!(is_valid_request_target("/mcp"));
+        assert!(is_valid_request_target("/health"));
+        assert!(is_valid_request_target("/mcp?x=1&y=2"));
+        assert!(is_valid_request_target("/api/v1/mcp"));
+
+        // Non origin-form, fragment `#`, espaces, contrôle ou non-ASCII : refusés.
+        assert!(!is_valid_request_target(""));
+        assert!(!is_valid_request_target("mcp"));
+        assert!(!is_valid_request_target("http://localhost/mcp"));
+        assert!(!is_valid_request_target("*"));
+        assert!(!is_valid_request_target("/mcp#frag"));
+        assert!(!is_valid_request_target("/mcp?x=1#frag"));
+        assert!(!is_valid_request_target("/mcp with space"));
+        assert!(!is_valid_request_target("/mcp\t"));
+        assert!(!is_valid_request_target("/mcp\x00"));
+        assert!(!is_valid_request_target("/mcp\x7f"));
+        assert!(!is_valid_request_target("/mcp\u{00a0}"));
+    }
+
+    #[test]
+    fn trim_ows_only_strips_sp_and_htab() {
+        assert_eq!(trim_ows(" \tvalue \t"), "value");
+        // VT (\x0b), FF (\x0c) et NBSP (\u{00a0}) ne sont PAS de l'OWS HTTP.
+        assert_eq!(trim_ows("\x0b2"), "\x0b2");
+        assert_eq!(trim_ows("\x0c2"), "\x0c2");
+        assert_eq!(trim_ows("\u{00a0}2"), "\u{00a0}2");
+    }
+
+    #[test]
+    fn field_value_rejects_control_characters() {
+        assert!(is_valid_field_value("application/json; charset=utf-8"));
+        assert!(is_valid_field_value("avec\ttabulation"));
+        assert!(is_valid_field_value("UTF-8 autorisé : café"));
+
+        // Contrôles C0 (hors HTAB), DEL (0x7F) et contrôles C1 Unicode refusés.
+        assert!(!is_valid_field_value("nul\x00byte"));
+        assert!(!is_valid_field_value("bell\x07"));
+        assert!(!is_valid_field_value("vt\x0b"));
+        assert!(!is_valid_field_value("ff\x0c"));
+        assert!(!is_valid_field_value("cr\r"));
+        assert!(!is_valid_field_value("lf\n"));
+        assert!(!is_valid_field_value("esc\x1b"));
+        assert!(!is_valid_field_value("del\x7f"));
+        assert!(!is_valid_field_value("nel\u{0085}"));
+    }
+
+    #[test]
+    fn host_header_validation_covers_ipv4_ipv6_regname_and_ports() {
+        assert!(is_valid_host("localhost"));
+        assert!(is_valid_host("localhost:8080"));
+        assert!(is_valid_host("127.0.0.1"));
+        assert!(is_valid_host("127.0.0.1:65535"));
+        assert!(is_valid_host("[::1]"));
+        assert!(is_valid_host("[::1]:8080"));
+        assert!(is_valid_host("[2001:db8::1]:443"));
+        assert!(is_valid_host("api.example.com"));
+
+        // Valeurs malformées ou hostiles (RFC 9112 §3.2 / RFC 9110 §7.2).
+        assert!(!is_valid_host(""));
+        assert!(!is_valid_host("user@example.com"));
+        assert!(!is_valid_host("example.com/path"));
+        assert!(!is_valid_host("example.com?query"));
+        assert!(!is_valid_host("example.com#frag"));
+        assert!(!is_valid_host("example.com\\path"));
+        assert!(!is_valid_host("example .com"));
+        assert!(!is_valid_host("example.com:"));
+        assert!(!is_valid_host("example.com:abc"));
+        assert!(!is_valid_host("example.com:65536"));
+        assert!(!is_valid_host("example.com:99999"));
+        assert!(!is_valid_host("example.com:80:80"));
+        assert!(!is_valid_host("[::1"));
+        assert!(!is_valid_host("[]"));
+        assert!(!is_valid_host("[::1]:99999"));
+        assert!(!is_valid_host("[::1]extra"));
+    }
+
+    #[test]
+    fn origin_syntax_validation_rejects_malformed_origins() {
+        assert!(is_valid_origin_syntax("https://trusted.example"));
+        assert!(is_valid_origin_syntax("http://localhost:3000"));
+        assert!(is_valid_origin_syntax("http://[::1]:8080"));
+        assert!(is_valid_origin_syntax("null"));
+
+        assert!(!is_valid_origin_syntax(""));
+        assert!(!is_valid_origin_syntax("*"));
+        assert!(!is_valid_origin_syntax("https://trusted.example/"));
+        assert!(!is_valid_origin_syntax("https://trusted.example/path"));
+        assert!(!is_valid_origin_syntax("https://user@trusted.example"));
+        assert!(!is_valid_origin_syntax(
+            "https://a.example https://b.example"
+        ));
+        assert!(!is_valid_origin_syntax("://no-scheme.example"));
+        assert!(!is_valid_origin_syntax("1http://bad-scheme.example"));
+        assert!(!is_valid_origin_syntax("https://"));
+    }
+
+    #[test]
+    fn content_type_validation_enforces_json_and_utf8_charset() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type("APPLICATION/JSON"));
+        assert!(is_json_content_type("application/json; charset=utf-8"));
+        assert!(is_json_content_type("application/json; charset=\"UTF-8\""));
+        assert!(is_json_content_type("application/json; boundary=something"));
+
+        assert!(!is_json_content_type(""));
+        assert!(!is_json_content_type("text/plain"));
+        assert!(!is_json_content_type("application/json-patch+json"));
+        assert!(!is_json_content_type("application/json, text/plain"));
+        assert!(!is_json_content_type("application/json; charset=utf-16"));
+        assert!(!is_json_content_type(
+            "application/json; charset=iso-8859-1"
+        ));
+        assert!(!is_json_content_type("application/json;"));
+        assert!(!is_json_content_type("application/json; invalid_param"));
+        assert!(!is_json_content_type("application/json; charset="));
+    }
+
+    #[test]
+    fn expect_validation_only_accepts_100_continue() {
+        assert!(parse_expect_100_continue("100-continue"));
+        assert!(parse_expect_100_continue("100-Continue"));
+        assert!(parse_expect_100_continue("100-continue, 100-continue"));
+
+        assert!(!parse_expect_100_continue(""));
+        assert!(!parse_expect_100_continue("not-100-continued"));
+        assert!(!parse_expect_100_continue("100-continue, custom-expect"));
+    }
+
+    #[test]
+    fn accept_media_type_honors_q_zero_exclusion() {
+        assert!(header_has_media_type(
+            "text/event-stream",
+            "text/event-stream"
+        ));
+        assert!(header_has_media_type(
+            "text/event-stream; charset=utf-8; q=0.8",
+            "text/event-stream"
+        ));
+        assert!(!header_has_media_type(
+            "text/event-stream;q=0",
+            "text/event-stream"
+        ));
+        assert!(!header_has_media_type(
+            "text/event-stream; q=0.000",
+            "text/event-stream"
+        ));
+        assert!(!header_has_media_type(
+            "text/event-stream-x",
+            "text/event-stream"
+        ));
+        assert!(header_has_token("100-continue", "100-continue"));
+        assert!(!header_has_token("not-100-continued", "100-continue"));
+    }
+
+    #[test]
+    fn format_sse_event_neutralizes_embedded_newlines() {
+        let normal = format_sse_event(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+        assert_eq!(
+            normal,
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n"
+        );
+
+        // Défense en profondeur : si un payload contenait des `\r\n` bruts,
+        // chaque ligne est préfixée par `data: ` et aucun champ `event:` ne
+        // peut être injecté.
+        let injected = format_sse_event(b"line1\r\nevent: pwned\ndata: fake");
+        assert_eq!(
+            injected,
+            b"data: line1\ndata: event: pwned\ndata: data: fake\n\n"
+        );
+    }
+
+    #[test]
+    fn extract_request_id_filters_out_invalid_id_types() {
+        assert_eq!(
+            extract_request_id(br#"{"jsonrpc":"2.0","id":42}"#),
+            serde_json::json!(42)
+        );
+        assert_eq!(
+            extract_request_id(br#"{"jsonrpc":"2.0","id":"req-1"}"#),
+            serde_json::json!("req-1")
+        );
+        // Booléen, tableau, objet ou flottant -> Null.
+        assert_eq!(
+            extract_request_id(br#"{"jsonrpc":"2.0","id":true}"#),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            extract_request_id(br#"{"jsonrpc":"2.0","id":[1]}"#),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            extract_request_id(br#"{"jsonrpc":"2.0","id":{"a":1}}"#),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            extract_request_id(br#"{"jsonrpc":"2.0","id":1.5}"#),
+            serde_json::Value::Null
+        );
+        assert_eq!(extract_request_id(b"not json"), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn respond_writes_exact_framing_for_get_and_head() {
+        let mut get_buf = Vec::new();
+        respond(&mut get_buf, "200 OK", "", "text/plain", b"ok", true, false).unwrap();
+        assert_eq!(
+            get_buf,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok"
+        );
+
+        let mut head_buf = Vec::new();
+        respond(
+            &mut head_buf,
+            "200 OK",
+            "",
+            "text/plain",
+            b"ok",
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            head_buf,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn read_line_capped_enforces_cap_crlf_utf8_and_deadline() {
+        // 1. Ligne CRLF valide dans la borne.
+        let (mut client, server) = connected_pair();
+        client.write_all(b"POST /mcp HTTP/1.1\r\n").unwrap();
+        let mut reader = BufReader::new(server);
+        let mut out = String::new();
+        let mut scratch = Vec::new();
+        let res = read_line_capped(
+            &mut reader,
+            &mut out,
+            &mut scratch,
+            64,
+            Duration::from_millis(300),
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert!(res.is_ok());
+        assert_eq!(out, "POST /mcp HTTP/1.1\r\n");
+
+        // 2. Dépassement de `cap` -> TooLong.
+        client.write_all(b"X-Long: 0123456789abcdef\r\n").unwrap();
+        let res = read_line_capped(
+            &mut reader,
+            &mut out,
+            &mut scratch,
+            10,
+            Duration::from_millis(300),
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert!(matches!(res, Err(LineFail::TooLong)));
+
+        // 3. LF nu sans CR -> Closed.
+        let (mut client, server) = connected_pair();
+        client.write_all(b"GET /health HTTP/1.1\n").unwrap();
+        let mut reader = BufReader::new(server);
+        let res = read_line_capped(
+            &mut reader,
+            &mut out,
+            &mut scratch,
+            64,
+            Duration::from_millis(300),
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert!(matches!(res, Err(LineFail::Closed)));
+
+        // 4. UTF-8 invalide -> Closed.
+        let (mut client, server) = connected_pair();
+        client.write_all(b"GET /\xff\xfe HTTP/1.1\r\n").unwrap();
+        let mut reader = BufReader::new(server);
+        let res = read_line_capped(
+            &mut reader,
+            &mut out,
+            &mut scratch,
+            64,
+            Duration::from_millis(300),
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert!(matches!(res, Err(LineFail::Closed)));
+
+        // 5. Deadline dépassée -> Slow.
+        let (_client, server) = connected_pair();
+        let mut reader = BufReader::new(server);
+        let res = read_line_capped(
+            &mut reader,
+            &mut out,
+            &mut scratch,
+            64,
+            Duration::from_secs(10),
+            Instant::now() + Duration::from_millis(40),
+        );
+        assert!(matches!(res, Err(LineFail::Slow)));
+    }
+
+    #[test]
+    fn read_body_reads_chunks_shrinks_capacity_and_rejects_truncation() {
+        let (mut client, server) = connected_pair();
+        let payload = vec![b'A'; BODY_CHUNK + 1024];
+        std::thread::spawn(move || {
+            client.write_all(&payload).unwrap();
+            client.write_all(b"short").unwrap();
+            // Tronqué pour le 3e appel (annonce 50 octets, n'envoie que 2).
+            client.write_all(b"xy").unwrap();
+        });
+
+        let mut reader = BufReader::new(server);
+        let mut body = Vec::new();
+        read_body(
+            &mut reader,
+            &mut body,
+            BODY_CHUNK + 1024,
+            Duration::from_millis(300),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(body.len(), BODY_CHUNK + 1024);
+        assert!(body.capacity() >= BODY_CHUNK + 1024);
+
+        // Appel suivant avec petit corps : la capacité excédentaire est réduite à BODY_CHUNK.
+        read_body(
+            &mut reader,
+            &mut body,
+            5,
+            Duration::from_millis(300),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(&body, b"short");
+        assert!(body.capacity() <= BODY_CHUNK);
+
+        // Corps tronqué (EOF avant `len`) -> UnexpectedEof.
+        let err = read_body(
+            &mut reader,
+            &mut body,
+            50,
+            Duration::from_millis(300),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
 }

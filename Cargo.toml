@@ -3,10 +3,10 @@ members = [".", "litemcp-macros"]
 
 [package]
 name = "litemcp"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.85"
-description = "La lib MCP (Model Context Protocol) la plus légère pour Rust : votre serveur MCP en quelques lignes. Streamable HTTP stateless uniquement (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement."
+description = "LiteMCP — la lib MCP (Model Context Protocol) la plus légère pour Rust : votre serveur MCP en quelques lignes. Streamable HTTP stateless uniquement (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DeamonDev888/litemcp"
 readme = "README.md"
@@ -15,9 +15,9 @@ categories = ["api-bindings", "network-programming", "web-programming::http-serv
 exclude = [".github", "docs"]
 
 [features]
-# Macros procédurales #[tool]/#[resource]/#[prompt] — opt-in : le cœur du
-# crate garde exactement serde + serde_json ; syn/quote ne sont que des
-# dépendances de compilation des consommateurs qui activent la feature.
+# Macros procédurales #[tool]/#[resource]/#[prompt] — zéro dépendance externe
+# (implémentées uniquement avec `proc_macro` de la bibliothèque standard,
+# sans `syn`, `quote` ni `proc-macro2`).
 macros = ["dep:litemcp-macros"]
 # Adaptateur schemars : n'importe quel type #[derive(JsonSchema)] devient un
 # schéma exécuteur (dérivation par schemars, validation par jsonschema).
@@ -26,7 +26,7 @@ schemars = ["dep:schemars", "dep:jsonschema"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-litemcp-macros = { path = "litemcp-macros", version = "0.3.0", optional = true }
+litemcp-macros = { path = "litemcp-macros", version = "0.4.0", optional = true }
 schemars = { version = "1", optional = true }
 jsonschema = { version = "0.60", default-features = false, optional = true }
 

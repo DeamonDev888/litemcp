@@ -1,14 +1,16 @@
 <div align="center">
 
-# litemcp
+# LiteMCP
 
 **La lib MCP la plus légère de l'écosystème Rust : votre serveur MCP en quelques lignes.**
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.6.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.7.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
-![crates.io](https://img.shields.io/crates/v/litemcp.svg) ![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI) ![Docs](https://img.shields.io/docsrs/litemcp)
+[![crates.io](https://img.shields.io/crates/v/litemcp.svg)](https://crates.io/crates/litemcp) [![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI)](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml) [![Docs](https://img.shields.io/docsrs/litemcp)](https://docs.rs/litemcp)
+
+📦 **Crate officiel : [crates.io/crates/litemcp](https://crates.io/crates/litemcp)** · 📖 **Docs : [docs.rs/litemcp](https://docs.rs/litemcp)**
 
 [Installation](#installation) · [Démarrage rapide](#démarrage-rapide) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/) · [Concepts](#concepts) · [Configuration](#configuration) · [Sécurité](#sécurité) · [Protocole](#protocole) · [FAQ](#faq) · [Client](#client--mcp-command-center)
 
@@ -16,9 +18,9 @@ Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro
 
 ---
 
-## Pourquoi litemcp
+## Pourquoi LiteMCP
 
-La plupart des serveurs MCP sont des **services** : un programme qui s'installe, charge un gros framework et tourne à côté de votre application. **litemcp fait l'inverse : c'est une bibliothèque Rust.** Vous écrivez quelques lignes, vous appelez `.serve()`, et un vrai serveur MCP tourne **dans** votre programme — avec les threads standards du langage, sans runtime async, sans framework HTTP. Seule dépendance pour le JSON : `serde`.
+La plupart des serveurs MCP sont des **services** : un programme qui s'installe, charge un gros framework et tourne à côté de votre application. **LiteMCP fait l'inverse : c'est une bibliothèque Rust.** Vous écrivez quelques lignes, vous appelez `.serve()`, et un vrai serveur MCP tourne **dans** votre programme — avec les threads standards du langage, sans runtime async, sans framework HTTP. Seule dépendance pour le JSON : `serde`.
 
 **Pour qui ?**
 
@@ -42,11 +44,11 @@ Les principes :
 | `+ macros` | 20 (+1) | 214 Kio (+67 Kio) |
 | `+ schemars` | 70 (+51) | **6,0 Mio** (+5,9 Mio) |
 
-*Mesuré le 2026-10-24 — Windows 11, rustc 1.99.1, release + `lto = "fat"` + `codegen-units = 1` + `strip`. Méthode : un projet consommateur externe dépendant de litemcp (un serveur, un outil), comparé avec et sans chaque feature — **la feature étant réellement utilisée**, sinon le linker élimine tout et le binaire ne change pas.*
+*Mesuré le 2026-10-24 — Windows 11, rustc 1.99.1, release + `lto = "fat"` + `codegen-units = 1` + `strip`. Méthode : un projet consommateur externe dépendant de LiteMCP (un serveur, un outil), comparé avec et sans chaque feature — **la feature étant réellement utilisée**, sinon le linker élimine tout et le binaire ne change pas.*
 
 **Le cœur est minimal par défaut.** Le build par défaut ne tire que deux dépendances : `serde` et `serde_json` — rien d'autre.
 
-- **`macros`** ajoute **une** crate (`litemcp-macros`, compilation seule : `syn`/`quote` ne sont jamais liés dans votre binaire) ;
+- **`macros`** ajoute **une** crate locale (`litemcp-macros`, **zéro dépendance externe** : implémentée uniquement avec `proc_macro` de la bibliothèque standard — ni `syn`, ni `quote`, ni `proc-macro2`) ;
 - **`schemars`** est la feature à surveiller : elle tire `schemars` + `jsonschema` et **+51 crates transitives** (`regex`, `fancy-regex`, `num`, `parking_lot`, `ahash`…). Si vous l'utilisez réellement, le binaire passe de **147 Kio à 6,0 Mio** ; si vous l'activez sans l'utiliser, le linker élimine tout et le binaire reste à 147 Kio ;
 - **Si vous voulez rester minimal**, gardez le jeu par défaut et utilisez le module `zod` intégré : il couvre le même terrain — validation, formats, défauts, dictionnaires, énumérations — **sans aucune dépendance de plus**.
 
@@ -63,6 +65,7 @@ Les principes :
 | 🦀 **Handlers typés** | arguments désérialisés dans vos structs `Deserialize` ; macro `#[tool]` (feature `macros`) qui dérive le schéma des types des paramètres |
 | 📚 **Resources & Prompts** | `resources/list`·`read`, `prompts/list`·`get` — mêmes indices de cache que `tools/list` (SEP-2549) |
 | ⏱️ **Handlers bornés** | `.tool_timeout(duration)` : un handler qui dépasse rend une erreur, la connexion n'est plus retenue indéfiniment |
+| 🩺 **Erreurs structurées & observabilité** | `ToolError` (`rate_limited`, `timeout`, `upstream`… avec `retryable`/`retryAfterMs`) + `.on_call(hook)` pour métriques et latences |
 | 🛑 **Arrêt propre** | `bound.handle()` puis `handle.shutdown()` : `serve()` rend `Ok(())`, les connexions ferment entre deux requêtes |
 | 🛡️ **Sûr par défaut** | `#![forbid(unsafe_code)]`, garde DNS-rebinding, corps limité |
 
@@ -70,12 +73,12 @@ Les principes :
 
 ```toml
 [dependencies]
-litemcp = "0.6.0"
+litemcp = "0.7.0"
 
 # pour la macro #[tool] (deps de compilation seulement) :
-# litemcp = { version = "0.6.0", features = ["macros"] }
+# litemcp = { version = "0.7.0", features = ["macros"] }
 # pour l'adaptateur schemars (#[derive(JsonSchema)] en schéma exécuteur) :
-# litemcp = { version = "0.6.0", features = ["schemars"] }
+# litemcp = { version = "0.7.0", features = ["schemars"] }
 ```
 
 Ou directement depuis GitHub :
@@ -87,7 +90,7 @@ litemcp = { git = "https://github.com/DeamonDev888/litemcp" }
 
 ## Démarrage rapide
 
-> 📖 **Envie d'être guidé ?** Le [tutoriel pas à pas](https://deamondev888.github.io/litemcp-tuto/) construit un serveur MCP complet avec litemcp — du premier outil aux schémas, ressources et prompts.
+> 📖 **Envie d'être guidé ?** Le [tutoriel pas à pas](https://deamondev888.github.io/litemcp-tuto/) construit un serveur MCP complet avec LiteMCP — du premier outil aux schémas, ressources et prompts.
 
 ```rust
 use litemcp::prelude::*;
@@ -217,7 +220,7 @@ ServerBuilder::new("calc", "1.0.0")
     .serve()?;
 ```
 
-`#[tool]` et `#[prompt]` valident les arguments via le schéma dérivé (`#[prompt]` passe par `.prompt_typed(…)`, la variante validée de `.prompt()`) ; `#[resource]` prend une fonction **sans paramètre** (`uri` requise). Types supportés : entiers, `f32`/`f64`, `bool`, `String`, `Option<T>` (champ optionnel), `Vec<T>`. Le cœur du crate reste à **2 dépendances** — `syn`/`quote` ne sont que des deps de compilation, activées seulement par la feature.
+`#[tool]` et `#[prompt]` valident les arguments via le schéma dérivé (`#[prompt]` passe par `.prompt_typed(…)`, la variante validée de `.prompt()`) ; `#[resource]` prend une fonction **sans paramètre** (`uri` requise). Types supportés : entiers, `f32`/`f64`, `bool`, `String`, `Option<T>` (champ optionnel), `Vec<T>`. Le cœur du crate reste à **2 dépendances** — et `litemcp-macros` elle-même n'a **aucune dépendance externe** (pur `proc_macro` standard, sans `syn` ni `quote`).
 
 **Valeurs par défaut** — `default(nom = valeur, …)` déclaré sur la macro (Rust interdit les attribute macros sur les paramètres). Le champ devient optionnel, la valeur est **publiée** dans l'`inputSchema` **et injectée** dans les arguments si elle est absente.
 
@@ -300,8 +303,8 @@ Métadonnées de la spec 2026-07-28, publiées dans `tools/list` : `.title()`, `
 
 ### Erreurs
 
-- **Hors schéma** → `-32602` avant exécution ; `error.data.issues` liste chaque problème (champ manquant, type, borne, champ inconnu) ;
-- **Erreur d'outil** (le handler a tourné et a échoué) → `CallToolResult::isError` — le client affiche le message ;
+- **Hors schéma** → `-32602` avant exécution ; `error.data.issues` liste chaque problème en anglais (champ manquant, type, borne, champ inconnu) ;
+- **Erreur d'outil** (`ToolError`) → `CallToolResult::isError` avec le message en texte **et** un objet machine-lisible sous `structuredContent.error` (`code`, `message`, `retryable`, `retryAfterMs` optionnel via `ToolError::rate_limited` / `timeout` / `upstream` / `invalid_input` / `unauthorized` / `not_found` / `internal`). Les erreurs texte (`String`, `&str`) restent acceptées via `?` (`From<String>` / `From<&str>`, classées `unclassified`) ;
 - **Erreur de protocole** (mauvaise requête, outil inconnu, JSON invalide) → erreur JSON-RPC typée (-32700, -32602, -32601…), rendue de façon opaque.
 
 La valeur de retour d'un outil devient `structuredContent` — un objet JSON passe tel quel ; toute autre valeur (scalaire, tableau, `null`) est enveloppée dans `{"result": …}` (**choix d'API** : `structuredContent` toujours objet, contrat simple pour les clients) — **sauf** si un `outputSchema` de racine non-objet est attaché à l'outil : la valeur brute est alors envoyée telle quelle (la spec MCP 2026-07-28 autorise toute valeur JSON dans `structuredContent`, et l'enveloppe serait elle-même non conforme au schéma publié). Une `Err(msg)` devient `isError: true` avec le message en contenu texte. Un `outputSchema` attaché via `.output_schema("outil", schéma)` valide cette sortie **avant envoi** : non conforme → résultat `isError`.
@@ -315,7 +318,10 @@ La valeur de retour d'un outil devient `structuredContent` — un objet JSON pas
 | `.read_timeout(duration)` | 30 s | timeout de lecture par opération (anti-slowloris) — un client trop lent est déconnecté sans réponse |
 | `.max_connections(n)` | 256 (par serveur) | plafond de connexions simultanées — au-delà, `503` immédiat, pas de spawn |
 | `.connection_ttl(duration)` | 5 min | durée de vie maximale d'une connexion keep-alive — borne le temps d'occupation d'un slot (sans elle, un client qui drip-feed des requêtes valides retient son slot indéfiniment) ; `0` désactive le TTL |
-| `.tool_timeout(duration)` | illimité | délai maximal d'exécution des handlers (outils, ressources, prompts) — au-delà : résultat `isError` pour un outil, `-32000` pour une ressource/prompt ; les arguments d'un `tools/call` sont clonés une fois par appel quand il est actif |
+| `.tool_timeout(duration)` | illimité | délai maximal d'exécution des handlers (outils, ressources, prompts) — au-delà : résultat `isError` (`ErrorCode::Timeout`, retentable) pour un outil, `-32000` pour une ressource/prompt ; les arguments d'un `tools/call` sont clonés une fois par appel quand il est actif |
+| `.on_call(hook)` | aucun | callback d'observabilité appelé après chaque message JSON-RPC (`CallEvent { method, name, duration, status }`) ; cumulable, paniques du hook contenues |
+| Threads de handlers (`MAX_INFLIGHT_HANDLERS`) | 256 | plafond de threads de handlers simultanés (actifs ou détachés après un timeout de `tool_timeout`) — au-delà : `rate_limited` pour un outil, `-32000` pour une ressource/prompt ; le slot n'est rendu qu'à la terminaison effective du thread |
+| Réponse JSON-RPC (`MAX_RESPONSE_BYTES`) | 16 Mio | une réponse sérialisée qui dépasse ce plafond est remplacée par `-32603` (« response size … exceeds maximum … ») — un handler ne peut pas pousser un corps illimité |
 | `bound.handle()` → `ServerHandle` | — | poignée d'arrêt cloneable : `handle.shutdown()` rend `serve()` → `Ok(())`, les connexions ferment entre deux requêtes (une lecture bloquée en cours ferme au `read_timeout`) |
 | Sonde `GET /health` | `/health` (inclus) | `200` « ok » sans JSON-RPC — probes k8s/systemd/équilibreur (`HEAD` accepté, sans corps) |
 | Corps de requête | 1 Mio | au-delà → `413` — lu **par tranches** (buffer 64 Ko) : la mémoire engagée est proportionnelle aux octets réellement reçus |
@@ -323,9 +329,9 @@ La valeur de retour d'un outil devient `structuredContent` — un objet JSON pas
 
 ## Sécurité
 
-**Modèle de menace assumé : litemcp est une bibliothèque réseau, pas un service exposé.** Quiconque peut joindre le socket peut appeler vos outils — il n'y a ni authentification ni TLS intégrés (choix architectural : voir le comparatif ViteMCP, « OAuth 2.1 intégré » est écarté volontairement). Le durcissement intégré couvre le protocole ; la périphérie est à votre charge :
+**Modèle de menace assumé : LiteMCP est une bibliothèque réseau, pas un service exposé.** Quiconque peut joindre le socket peut appeler vos outils — il n'y a ni authentification ni TLS intégrés (choix architectural : voir le comparatif ViteMCP, « OAuth 2.1 intégré » est écarté volontairement). Le durcissement intégré couvre le protocole ; la périphérie est à votre charge :
 
-- **Liaison** : bind `127.0.0.1:8080` (comme dans tous les exemples) si le serveur ne parle qu'à des processus locaux ; sinon, exposez derrière un **reverse proxy** qui apporte TLS, authentification (par ex. OAuth 2.1) et rate-limiting **par IP** — le plafond de connexions de litemcp est **global au serveur** (256 par défaut) : 256 clients lents peuvent l'occuper et renvoyer `503` aux autres, c'est à ça que sert le quota par IP du proxy (le TTL de connexion de 5 min borne par ailleurs la durée d'occupation d'un slot) ;
+- **Liaison** : bind `127.0.0.1:8080` (comme dans tous les exemples) si le serveur ne parle qu'à des processus locaux ; sinon, exposez derrière un **reverse proxy** qui apporte TLS, authentification (par ex. OAuth 2.1) et rate-limiting **par IP** — le plafond de connexions de LiteMCP est **global au serveur** (256 par défaut) : 256 clients lents peuvent l'occuper et renvoyer `503` aux autres, c'est à ça que sert le quota par IP du proxy (le TTL de connexion de 5 min borne par ailleurs la durée d'occupation d'un slot) ;
 - **Navigateurs** : garde DNS-rebinding intégrée — toute requête portant un `Origin` non listé dans `.allow_origins` est refusée (`403`), et les préflights CORS échouent par défaut (`OPTIONS` → `405`) ;
 - **Handlers bloquants** : par défaut il n'y a pas de timeout d'exécution — un handler qui bloque retient son thread et son slot de connexion. `.tool_timeout(duration)` borne la **réponse** (résultat `isError`/`-32000` passé le délai) mais ne peut pas tuer le thread du handler (Rust n'a pas d'annulation de thread) : il termine en arrière-plan et son résultat est ignoré. Pour des effets de bord annulables, encadrez vos appels lents vous-même ;
 - **Validation** : privilégiez `tool_typed`/`tool_parse` (schéma appliqué **avant** votre code) ; `tool` brut vous laisse la validation des arguments — c'est là que naissent les bugs d'injection côté handler, pas dans le transport. Le schéma publié est **exécuteur** : ce qu'il annonce est exactement ce que la validation applique.
@@ -424,7 +430,7 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 | Mémoire après 2 300 requêtes | < 10 Mo | **2,7 Mio `VmRSS`, +4 Kio pendant la charge** ✅ |
 | Démarrage in-process | < 10 ms | **~0,4 ms** ✅ |
 
-`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **154 tests** (dont fuzz proptest) est vérifiée sur les deux OS.
+`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **196 tests** (dont fuzz proptest) est vérifiée sur les deux OS.
 
 ## Comparatif — ViteMCP (TypeScript)
 
@@ -432,7 +438,7 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 
 **Résumé express :**
 
-| | litemcp | ViteMCP (TS) |
+| | LiteMCP | ViteMCP (TS) |
 |---|---|---|
 | ⚡ Temps de réponse moyen | **0,09 ms** | 1,43 ms |
 | 😰 Le pire cas (p99) | **0,18 ms** | 5,4 ms |
@@ -442,7 +448,7 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 
 Détail complet (plages, passes alternées) :
 
-| Métrique | **litemcp** | @vitemcp/server | Verdict |
+| Métrique | **LiteMCP** | @vitemcp/server | Verdict |
 |---|---|---|---|
 | keep-alive (moyenne) | **0,09–0,10 ms** | 1,43–1,73 ms | **~15–18× plus rapide** |
 | p99 keep-alive | **0,18–0,22 ms** | 5,4–5,9 ms | ~25× plus resserré |
@@ -450,13 +456,13 @@ Détail complet (plages, passes alternées) :
 | Nouvelles connexions acceptées **(connexions/seconde)** | **848–1257 connexions/s** | 354–498 connexions/s | **~2–3× plus de nouveaux clients par seconde** |
 | Mémoire après 2 300 requêtes | **5,5 Mo** (0,9 Mo privé, reste = DLL partagées) | ~417 Mo (3 processus Node : 47 + 63 + 306) | **~75× moins de mémoire** |
 
-L'écart structurel : litemcp délimite ses réponses par `Content-Length` et clôt le flux après l'événement — la connexion TCP reste proprement réutilisable ; ViteMCP répond en **SSE encadré** qu'il maintient ouvert, le client doit donc rouvrir une connexion par appel séquentiel. (Conditions : tsx/Node 24 côté TS ; les deux serveurs complétaient les mêmes requêtes JSON-RPC.)
+L'écart structurel : LiteMCP délimite ses réponses par `Content-Length` et clôt le flux après l'événement — la connexion TCP reste proprement réutilisable ; ViteMCP répond en **SSE encadré** qu'il maintient ouvert, le client doit donc rouvrir une connexion par appel séquentiel. (Conditions : tsx/Node 24 côté TS ; les deux serveurs complétaient les mêmes requêtes JSON-RPC.)
 
 ## Hébergement VPS & proxies (le piège du tamponnage SSE)
 
 Derrière beaucoup d'hébergements, un proxy (nginx, Cloudflare…) met les réponses en tampon et n'envoie les flux SSE que lorsqu'il a accumulé ~8 Ko — les événements « s'empilent ». Deux lignes de défense :
 
-- **litemcp est structuré pour ça** : son SSE est *request-scoped* — un événement, `Connection: close`, `Content-Length` explicite. Un proxy tamponne les flux *en cours* ; une réponse terminée est toujours poussée. Le symptôme ne peut pas se produire ;
+- **LiteMCP est structuré pour ça** : son SSE est *request-scoped* — un événement, `Connection: close`, `Content-Length` explicite. Un proxy tamponne les flux *en cours* ; une réponse terminée est toujours poussée. Le symptôme ne peut pas se produire ;
 - **les réponses SSE portent les en-têtes anti-tampon** `X-Accel-Buffering: no` (honoré par nginx **par réponse**, même avec `proxy_buffering on` global) et `Cache-Control: no-cache, no-transform`.
 
 Si vous contrôlez le proxy, la configuration propre :
@@ -477,7 +483,7 @@ location /mcp {
 ## Tests
 
 ```bash
-cargo test --workspace --all-features   # 154 tests : unitaires + intégration (vraies sockets) + doctests
+cargo test --workspace --all-features   # 196 tests : unitaires + intégration (vraies sockets) + doctests
 cargo clippy --workspace --all-targets --all-features -- -D warnings   # CI stricte
 cargo fmt --check                       # formatage
 ```
@@ -503,22 +509,22 @@ Le détail — jalons, SLO, risques, journal : [docs/ROADMAP.md](https://github.
 ## FAQ
 
 **Par où commencer ?**
-Par le [tutoriel pas à pas](https://deamondev888.github.io/litemcp-tuto/) — il construit un serveur MCP complet avec litemcp, du premier `#[tool]` aux schémas, ressources et prompts. Le [Démarrage rapide](#démarrage-rapide) ci-dessus suffit pour un premier serveur en dix lignes ; les [Concepts](#concepts) détaillent chaque surface ; la [doc du crate](https://docs.rs/litemcp) (docs.rs) référence aussi le tutoriel.
+Par le [tutoriel pas à pas](https://deamondev888.github.io/litemcp-tuto/) — il construit un serveur MCP complet avec LiteMCP, du premier `#[tool]` aux schémas, ressources et prompts. Le [Démarrage rapide](#démarrage-rapide) ci-dessus suffit pour un premier serveur en dix lignes ; les [Concepts](#concepts) détaillent chaque surface ; la [doc du crate](https://docs.rs/litemcp) (docs.rs) référence aussi le tutoriel.
 
 **Pourquoi un seul transport ?**
-Parce qu'un serveur lancé comme sous-processus d'un client meurt avec lui et n'accepte qu'un seul pair — c'est le modèle du client, pas de la lib. litemcp fait le choix inverse : **votre programme devient un démon Streamable HTTP stateless**, bindé sur un socket TCP, que plusieurs agents peuvent joindre, qui survit aux clients et se déploie derrière nginx. Le MCP local en sous-processus est hors périmètre, par conception.
+Parce qu'un serveur lancé comme sous-processus d'un client meurt avec lui et n'accepte qu'un seul pair — c'est le modèle du client, pas de la lib. LiteMCP fait le choix inverse : **votre programme devient un démon Streamable HTTP stateless**, bindé sur un socket TCP, que plusieurs agents peuvent joindre, qui survit aux clients et se déploie derrière nginx. Le MCP local en sous-processus est hors périmètre, par conception.
 
 **Pourquoi un module de schémas intégré ?**
 Une lib MCP sans schéma n'est qu'un routeur JSON : les clients ont besoin de l'`inputSchema` pour présenter vos outils, et vos handlers ont besoin d'arguments garantis. Le module `zod` couvre les deux — dérivation JSON Schema + validation runtime — sans dépendance de plus : il pèse moins que les bibliothèques de schémas génériques qu'on embarquerait sinon.
 
 **Pourquoi pas de tokio ?**
-Une lib MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des requêtes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions (plafond par défaut : 256). Si votre application est déjà dans un runtime async, l'avez-vous simplement dans le même processus — litemcp reste un serveur réseau, appelable en HTTP.
+Une lib MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des requêtes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions (plafond par défaut : 256). Si votre application est déjà dans un runtime async, l'avez-vous simplement dans le même processus — LiteMCP reste un serveur réseau, appelable en HTTP.
 
 **Pourquoi réécrire HTTP ?**
 Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE mono-événement. Pas de chunked entrant, pas de TLS, pas de compression. Ce choix est **tranché par les tests** : le bench maison contre le backend alternatif testé (tiny_http) montre la route maison ~1,85× plus rapide en keep-alive et 0 dépendance de plus (voir [Benchmarks](#benchmarks)) — et elle embarque son durcissement (timeouts, limites d'en-têtes, `Expect: 100-continue`).
 
 **Pourquoi pas de WebSocket ?**
-Choix architectural, pas un oubli : WS n'économiserait que le re-parsing des en-têtes HTTP (~1–2 % du trajet — JSON, syscalls et noyau réseau dominent), ne passe pas bien derrière les proxies d'hébergement, et traînerait sessions et reconnexions — les trois choses que le mode stateless évite. La spec 2026-07-28 est HTTP-only ; le keep-alive one-write de litemcp est déjà au plancher de TCP.
+Choix architectural, pas un oubli : WS n'économiserait que le re-parsing des en-têtes HTTP (~1–2 % du trajet — JSON, syscalls et noyau réseau dominent), ne passe pas bien derrière les proxies d'hébergement, et traînerait sessions et reconnexions — les trois choses que le mode stateless évite. La spec 2026-07-28 est HTTP-only ; le keep-alive one-write de LiteMCP est déjà au plancher de TCP.
 
 **Pourquoi pas de SSE longue durée ?**
 Le mode stateless n'a aucun flux ouvert : chaque POST est auto-suffisant (un événement `data:`, clôture). C'est ce choix qui immunise le transport contre le tamponnage des proxies de VPS et le rend trivial à déployer derrière nginx — voir [Hébergement VPS & proxies](#hébergement-vps--proxies-le-piège-du-tamponnage-sse). Un flux permanent (progress, notifications serveur→client) exigerait des sessions : hors périmètre, réévalué si un besoin concret l'exige.
@@ -530,10 +536,10 @@ Pacement volontaire : toute modification atterrit d'abord dans la section `[Unre
 
 Le [**MCP Command Center**](https://github.com/DeamonDev888/mcp-command-center) est un **client** : superviseur
 de serveurs MCP en Rust natif (détection multi-machines par scan et SSH, boutique, démarrage auto). Il reconnaît
-les serveurs litemcp **par fingerprint** — `initialize` répondu en 2026-07-28 sans négocier la version demandée
+les serveurs LiteMCP **par fingerprint** — `initialize` répondu en 2026-07-28 sans négocier la version demandée
 + sonde `GET /health` « ok » — affiche alors un badge dédié et supervise vos serveurs (état, outils, latence).
 
-C'est un projet **sibling** : il consomme litemcp, il n'en fait pas partie. La lib n'ajoute **aucune** dépendance
+C'est un projet **sibling** : il consomme LiteMCP, il n'en fait pas partie. La lib n'ajoute **aucune** dépendance
 ni code pour cette intégration — la reconnaissance repose uniquement sur des comportements déjà publics
 (`initialize`, `/health`).
 

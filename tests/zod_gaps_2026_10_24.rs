@@ -266,7 +266,7 @@ fn integer_enumeration_works() {
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect::<Vec<_>>()
         .join(" ");
-    assert!(rendered.contains("entier attendu"), "{rendered}");
+    assert!(rendered.contains("expected an integer"), "{rendered}");
 }
 
 #[test]
