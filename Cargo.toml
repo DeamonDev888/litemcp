@@ -3,10 +3,10 @@ members = [".", "litemcp-macros"]
 
 [package]
 name = "litemcp"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.85"
-description = "LiteMCP — la lib MCP (Model Context Protocol) la plus légère pour Rust : votre serveur MCP en quelques lignes. Streamable HTTP stateless uniquement (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement."
+description = "LiteMCP — la lib MCP la plus légère en mémoire et la plus rapide : votre serveur MCP en quelques lignes. Streamable HTTP stateless uniquement (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DeamonDev888/litemcp"
 readme = "README.md"

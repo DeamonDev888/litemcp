@@ -12,16 +12,20 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
-### Documentation — arène multi-frameworks (2026-10-25)
-
-- **Comparatif 9 serveurs MCP** dans le README, mêmes 4 outils et même client neutre : LiteMCP `0.7.0` face à `tower-mcp` 0.25, `mcp-go` 1.3, `rust-mcp-sdk` 2.0, `rmcp` 3.7, `vitemcp` 1.9.7 (SSE et JSON), `mcp` Python 2.3 et `fastmcp` 4.1.3. Résultat en keep-alive (médiane de 3 passes) : **0,075–0,091 ms** pour LiteMCP, soit ×2,1 tower-mcp, ×2,2 mcp-go, ×4,4 rust-mcp-sdk, ×5,5 rmcp, ×22–26 vitemcp, ×31 le SDK Python, ×45 FastMCP ; seuls LiteMCP, tower-mcp et mcp-go laissent la connexion réutilisable (2000/2000 contre 0/2000 pour les transports SSE) ;
-- **Deux enseignements de banc** : `rmcp` et `rust-mcp-sdk` exigent les en-têtes 2026-07-28 (`Mcp-Method`, `Mcp-Name`, `_meta`) pour un `tools/call` sans session, et **tower-mcp voit sa mémoire croître avec le volume** (5,8 Mo à froid → 144–183 Mo après ≈7 000 requêtes, reproduit deux fois) ;
-- Banc reproductible hors crate : `litemcp-it/bench_arena.sh` + `arena_aggregate.py`, serveurs de démonstration dans `mcp-bench-arena/` ;
-- **[`docs/BENCH.md`](docs/BENCH.md)** : méthode, définitions des métriques, pièges de mesure, mémoire/binaire et **portée exacte** des chiffres (ce qui est établi : meilleur des neuf mesurés ; ce qui ne l'est pas : « toutes implémentations confondues »), avec le graphique `docs/bench-arena-2026-10-25.svg`.
-
 ### Prévu (suite)
 
 - Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur.
+
+## [0.7.1] - 2026-10-25
+
+### Documentation — comparatif 9 frameworks, README recentré sur la lib
+
+- **Comparatif des 9 frameworks MCP** (campagne du 2026-10-25, même démo de 4 outils, client neutre unique, Windows 11 loopback, 3 passes) : LiteMCP `0.7.0` face à `tower-mcp` 0.25, `mcp-go` 1.3, `rust-mcp-sdk` 2.0, `rmcp` 3.7, `vitemcp` 1.9.7 (SSE et JSON), `mcp` Python 2.3 et `fastmcp` 4.1.3. En keep-alive (médiane de 3 passes) : **0,075–0,091 ms** pour LiteMCP, soit ×2,1 tower-mcp, ×2,2 mcp-go, ×4,4 rust-mcp-sdk, ×5,5 rmcp, ×22–26 vitemcp, ×31 le SDK Python, ×45 FastMCP ; seuls LiteMCP, tower-mcp et mcp-go laissent la connexion réutilisable (2000/2000 contre 0/2000 pour les transports SSE) ;
+- **README** : section bench volontairement courte (3 lignes de résultats + renvoi vers `docs/BENCH.md`), le reste du document reste centré sur la lib ; titre et description alignés sur « la lib MCP la plus légère en mémoire et la plus rapide au monde » ;
+- **[`docs/BENCH.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/BENCH.md)** : méthode, définitions des métriques, planchers de transport (TCP nu 0,060–0,067 ms · WebSocket 0,065–0,082 ms · socket local 0,032–0,037 ms · HTTP 0,075–0,091 ms), queue de distribution (p99,9 0,64–0,97 ms, max 1,03–1,17 ms) et budgets temps réel, mémoire/binaire, pièges de mesure, campagnes écartées et **portée exacte** des chiffres ; graphique `docs/bench-arena-2026-10-25.svg` ;
+- **Deux enseignements de banc** : `rmcp` et `rust-mcp-sdk` exigent les en-têtes 2026-07-28 (`Mcp-Method`, `Mcp-Name`, `_meta`) pour un `tools/call` sans session, et **tower-mcp voit sa mémoire croître avec le volume** (5,8 Mo à froid → 144–183 Mo après ≈7 000 requêtes, reproduit deux fois) ;
+- **Banc reproductible hors crate** : `litemcp-it/bench_arena.sh` + `arena_aggregate.py`, serveurs de démonstration dans `mcp-bench-arena/`, planchers dans `examples/bench_floor`, `bench_ws` et `bench_pipe` ;
+- **Paquets `.crate` officiels** attachés à chaque release GitHub, SHA-256 vérifié contre crates.io.
 
 ## [0.7.0] - 2026-10-25
 
