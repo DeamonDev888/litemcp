@@ -46,12 +46,19 @@ jobs:
 
       - name: Determiner la version
         id: ver
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          V="${{ inputs.version }}"
+          V="$VERSION_INPUT"
           if [ -z "$V" ]; then
             V=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           fi
+          # Garde anti-injection : semver strict uniquement.
+          case "$V" in
+            [0-9].[0-9].[0-9]|[0-9].[0-9].[0-9][0-9]|[0-9].[0-9][0-9].[0-9]|[0-9][0-9].[0-9].[0-9]) ;;
+            *) echo "version non semver stricte : '$V' — abandon"; exit 1;;
+          esac
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "version a publier : $V"
 
