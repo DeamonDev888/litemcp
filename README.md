@@ -12,7 +12,7 @@ Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro
 
 📦 **Crate officiel : [crates.io/crates/litemcp](https://crates.io/crates/litemcp)** · 📖 **Docs : [docs.rs/litemcp](https://docs.rs/litemcp)**
 
-[Installation](#installation) · [Démarrage rapide](#démarrage-rapide) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/) · [Concepts](#concepts) · [Configuration](#configuration) · [Sécurité](#sécurité) · [Protocole](#protocole) · [FAQ](#faq) · [Client](#client--mcp-command-center)
+[Installation](#installation) · [Démarrage rapide](#démarrage-rapide) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/) · [Stack](#stack-par-défaut-et-options) · [Concepts](#concepts) · [Configuration](#configuration) · [Sécurité](#sécurité) · [Protocole](#protocole) · [FAQ](#faq) · [Client](#client--mcp-control)
 
 </div>
 
@@ -54,6 +54,22 @@ Les principes :
 
 > Le cœur du crate reste à **2 dépendances** quoi que vous activiez : `schemars` n'est qu'un adaptateur *optionnel* pour les types `#[derive(JsonSchema)]`.
 
+## Stack par défaut et options
+
+Le tableau suivant fixe le contrat : ce qui est **toujours** là (stack par défaut) et ce qui ne l'est que si vous activez la feature Cargo correspondante (**options**).
+
+| Élément | Stack **par défaut** (aucune feature) | **Options** (features Cargo) |
+|---|---|---|
+| Sérialisation JSON | `serde` + `serde_json` — **les deux seules dépendances du cœur** | — |
+| Exécution | **zéro runtime async** : threads `std`, un par connexion | — |
+| Transport | HTTP/1.1 maison sur `std::net::TcpListener` (POST / SSE request-scoped, keep-alive) | — |
+| Sûreté mémoire | `#![forbid(unsafe_code)]` sur tout le crate | — |
+| MSRV | **1.85** (`rust-version = "1.85"`, edition 2024) | — |
+| Schémas & validation | module [`zod`](#outils--schémas-à-la-zod) intégré : dérivation JSON Schema + validation exécuteur, **sans dépendance de plus** | feature **`schemars`** : adaptateur `#[derive(JsonSchema)]` (`schemars`) + validateur `jsonschema` avec **formats appliqués** — +51 crates transitives, +5,9 Mio de binaire (mesuré ci-dessus) |
+| Macros `#[tool]` · `#[resource]` · `#[prompt]` | — (le DSL `zod` couvre le même terrain) | feature **`macros`** : ajoute `litemcp-macros`, **zéro dépendance externe** (pur `proc_macro` standard, sans `syn`/`quote`) — +1 crate, +67 Kio (mesuré ci-dessus) |
+
+Les features sont **additives** : sans aucune feature, le cœur ne compile **que** `serde` + `serde_json` — le code des options n'existe même pas au build par défaut, donc **aucun coût** (ni binaire, ni compilation, ni surface d'API). Activer une feature ne renchérit qu'elle-même (coûts mesurés dans [Le coût réel des features](#le-coût-réel-des-features)) ; les désactiver toutes restitue exactement la stack minimale du tableau. Le noyau — JSON-RPC, transport, registres, schémas `zod`, erreurs structurées, observabilité — n'a jamais besoin d'option.
+
 ## Fonctions phares
 
 | | |
@@ -81,16 +97,7 @@ litemcp = "0.7.1"
 # litemcp = { version = "0.7.1", features = ["schemars"] }
 ```
 
-Ou directement depuis GitHub :
-
-```toml
-[dependencies]
-litemcp = { git = "https://github.com/DeamonDev888/litemcp" }
-```
-
 ## Démarrage rapide
-
-> 📖 **Envie d'être guidé ?** Le [tutoriel pas à pas](https://deamondev888.github.io/litemcp-tuto/) construit un serveur MCP complet avec LiteMCP — du premier outil aux schémas, ressources et prompts.
 
 ```rust
 use litemcp::prelude::*;
@@ -125,6 +132,8 @@ curl -s http://127.0.0.1:8080/mcp \
 Ou avec MCP Inspector en mode URL : `npx @modelcontextprotocol/inspector` → `http://127.0.0.1:8080/mcp`.
 
 Un exemple complet (les trois registres d'outils + annotations) : `cargo run --example hello`.
+
+> 📖 **Envie d'être guidé ?** Le [tutoriel pas à pas](https://deamondev888.github.io/litemcp-tuto/) construit un serveur MCP complet avec LiteMCP — du premier outil aux schémas, ressources et prompts.
 
 ## Concepts
 
@@ -185,6 +194,37 @@ zod::object().field("labels", zod::record(zod::string()))
 ```
 
 `Box<S>`, `Arc<S>` et `&S` implémentent `Schema` : un **registre de schémas hétérogènes** (issus d'une config, d'une base, d'un registre dynamique) s'utilise directement, sans wrapper manuel.
+
+### Référence des combinators zod
+
+Chaque combinator du module `zod` publie une forme JSON Schema (draft 2020-12) et applique **exactement** cette sémantique à la validation — le schéma publié est exécuteur, sans dérogation :
+
+| Combinator | Publié dans l'`inputSchema` | Validation appliquée |
+|---|---|---|
+| `object().field(n, s)` | propriété `n` + `n` listé dans `required` | présent et valide, sinon issue (`arguments.n is required`) ; doublon de nom → panique de développement |
+| `object().opt(n, s)` | propriété `n`, hors `required` | absent → valide ; présent → validé par `s` |
+| `.strict()` | `"additionalProperties": false` | tout champ inconnu → issue « unknown field (strict object) » |
+| `string()` | `{"type": "string"}` | type chaîne |
+| `string().min(n)` / `.max(n)` | `minLength` / `maxLength` | longueur en **caractères** (points de code, comme JSON Schema — pas en octets) ; `min > max` → panique au démarrage |
+| `string().email()` | `format: "email"` | **appliqué** : `local@domaine` — bornes RFC 5321 (≤ 254 octets, `local` ≤ 64, labels ≤ 63 sans `-` en bord), domaine avec point, ni espaces ni caractères de contrôle |
+| `string().uuid()` | `format: "uuid"` | **appliqué** : forme canonique 8-4-4-4-12 hexadécimale |
+| `string().url()` | `format: "uri"` | **appliqué** : URL absolue `schéma://hôte…` — IPv6 entre crochets acceptée, port 1–65535, aucun espace, contrôle ou antislash |
+| `string().datetime()` | `format: "date-time"` | **appliqué** : ISO 8601 / RFC 3339 — calendrier vérifié (jours par mois, années bissextiles), fraction optionnelle, fuseau **obligatoire** (`Z` ou `±HH:MM`), seconde 60 (intercalaire) tolérée |
+| `integer()` | `{"type": "integer", "minimum": i64::MIN, "maximum": i64::MAX}` | **entier JSON syntaxique strict** : `3.0`, `1e2`, `0.0` sont refusés — la garantie documentée `as_i64()` réussit **toujours** quand le schéma passe |
+| `integer().min(n)` / `.max(n)` | `minimum` / `maximum` — **les bornes publiées sont exactement celles appliquées** | hors borne (incluse) → issue ; `min > max` → panique |
+| `number()` | `{"type": "number"}` (+ `minimum`/`maximum` si bornes) | tout nombre JSON, bornes incluses ; borne non finie (NaN/±∞) → panique (serde_json la publierait `null` et elle ne serait jamais appliquée) |
+| `boolean()` | `{"type": "boolean"}` | type booléen |
+| `enumeration(&["a", "b"])` | `{"type": "string", "enum": ["a", "b"]}` | appartenance stricte (l'issue cite les valeurs autorisées) ; liste vide ou doublon → panique |
+| `integer_enumeration(&[1, 2])` | `{"type": "integer", "enum": [1, 2]}` | idem, sur entiers |
+| `array(s).min(n)` / `.max(n)` | `{"type": "array", "items": s}` + `minItems` / `maxItems` | taille puis chaque élément validé ; chemin d'issue indexé (`arguments.list[1]`) |
+| `record(s)` | `{"type": "object", "additionalProperties": s}` | chaque **valeur** validée par `s` (clés libres) ; le chemin d'issue pointe la clé fautive (`arguments.labels.a`) ; aucune clé n'est inventée par les défauts |
+| `nullable(s)` | `{"anyOf": [s, {"type": "null"}]}` | `null` accepté ; sinon délégation à `s` — la cardinalité ne change pas (avec `.field`, le champ reste requis) |
+| `describe("…", s)` | `s` + `"description": "…"` | délégation intégrale à `s` |
+| `<tout schéma>.default(v)` | mot-clé `default: v` ; le champ **sort de `required`** | absent → `v` **injecté** dans les arguments avant le handler (récursivement : un objet imbriqué porte ses propres défauts) ; le défaut lui-même est validé — un défaut incohérent fait échouer la validation |
+
+Bornes communes : profondeur d'imbrication plafonnée (`MAX_DEPTH = 128` — issue « maximum nesting depth ») et collecteur d'issues borné (`MAX_ISSUES = 64` — au-delà, les problèmes sont comptés et résumés par « … and N more issue(s) omitted » : un tableau géant d'éléments invalides ne peut pas faire grossir la mémoire). Les paniques signalées ci-dessus sont des **erreurs de programmation**, levées à la construction du schéma (donc au démarrage) — jamais des entrées utilisateur.
+
+Hors DSL (feature `schemars`) : [`from_schemars::<T>()`](#adaptateur-schemars-feature-schemars) et `from_json_schema(document)` branchent le JSON Schema de votre choix avec la même promesse — **publié tel quel**, appliqué par le validateur `jsonschema` compilé avec les `format` **activés** (les formats inconnus restent ignorés). Seule nuance : les sémantiques sont celles du validateur JSON Schema officiel — par exemple `type: "integer"` y accepte `3.0` ; pour la garantie `as_i64()` stricte, restez sur `zod::integer()`.
 
 ### Macros `#[tool]` · `#[resource]` · `#[prompt]` (feature `macros`)
 
@@ -320,6 +360,7 @@ La valeur de retour d'un outil devient `structuredContent` — un objet JSON pas
 | `.connection_ttl(duration)` | 5 min | durée de vie maximale d'une connexion keep-alive — borne le temps d'occupation d'un slot (sans elle, un client qui drip-feed des requêtes valides retient son slot indéfiniment) ; `0` désactive le TTL |
 | `.tool_timeout(duration)` | illimité | délai maximal d'exécution des handlers (outils, ressources, prompts) — au-delà : résultat `isError` (`ErrorCode::Timeout`, retentable) pour un outil, `-32000` pour une ressource/prompt ; les arguments d'un `tools/call` sont clonés une fois par appel quand il est actif |
 | `.on_call(hook)` | aucun | callback d'observabilité appelé après chaque message JSON-RPC (`CallEvent { method, name, duration, status }`) ; cumulable, paniques du hook contenues |
+| `.announce()` | désactivée | publie une annonce JSON dans le dossier temporaire partagé (`%TEMP%/litemcp-registry/<nom>.json`) au bind réussi — port effectif, PID, exe, args, cwd, ts — retirée à la fin de vie du serveur ; intégration native avec le [MCP Control](#client--mcp-control) (voir ce qui suit) |
 | Threads de handlers (`MAX_INFLIGHT_HANDLERS`) | 256 | plafond de threads de handlers simultanés (actifs ou détachés après un timeout de `tool_timeout`) — au-delà : `rate_limited` pour un outil, `-32000` pour une ressource/prompt ; le slot n'est rendu qu'à la terminaison effective du thread |
 | Réponse JSON-RPC (`MAX_RESPONSE_BYTES`) | 16 Mio | une réponse sérialisée qui dépasse ce plafond est remplacée par `-32603` (« response size … exceeds maximum … ») — un handler ne peut pas pousser un corps illimité |
 | `bound.handle()` → `ServerHandle` | — | poignée d'arrêt cloneable : `handle.shutdown()` rend `serve()` → `Ok(())`, les connexions ferment entre deux requêtes (une lecture bloquée en cours ferme au `read_timeout`) |
@@ -503,7 +544,7 @@ cargo fmt --check                       # formatage
 
 ## Journal des versions
 
-L'historique complet et détaillé vit dans [CHANGELOG.md](CHANGELOG.md) — section **[Unreleased]** en tête : chaque modification y est consignée au fil de l'eau, et une version n'est coupée que pour un lot cohérent (voir la [politique de versioning](CHANGELOG.md#politique-de-versioning)).
+L'historique complet et détaillé vit dans [CHANGELOG.md](CHANGELOG.md) — section **[Unreleased]** en tête : chaque modification y est consignée au fil de l'eau, et une version n'est coupée que pour un lot cohérent (voir la [politique de versioning](CHANGELOG.md#politique-de-versioning)). Le pipeline de publication (crates.io, tag `vX.Y.Z`, release GitHub) est documenté dans [`docs/RELEASE.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/RELEASE.md).
 
 ## Feuille de route
 
@@ -545,12 +586,14 @@ Le mode stateless n'a aucun flux ouvert : chaque POST est auto-suffisant (un év
 **Comment sont choisies les versions ?**
 Pacement volontaire : toute modification atterrit d'abord dans la section `[Unreleased]` du [CHANGELOG](CHANGELOG.md) ; une version n'est coupée que pour un lot cohérent (fonction, correctif, doc majeure). Le `0.x` court jusqu'à la conformance officielle MCP verte ; la mention « 1.0 » attend ce jalon.
 
-## Client — MCP Command Center
+## Client — MCP Control
 
-Le [**MCP Command Center**](https://github.com/DeamonDev888/mcp-command-center) est un **client** : superviseur
+Le [**MCP Control**](https://github.com/DeamonDev888/mcp-control) est un **client** : superviseur
 de serveurs MCP en Rust natif (détection multi-machines par scan et SSH, boutique, démarrage auto). Il reconnaît
 les serveurs LiteMCP **par fingerprint** — `initialize` répondu en 2026-07-28 sans négocier la version demandée
 + sonde `GET /health` « ok » — affiche alors un badge dédié et supervise vos serveurs (état, outils, latence).
+
+**Intégration native (opt-in)** — `.announce()` sur le builder : au bind réussi, le serveur écrit une annonce JSON dans le dossier temporaire partagé (`%TEMP%/litemcp-registry/<nom>.json`, sinon `$TMPDIR` ou `/tmp`) — `{ name, version, port, pid, exe, args, cwd, ts }` : le **port effectif** du listener (connu même après un bind sur le port 0), le PID et la ligne de commande. MCP Control peut alors démarrer, arrêter et relancer vos serveurs nativement, sans scan de ports ni saisie manuelle. L'annonce est **retirée à la fin de vie du serveur** — arrêt gracieux ou simple `drop` après `bind` sans `serve()` — et seulement si le couple `pid`/`port` du fichier est celui de l'instance appelante : une instance plus récente du même nom ne peut pas être effacée par une ancienne. Durcissements intégrés : nom de fichier sûr (`:`/`/`/`\`/`..` refusés — sous Windows `C:x` remplacerait la base du chemin et `nom:flux` écrirait un flux NTFS alternatif), écriture **atomique** (fichier temporaire créé exclusivement puis `rename` — jamais de JSON partiel lu, jamais d'écrasement à travers un symlink planté dans un dossier partagé), permissions `0600` sous Unix. Toute défaillance est silencieuse : l'annonce est une commodité d'intégration, jamais une condition de fonctionnement du serveur — et zéro coût tant que `.announce()` n'est pas appelé.
 
 C'est un projet **sibling** : il consomme LiteMCP, il n'en fait pas partie. La lib n'ajoute **aucune** dépendance
 ni code pour cette intégration — la reconnaissance repose uniquement sur des comportements déjà publics

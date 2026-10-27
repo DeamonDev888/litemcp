@@ -280,6 +280,67 @@ fn mcp_routing_headers_enforce_exact_case_and_reject_unexpected_or_empty_names()
     assert_eq!(executed.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn notification_with_incoherent_mcp_headers_is_silently_dropped() {
+    // JSON-RPC 2.0 §4 : JAMAIS de réponse à une notification. Une notification
+    // portant des en-têtes de routage incohérents doit donc être laissée
+    // tomber (`202`, corps vide) — pas d'erreur `-32020` sur le fil, qui
+    // ferait du serveur un émetteur de réponse sans `id` de requête. Le refus
+    // reste visible des hooks d'observation.
+    let (addr, executed) = spawn_audit_server();
+    let body = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    for headers in [
+        "Mcp-Method: tools/call\r\n", // méthode incohérente
+        "Mcp-Method: \r\n",           // méthode vide
+        "Mcp-Name: admin_action\r\n", // nom sur une méthode sans nom
+    ] {
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, head, resp) = raw_exchange(addr, req.as_bytes());
+        assert_eq!(
+            status, 202,
+            "notification incohérente ({headers:?}) : 202 sans corps attendu"
+        );
+        assert!(
+            resp.is_empty(),
+            "aucune réponse JSON-RPC attendue : {resp:?}"
+        );
+        assert!(
+            !head.contains("jsonrpc"),
+            "pas d'erreur JSON-RPC sur le fil"
+        );
+    }
+    assert_eq!(
+        executed.load(Ordering::SeqCst),
+        0,
+        "aucun outil ne doit avoir été exécuté"
+    );
+
+    // Frontière notification / requête : `id: null` **explicite** est une
+    // requête à réponse obligatoire (pas une notification) — l'incohérence
+    // d'en-tête y donne bien `-32020`, rendue avec `id: null`.
+    let body_null = r#"{"jsonrpc":"2.0","id":null,"method":"notifications/initialized"}"#;
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nMcp-Method: tools/call\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_null}",
+        body_null.len()
+    );
+    let (status, _, resp) = raw_exchange(addr, req.as_bytes());
+    assert_eq!(
+        status, 200,
+        "`id: null` explicite = requête : réponse attendue"
+    );
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["id"], Value::Null);
+    assert_eq!(v["error"]["code"], -32020, "{v}");
+    assert_eq!(
+        executed.load(Ordering::SeqCst),
+        0,
+        "l'outil nommé par l'en-tête ne doit pas être exécuté"
+    );
+}
+
 // ============================================================================
 // 5. P1 — `Expect` (RFC 9110 §10.1.1 : 417 Expectation Failed & pas de 100 en HTTP/1.0)
 // ============================================================================

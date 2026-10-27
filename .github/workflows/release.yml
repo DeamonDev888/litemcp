@@ -1,0 +1,179 @@
+# Release — pipeline canonique de publication d'une version.
+#
+# Déclenché par le push d'un tag `v*` (et manuellement). Trois jobs
+# séquentiels :
+#   1. `verify` — fmt, clippy strict (-D warnings), tests et doc sur toutes
+#      les features : rien ne part tant que la suite n'est pas verte ;
+#   2. `publish` — publication crates.io IDEMPOTENTE (vérification crates.io
+#      avant chaque `cargo publish`) : `litemcp-macros` d'abord, puis
+#      `litemcp` (dépendance versionnée — voir docs/RELEASE.md) ;
+#   3. `github-release` — release GitHub dont le corps est extrait de la
+#      section `## [X.Y.Z]` du CHANGELOG.md.
+#
+# Chevauchement avec `publish.yml` (déclencheur `tags: v*` commun) : les deux
+# workflows partagent le groupe de concurrence `publication` (runs sérialisés)
+# et la publication est idempotente — le premier arrivé publie, le second
+# constate la version déjà en ligne et saute ; jamais de double publication.
+# Détail et séquence manuelle : docs/RELEASE.md.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version a publier (ex. 0.7.2) — vide : le tag courant, sinon Cargo.toml'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+# Même groupe que `publish.yml` : les runs des deux workflows de publication
+# sont sérialisés — combiné à l'idempotence, cela écarte toute publication
+# en double d'une même version.
+concurrency:
+  group: publication
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verifier (fmt, clippy, tests, doc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --all-features
+      - name: Doc
+        run: cargo doc --no-deps --all-features
+
+  publish:
+    name: Publier sur crates.io
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Rust (toolchain stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Determiner la version
+        id: ver
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          V="$VERSION_INPUT"
+          # Push d'un tag `vX.Y.Z` : la version vient du tag.
+          if [ -z "$V" ] && [ "${GITHUB_REF_TYPE:-branch}" = "tag" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          # Dispatch sans input ni tag : version du Cargo.toml.
+          if [ -z "$V" ]; then
+            V=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          fi
+          # Garde anti-injection : semver strict uniquement (meme garde que
+          # publish.yml).
+          case "$V" in
+            [0-9].[0-9].[0-9]|[0-9].[0-9].[0-9][0-9]|[0-9].[0-9][0-9].[0-9]|[0-9][0-9].[0-9].[0-9]) ;;
+            *) echo "version non semver stricte : '$V' — abandon"; exit 1;;
+          esac
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "version a publier : $V"
+
+      - name: Verifier que la version n'existe pas deja sur crates.io
+        id: existe
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          if curl -sf -A "litemcp-release (https://github.com/DeamonDev888/litemcp)" \
+             "https://crates.io/api/v1/crates/litemcp/$V" >/dev/null 2>&1; then
+            echo "deja=true" >> "$GITHUB_OUTPUT"
+            echo "litemcp $V est deja publiee — publication ignoree"
+          else
+            echo "deja=false" >> "$GITHUB_OUTPUT"
+            echo "litemcp $V n'est pas encore publiee"
+          fi
+
+      - name: Publier litemcp-macros (si necessaire)
+        if: steps.existe.outputs.deja == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          MV=$(sed -n 's/^version = "\(.*\)"$/\1/p' litemcp-macros/Cargo.toml | head -1)
+          if curl -sf -A "litemcp-release (https://github.com/DeamonDev888/litemcp)" \
+             "https://crates.io/api/v1/crates/litemcp-macros/$MV" >/dev/null 2>&1; then
+            echo "litemcp-macros $MV est deja publiee sur crates.io"
+          else
+            cargo publish -p litemcp-macros
+            for i in $(seq 1 18); do
+              if curl -sf -A "litemcp-release (https://github.com/DeamonDev888/litemcp)" \
+                 "https://crates.io/api/v1/crates/litemcp-macros/$MV" >/dev/null 2>&1; then
+                echo "litemcp-macros $MV est en ligne sur crates.io"
+                break
+              fi
+              echo "crates.io n'a pas encore indexe litemcp-macros $MV — tentative $i/18…"
+              sleep 10
+            done
+          fi
+
+      - name: Publier litemcp (si necessaire)
+        if: steps.existe.outputs.deja == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          cargo publish -p litemcp
+          echo "litemcp ${{ steps.ver.outputs.version }} publiee sur crates.io"
+
+  github-release:
+    name: Release GitHub
+    # Uniquement sur un push de tag : un dispatch manuel verifie et publie,
+    # mais ne cree pas de release (aucun tag a rattacher — eviter de creer
+    # un tag sur le commit d'une branche par surprise).
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extraire le corps depuis le CHANGELOG
+        id: corps
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#v}"
+          FICHIER=$(mktemp)
+          # Section `## [X.Y.Z]` (prefixe exact, le `]` evite 0.7 vs 0.7.1)
+          # jusqu'au prochain titre `## `.
+          if awk -v cible="## [$V]" \
+            'index($0, cible) == 1 {dans=1; next} dans && /^## / {exit} dans {print}' \
+            CHANGELOG.md > "$FICHIER" && [ -s "$FICHIER" ]; then
+            echo "section CHANGELOG trouvee pour [$V]"
+          else
+            echo "section [$V] absente du CHANGELOG.md — corps de repli" >&2
+            printf 'Version %s — voir [CHANGELOG.md](https://github.com/%s/blob/main/CHANGELOG.md).\n' \
+              "$V" "$GITHUB_REPOSITORY" > "$FICHIER"
+          fi
+          echo "path=$FICHIER" >> "$GITHUB_OUTPUT"
+
+      - name: Creer la release GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: LiteMCP ${{ github.ref_name }}
+          body_path: ${{ steps.corps.outputs.path }}
+          draft: false
+          prerelease: false

@@ -350,7 +350,11 @@ impl ServerCore {
     /// `Mcp-Method` / `Mcp-Name` sont **optionnels** chez nous (compatibilité
     /// avec les clients qui les n'envoient pas) mais s'ils sont présents ils
     /// doivent correspondre à la méthode et à l'outil du corps — sinon un
-    /// gateway qui route sur ces en-têtes désynchronise le routage.
+    /// gateway qui route sur ces en-têtes désynchronise le routage. Une
+    /// **requête** incohérente reçoit `-32020` ; une **notification**
+    /// incohérente ne reçoit rien (JSON-RPC 2.0 §4 : jamais de réponse à une
+    /// notification) — le refus n'est visible que par les hooks
+    /// [`ServerBuilder::on_call`](crate::server::ServerBuilder::on_call).
     pub fn dispatch_with_headers(
         &self,
         body: &[u8],
@@ -395,52 +399,62 @@ impl ServerCore {
         // sinon `tools/call` arriver comme `ping`, `ADMIN_TOOL` contourner
         // une règle sur `admin_tool`, ou `Mcp-Name` passer sur une méthode
         // sans nom (`resources/read`, `tools/list`…).
+        //
+        // L'incohérence est calculée d'abord, traitée ensuite : une
+        // **notification** (pas d'`id`) ne reçoit pas de réponse ici (JSON-RPC
+        // 2.0 §4 — hors le refus explicite des notifications d'action, assumé
+        // plus bas) : son rejet est seulement signalé aux hooks d'observation,
+        // puis le message est laissé tomber (le transport répond `202`). Une
+        // requête, elle, reçoit l'erreur `-32020`.
+        let mut header_mismatch: Option<ErrorObject> = None;
         if let Some(headers) = headers {
             if let Some(header_method) = &headers.method {
                 if header_method.is_empty() || header_method != &incoming.method {
-                    return Some(self.protocol_failure(
-                        &id,
-                        &incoming,
-                        name,
-                        started,
-                        ErrorObject::with_data(
-                            ErrorObject::HEADER_MISMATCH,
-                            "Mcp-Method header does not match the request body",
-                            json!({
-                                "header": header_method,
-                                "body": incoming.method,
-                            }),
-                        ),
+                    header_mismatch = Some(ErrorObject::with_data(
+                        ErrorObject::HEADER_MISMATCH,
+                        "Mcp-Method header does not match the request body",
+                        json!({
+                            "header": header_method,
+                            "body": incoming.method,
+                        }),
                     ));
                 }
             }
-            if let Some(header_name) = &headers.name {
-                let body_name = params.get("name").and_then(Value::as_str).unwrap_or("");
-                let expects_name = matches!(
-                    incoming.method.as_str(),
-                    protocol::method::TOOLS_CALL | protocol::method::PROMPTS_GET
-                );
-                if !expects_name
-                    || header_name.is_empty()
-                    || body_name.is_empty()
-                    || header_name != body_name
-                {
-                    return Some(self.protocol_failure(
-                        &id,
-                        &incoming,
-                        name,
-                        started,
-                        ErrorObject::with_data(
+            if header_mismatch.is_none() {
+                if let Some(header_name) = &headers.name {
+                    let body_name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                    let expects_name = matches!(
+                        incoming.method.as_str(),
+                        protocol::method::TOOLS_CALL | protocol::method::PROMPTS_GET
+                    );
+                    if !expects_name
+                        || header_name.is_empty()
+                        || body_name.is_empty()
+                        || header_name != body_name
+                    {
+                        header_mismatch = Some(ErrorObject::with_data(
                             ErrorObject::HEADER_MISMATCH,
                             "Mcp-Name header does not match the request body",
                             json!({
                                 "header": header_name,
                                 "body": body_name,
                             }),
-                        ),
-                    ));
+                        ));
+                    }
                 }
             }
+        }
+        if let Some(error) = header_mismatch {
+            if incoming.is_notification() {
+                self.emit_call(
+                    &incoming.method,
+                    name,
+                    started.elapsed(),
+                    CallStatus::ProtocolError(ErrorObject::HEADER_MISMATCH),
+                );
+                return None;
+            }
+            return Some(self.protocol_failure(&id, &incoming, name, started, error));
         }
 
         if incoming.is_notification() {
@@ -1282,6 +1296,8 @@ pub struct ServerBuilder {
     prompts: BTreeMap<String, PromptDef>,
     /// Hooks d'observation enregistrés par [`Self::on_call`].
     hooks: Vec<Arc<CallHook>>,
+    /// Annonce au MCP Control (voir [`Self::announce`]).
+    announce: bool,
 }
 
 impl ServerBuilder {
@@ -1303,7 +1319,21 @@ impl ServerBuilder {
             connection_ttl: crate::http::CONNECTION_TTL,
             tool_timeout: None,
             hooks: Vec::new(),
+            announce: false,
         }
+    }
+
+    /// Annonce ce serveur au MCP Control : au bind réussi, un JSON
+    /// (`%TEMP%/litemcp-registry/<nom>.json`) publie le port effectif, le PID
+    /// et la ligne de commande du process — MCP Control peut alors le démarrer,
+    /// l'arrêter et le relancer nativement, sans scan de ports ni saisie
+    /// manuelle. L'annonce est retirée à la fin de vie du serveur lié —
+    /// arrêt gracieux **ou** `drop` sans `serve()` (voir le `Drop` de
+    /// `BoundServer`). Opt-in, zéro coût quand il n'est pas appelé.
+    #[must_use]
+    pub fn announce(mut self) -> Self {
+        self.announce = true;
+        self
     }
 
     /// Hook d'**observabilité** : un callback appelé après le traitement
@@ -1693,6 +1723,23 @@ impl ServerBuilder {
         self
     }
 
+    /// Fusionne dans `tools` les annotations et schémas de sortie **en
+    /// attente** — déclarés avant l'enregistrement de l'outil, ou liés à un
+    /// outil réenregistré — et recalcule la forme du `structuredContent`
+    /// associée (elle dépend du schéma de sortie). Utilisé par
+    /// [`Self::core`] et [`Self::bind`].
+    fn merge_pending(&self, tools: &mut BTreeMap<String, ToolDef>) {
+        for (name, def) in tools.iter_mut() {
+            if let Some(annotations) = self.annotations.get(name) {
+                def.annotations = Some(annotations.clone());
+            }
+            if let Some(output) = self.output_schemas.get(name) {
+                def.output_schema = Some(Arc::clone(output));
+            }
+            def.sync_output_shape();
+        }
+    }
+
     /// Construit le cœur de dispatch (tests, intégrations custom).
     ///
     /// **Instantané** : le cœur capture les outils présents à cet instant.
@@ -1701,19 +1748,7 @@ impl ServerBuilder {
     #[must_use]
     pub fn core(&self) -> ServerCore {
         let mut tools = self.tools.clone();
-        // Fusionne les annotations et schémas de sortie en attente sur les
-        // outils déjà présents.
-        for (name, def) in tools.iter_mut() {
-            if let Some(annotations) = self.annotations.get(name) {
-                def.annotations = Some(annotations.clone());
-            }
-            if let Some(output) = self.output_schemas.get(name) {
-                def.output_schema = Some(Arc::clone(output));
-            }
-            // La forme du `structuredContent` dépend du schéma de sortie :
-            // elle doit être recalculée après la fusion tardive.
-            def.sync_output_shape();
-        }
+        self.merge_pending(&mut tools);
         let meta = json!({
             protocol::META_SERVER_INFO: ServerInfo {
                 name: self.name.clone(),
@@ -1746,7 +1781,7 @@ impl ServerBuilder {
     /// La route est validée ici (voir [`ServerBuilder::route`]) : une route
     /// qui ne peut jamais matcher ou qui masque la sonde de vie est refusée
     /// en `InvalidInput` plutôt que de démarrer un serveur injoignable.
-    pub fn bind(self, addr: &str) -> std::io::Result<crate::http::BoundServer> {
+    pub fn bind(mut self, addr: &str) -> std::io::Result<crate::http::BoundServer> {
         if !self.route.starts_with('/')
             || self.route.contains(['?', '#'])
             || self
@@ -1773,20 +1808,24 @@ impl ServerBuilder {
             ));
         }
         let listener = std::net::TcpListener::bind(addr)?;
-        let mut tools = self.tools;
+        // Annonce MCP Control : le listener est lié — le port effectif est
+        // connu même après un bind sur le port 0. Un échec d'écriture est
+        // silencieux (commodité d'intégration, jamais une condition).
+        let mut announce_name = None;
+        if self.announce {
+            let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+            if port != 0 {
+                crate::registry::announce(&self.name, &self.version, port);
+                announce_name = Some((self.name.clone(), port));
+            }
+        }
+        // `mem::take` plutôt qu'un move direct : `merge_pending` emprunte
+        // `self` (annotations en attente) — un move partiel de `self.tools`
+        // rendrait ce prêt illégal. Le builder n'est plus utilisé ensuite.
+        let mut tools = std::mem::take(&mut self.tools);
         // Fusionne les annotations et schémas de sortie en attente (outil
         // annoté avant d'être enregistré, ou réenregistré plus tard).
-        for (name, def) in tools.iter_mut() {
-            if let Some(annotations) = self.annotations.get(name) {
-                def.annotations = Some(annotations.clone());
-            }
-            if let Some(output) = self.output_schemas.get(name) {
-                def.output_schema = Some(Arc::clone(output));
-            }
-            // La forme du `structuredContent` dépend du schéma de sortie :
-            // elle doit être recalculée après la fusion tardive.
-            def.sync_output_shape();
-        }
+        self.merge_pending(&mut tools);
         let meta = json!({
             protocol::META_SERVER_INFO: ServerInfo {
                 name: self.name.clone(),
@@ -1823,6 +1862,7 @@ impl ServerBuilder {
             live_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             refusals_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            announce_name,
         })
     }
 }

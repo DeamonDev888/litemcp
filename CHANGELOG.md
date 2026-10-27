@@ -12,6 +12,17 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
+### Ajouté
+
+- **Intégration MCP Control — `ServerBuilder::announce()` (opt-in) et module `litemcp::registry`** : au bind réussi, le serveur publie une annonce JSON dans le dossier temporaire partagé (`%TEMP%/litemcp-registry/<nom>.json`, sinon `$TMPDIR` ou `/tmp`) : `{ name, version, port, pid, exe, args, cwd, ts }` — **port effectif** du listener (connu même après un bind sur le port 0), PID, exécutable et ligne de commande. Le client [MCP Control](https://github.com/DeamonDev888/mcp-control) peut alors démarrer, arrêter et relancer les serveurs LiteMCP nativement, sans scan de ports ni saisie manuelle. L'annonce vit dans le `Drop` de `BoundServer` : elle est retirée à l'arrêt gracieux **comme** après un simple `drop` d'un serveur lié jamais servi — tout chemin de fin de vie nettoie. Opt-in strict : sans `.announce()`, zéro code exécuté et zéro coût ;
+- **Durcissements d'audit de l'annonce** : noms dangereux refusés (vide, `..`, séparateurs `/` et `\` **et `:`** — sous Windows, `PathBuf::join("C:nom.json")` remplace la base du chemin et `nom:flux` écrirait un flux NTFS alternatif : l'annonce sortirait du dossier de registre) ; écriture **atomique** — fichier temporaire créé **exclusivement** (`create_new`) puis `fs::rename`, qui remplace la destination **sans la suivre** (un symlink planté dans ce dossier partagé ne détourne jamais l'écriture, et aucun lecteur ne voit jamais un JSON partiel) ; permissions **`0600` sous Unix** (le contenu publie exe/argv/cwd) ; retrait **conditionné au couple `(pid, port)`** — `retract` ne supprime le fichier que si le `pid` **et** le `port` qu'il porte sont ceux de l'instance appelante : une instance plus récente du même nom (autre process ou autre port) survit à l'arrêt d'une ancienne, et un fichier illisible ou corrompu est laissé au jugement de la sonde de vie du lecteur ;
+- **Erreur de compilation explicite des macros sur fonction générique** : `#[tool]` / `#[prompt]` appliqués à une `fn` générique (`fn f<T>(…)`) rendent désormais un diagnostic qui nomme la cause, au lieu du message générique « type non supporté » portant sur le paramètre dérivé du type générique.
+
+### Corrigé
+
+- **Conformité JSON-RPC 2.0 §4 — une notification ne reçoit jamais de réponse** : une notification (sans `id`) dont `Mcp-Method` / `Mcp-Name` contredit le corps recevait une erreur `-32020` en réponse (effet du contrôle d'en-têtes passé avant le retour anticipé des notifications en 0.7.1). Elle est désormais traitée comme toute notification : **aucune réponse** (silence, `202` sans corps) — l'observation via le hook `on_call` reste émise ;
+- **Conformité RFC 9110 §12.5.1 — `q=0.0000…` reconnu comme poids nul** : la négociation `Accept` ne reconnaissait `q=0` qu'avec au plus trois décimales (`0`, `0.0`, `0.00`, `0.000`) — `q=0.0000` (et au-delà) était lu comme un poids **non nul**, laissant acceptable un type de média que le client avait expressément désactivé. Toute suite de décimales zéro est désormais reconnue comme poids nul.
+
 ### Prévu (suite)
 
 - Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur.

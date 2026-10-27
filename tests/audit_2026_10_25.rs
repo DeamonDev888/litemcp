@@ -583,19 +583,59 @@ fn mcp_routing_headers_are_enforced_on_notifications_and_missing_body_name() {
     let v: serde_json::Value = serde_json::from_slice(&reply).unwrap();
     assert_eq!(v["error"]["code"], -32020, "{v}");
 
-    // Mcp-Method incohérent sur une notification -> -32020 (pas ignoré en 202).
+    // Mcp-Method incohérent sur une notification -> AUCUNE réponse (None,
+    // transport 202). Audit 2026-10-26 : l'ancien comportement répondait
+    // -32020, mais JSON-RPC 2.0 §4 interdit de répondre à une notification —
+    // le refus n'est plus visible que des hooks d'observation.
     let bad_method = litemcp::server::McpHeaders {
         method: Some("ping".to_string()),
         name: None,
     };
-    let reply = core
-        .dispatch_with_headers(
-            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-            Some(&bad_method),
+    let reply = core.dispatch_with_headers(
+        br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        Some(&bad_method),
+    );
+    assert!(
+        reply.is_none(),
+        "une notification ne doit jamais recevoir de réponse : {:?}",
+        reply.map(|b| String::from_utf8_lossy(&b).to_string())
+    );
+}
+
+#[test]
+fn notification_incoherent_emits_one_hook_event_and_no_reply() {
+    // Le refus d'une notification aux en-têtes incohérents n'est visible
+    // que des hooks : exactement UN événement, `ProtocolError(-32020)`,
+    // et aucune réponse sur le fil.
+    let events: std::sync::Arc<Mutex<Vec<(String, litemcp::CallStatus)>>> =
+        std::sync::Arc::new(Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&events);
+    let core = ServerBuilder::new("t", "0.1.0")
+        .tool("ok", "ok", |_| Ok(json!({})))
+        .on_call(move |event| {
+            sink.lock()
+                .unwrap()
+                .push((event.method.to_string(), event.status));
+        })
+        .core();
+    let bad_method = litemcp::server::McpHeaders {
+        method: Some("ping".to_string()),
+        name: None,
+    };
+    let reply = core.dispatch_with_headers(
+        br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        Some(&bad_method),
+    );
+    assert!(reply.is_none(), "aucune réponse à une notification");
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1, "un seul événement attendu : {events:?}");
+    assert_eq!(
+        events[0],
+        (
+            "notifications/initialized".to_string(),
+            litemcp::CallStatus::ProtocolError(-32020)
         )
-        .expect("erreur -32020 attendue");
-    let v: serde_json::Value = serde_json::from_slice(&reply).unwrap();
-    assert_eq!(v["error"]["code"], -32020, "{v}");
+    );
 }
 
 #[test]

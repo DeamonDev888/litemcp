@@ -148,6 +148,13 @@ pub struct BoundServer {
     /// Demande d'arrêt (voir [`BoundServer::handle`]) — la boucle d'accept
     /// et les boucles keep-alive la consultent entre deux requêtes.
     pub(crate) shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Annonce au MCP Control : `(nom, port)` quand
+    /// [`crate::ServerBuilder::announce`] a été appelé, `None` sinon. Présent
+    /// ⇒ l'écriture de l'annonce a été **tentée** au bind ; le `Drop` de
+    /// [`BoundServer`] tente le retrait correspondant (no-op si rien n'avait
+    /// été écrit — le retrait ne part que si le `(pid, port)` du fichier
+    /// correspond).
+    pub(crate) announce_name: Option<(String, u16)>,
 }
 
 impl BoundServer {
@@ -209,8 +216,20 @@ impl BoundServer {
     /// limite de `max_connections` (défaut [`MAX_CONNECTIONS`]).
     ///
     /// Rend `Ok(())` quand [`BoundServer::handle`]/`ServerHandle::shutdown`
-    /// est appelé — c'est le seul retour anticipé volontaire.
+    /// est appelé — c'est le seul retour anticipé volontaire. À la fin de vie
+    /// du serveur lié (arrêt gracieux **ou** `drop` sans `serve()`), le `Drop`
+    /// retire l'annonce MCP Control (si [`crate::ServerBuilder::announce`]) :
+    /// un moteur MCP Control ne voit plus un process arrêté proprement.
     pub fn serve(self) -> std::io::Result<()> {
+        // Le retrait de l'annonce est assuré par `Drop for BoundServer`,
+        // déclenché quand le `self` consommé ici finit de vivre — ce qui
+        // couvre aussi un `BoundServer` lié puis droppé sans `serve()`.
+        self.serve_loop()
+    }
+
+    /// Boucle d'accept — corps de [`Self::serve`], qui ne fait plus que la
+    /// déléguer (le retrait d'annonce vit dans le `Drop`).
+    fn serve_loop(self) -> std::io::Result<()> {
         for stream in self.listener.incoming() {
             // Arrêt demandé : la socket de réveil (ou une connexion en
             // attente) est abandonnée ici — le listener se ferme au retour,
@@ -294,7 +313,7 @@ impl BoundServer {
                 // `shutdown_gracefully`) — utilisé seulement si le thread n'a
                 // pas pu être créé.
                 let _ = respond(
-                    &mut &stream,
+                    &mut stream,
                     "503 Service Unavailable",
                     "",
                     "application/json",
@@ -346,7 +365,7 @@ impl BoundServer {
                 // garde de la closure n'a jamais vécu : on libère le plafond ici.
                 self.live_connections.fetch_sub(1, Ordering::Relaxed);
                 let _ = respond(
-                    &mut &stream,
+                    &mut stream,
                     "503 Service Unavailable",
                     "",
                     "application/json",
@@ -360,6 +379,22 @@ impl BoundServer {
             }
         }
         Ok(())
+    }
+}
+
+/// Fin de vie d'un serveur lié : retrait de l'annonce MCP Control.
+///
+/// Le retrait vit dans le `Drop` plutôt que dans [`BoundServer::serve`] pour
+/// couvrir **tous** les chemins de fin de vie : arrêt gracieux (`serve`
+/// consomme `self`), serveur lié jamais servi (bind puis drop — sinon
+/// l'annonce resterait, affirmant un serveur vivant), abandon du builder
+/// après un bind partiel. Un arrêt brutal (kill) ne passe pas par ici : le
+/// fichier reste, et le lecteur (MCP Control) tranche avec sa sonde de vie.
+impl Drop for BoundServer {
+    fn drop(&mut self) {
+        if let Some((name, port)) = self.announce_name.take() {
+            crate::registry::retract(&name, port);
+        }
     }
 }
 
@@ -1798,8 +1833,23 @@ fn header_has_media_type(value: &str, media_type: &str) -> bool {
     })
 }
 
+/// Vrai si la valeur de poids `q` désigne **zéro**.
+///
+/// RFC 9110 §12.5.1 : `qvalue = "0" [ "." 1*3DIGIT ]`. On reconnaît comme
+/// nul toute valeur dont les décimales sont **toutes** des zéros — y compris
+/// au-delà des trois chiffres valides (`0.0000`, syntaxiquement malformé) :
+/// l'intention du client y est non ambiguë, et la traiter comme non nulle
+/// ferait diverger le verdict d'un proxy strict qui lirait zéro. Les autres
+/// formes malformées (`00`, `0.5.0`…) restent **non nulles** : ce ne sont
+/// pas des `qvalue` valides, et les traiter comme zéro serait trop permissif.
 fn is_zero_qvalue(v: &str) -> bool {
-    matches!(v, "0" | "0." | "0.0" | "0.00" | "0.000")
+    match v.strip_prefix('0') {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix('.')
+            .is_some_and(|digits| digits.bytes().all(|b| b == b'0')),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -1979,6 +2029,18 @@ mod tests {
         ));
         assert!(header_has_token("100-continue", "100-continue"));
         assert!(!header_has_token("not-100-continued", "100-continue"));
+    }
+
+    #[test]
+    fn zero_qvalue_accepts_any_run_of_zero_decimals() {
+        // Toutes les décimales nulles = poids nul, y compris au-delà des 3
+        // chiffres valides de la RFC (0.0000 est malformé mais sans ambiguïté).
+        for zero in ["0", "0.", "0.0", "0.00", "0.000", "0.0000", "0.000000"] {
+            assert!(is_zero_qvalue(zero), "{zero} doit être un poids nul");
+        }
+        for nonzero in ["1", "0.1", "0.01", "0.0001", "00", "0.5", "0.250"] {
+            assert!(!is_zero_qvalue(nonzero), "{nonzero} n'est pas un poids nul");
+        }
     }
 
     #[test]

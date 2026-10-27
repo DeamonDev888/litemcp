@@ -339,6 +339,18 @@ fn parse_fn_sig(item: &TokenStream, macro_name: &str) -> Result<FnSig, String> {
                 let name = fn_ident.to_string();
                 let mut j = i + 2;
                 while j < tokens.len() {
+                    // Génériques (`fn foo<T: Fn(u8)>(…)`) : un `<` avant la
+                    // liste de paramètres — non supportés. Erreur explicite
+                    // plutôt qu'un mauvais découpage : sans ce garde, la
+                    // parenthèse d'une borne `Fn(u8)` serait prise pour la
+                    // liste de paramètres et l'erreur de compilation
+                    // résultante n'aurait aucun rapport avec la cause.
+                    if is_punct(&tokens[j], '<') {
+                        return Err(format!(
+                            "{macro_name} : les fonctions génériques ne sont pas supportées — \
+                             les types de paramètres doivent être concrets"
+                        ));
+                    }
                     if let TokenTree::Group(group) = &tokens[j] {
                         if group.delimiter() == Delimiter::Parenthesis {
                             let param_tokens: Vec<TokenTree> = group.stream().into_iter().collect();

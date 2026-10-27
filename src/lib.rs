@@ -104,6 +104,9 @@ pub mod macros {
     pub use litemcp_macros::{prompt, resource, tool};
 }
 pub mod protocol;
+/// Annonce des serveurs au MCP Control (intégration native) —
+/// opt-in via [`ServerBuilder::announce`].
+pub mod registry;
 /// Adaptateur schemars (feature `schemars`) — voir [`crate::schemars`].
 #[cfg(feature = "schemars")]
 pub mod schemars;

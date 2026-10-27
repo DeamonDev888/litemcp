@@ -361,7 +361,9 @@ impl<S: Schema> Schema for Defaulted<S> {
     }
 
     fn has_defaults(&self) -> bool {
-        true || self.inner.has_defaults()
+        // Ce schéma porte **toujours** un défaut : la descente dans `inner`
+        // n'ajouterait rien (et coûterait un parcours récursif inutile).
+        true
     }
 }
 
