@@ -65,6 +65,7 @@
 //!   arrête alors le processus entier.
 
 use crate::server::ServerCore;
+use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::AssertUnwindSafe;
@@ -127,6 +128,170 @@ pub const HEALTH_ROUTE: &str = "/health";
 pub const SSE_ANTI_BUFFERING: &str =
     "Cache-Control: no-cache, no-transform\r\nX-Accel-Buffering: no\r\n";
 
+/// Contexte d'une requête HTTP, vu par un hook
+/// [`ServerBuilder::on_request`](crate::server::ServerBuilder::on_request).
+///
+/// Le hook reçoit ce contexte **avant toute lecture du corps** : un rejet
+/// ne paie même pas le transport du payload. Les en-têtes sont conservés
+/// par la lib **seulement** quand un hook est enregistré — sans hook, le
+/// chemin chaud reste sans allocation et sans rétention (l'entrepôt des
+/// en-têtes est réutilisé sur la connexion keep-alive).
+pub struct RequestContext<'a> {
+    /// Méthode HTTP (`POST`, `GET`…), telle que reçue sur la ligne de
+    /// requête.
+    pub method: &'a str,
+    /// Chemin de la requête sans la query (`/mcp` par défaut). Une route
+    /// inconnue (404) et la sonde `/health` ne passent **pas** par le hook.
+    pub path: &'a str,
+    /// Query string sans le `?` (`x=1&y=2`), si présente.
+    pub query: Option<&'a str>,
+    /// Adresse du pair TCP. **Derrière un reverse proxy, c'est l'adresse du
+    /// proxy**, pas du client final — l'identité du client voyage alors dans
+    /// `X-Forwarded-For` (à ne croire que si la requête vient de votre
+    /// proxy : vérifiez `peer` avant de faire confiance à cet en-tête).
+    pub peer: SocketAddr,
+    /// Entrepôt concaténé des en-têtes bruts (spans de [`Self::spans`]).
+    store: &'a str,
+    /// Spans `(nom_début, nom_fin, valeur_début, valeur_fin)` dans
+    /// [`Self::store`], dans l'ordre d'arrivée.
+    spans: &'a [(u32, u32, u32, u32)],
+}
+
+impl<'a> RequestContext<'a> {
+    /// Valeur d'un en-tête, par nom **insensible à la casse** — la première
+    /// occurrence reçue gagne (les en-têtes à valeur unique que la lib
+    /// refuse d'elle-même sont déjà partis en `400` avant le hook ; les
+    /// autres peuvent légitimement se répéter, et le verdict ne doit pas
+    /// dépendre de l'ordre de lecture d'un proxy amont).
+    ///
+    /// La valeur est renvoyée telle que reçue : les espaces OWS de bord sont
+    /// déjà retirés au parsing (RFC 9110 §5.5) — `"Bearer abc"` arrive donc
+    /// sans espace parasite.
+    pub fn header(&self, name: &str) -> Option<&'a str> {
+        self.spans
+            .iter()
+            .find(|(name_start, name_end, _, _)| {
+                self.store
+                    .get(*name_start as usize..*name_end as usize)
+                    .is_some_and(|found| found.eq_ignore_ascii_case(name))
+            })
+            .and_then(|(_, _, value_start, value_end)| {
+                self.store.get(*value_start as usize..*value_end as usize)
+            })
+    }
+}
+
+/// Debug **sans les valeurs d'en-têtes** : un `Authorization` complet dans
+/// un log de diagnostic, c'est un jeton qui fuit. Les noms seuls suffisent
+/// à comprendre quelles en-têtes sont arrivées.
+impl fmt::Debug for RequestContext<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = self
+            .spans
+            .iter()
+            .filter_map(|(name_start, name_end, _, _)| {
+                self.store.get(*name_start as usize..*name_end as usize)
+            })
+            .collect();
+        f.debug_struct("RequestContext")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("query", &self.query)
+            .field("peer", &self.peer)
+            .field("headers", &names)
+            .finish()
+    }
+}
+
+/// Rejet d'une requête par un hook
+/// [`ServerBuilder::on_request`](crate::server::ServerBuilder::on_request).
+///
+/// Le transport répond `4xx`/`5xx` avec le message en corps JSON (même
+/// enveloppe que les autres erreurs de transport) et **ferme la connexion**
+/// — le corps de la requête n'a pas été lu, il ne peut pas être réinterprété
+/// comme une requête suivante. Un statut hors `400..=599` est ramené à
+/// `400` : un rejet qui répond `200` n'est pas un rejet.
+///
+/// Les en-têtes supplémentaires sont **assainis au départ de la réponse** :
+/// un nom hors jeton RFC 9110 ou une valeur portant un caractère de
+/// contrôle (CRLF inclus) est silencieusement écarté — un rejet ne doit
+/// jamais devenir une injection d'en-têtes, même si votre code y écho la
+/// valeur d'un client.
+#[derive(Debug, Clone)]
+pub struct RequestRejection {
+    status: u16,
+    message: String,
+    headers: Vec<(String, String)>,
+}
+
+impl RequestRejection {
+    /// Rejet avec un statut arbitraire (`400..=599` — toute autre valeur
+    /// est ramenée à `400`).
+    pub fn new(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status: if (400..=599).contains(&status) {
+                status
+            } else {
+                400
+            },
+            message: message.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    /// `401 Unauthorized` — identité absente ou invalide.
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(401, message)
+    }
+
+    /// `403 Forbidden` — identité connue, accès refusé.
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(403, message)
+    }
+
+    /// `429 Too Many Requests` — quota dépassé. Un `retry_after` non nul
+    /// ajoute l'en-tête `Retry-After` en secondes entières (arrondi au
+    /// dessus, minimum 1).
+    pub fn rate_limited(retry_after: Option<Duration>) -> Self {
+        let mut rejection = Self::new(429, "rate limit exceeded");
+        if let Some(delay) = retry_after {
+            let seconds = (delay.as_secs_f64().ceil() as u64).max(1);
+            rejection = rejection.with_header("Retry-After", seconds.to_string());
+        }
+        rejection
+    }
+
+    /// Ajoute un en-tête à la réponse de rejet (`WWW-Authenticate`,
+    /// `Retry-After`…). Les valeurs invalides (contrôles, CRLF) sont
+    /// écartées **au départ de la réponse**, jamais ici — le constructeur
+    /// reste infaillible.
+    #[must_use]
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Statut HTTP de la rejet (`400..=599` garanti).
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Message du corps de la réponse (enveloppe JSON-RPC de transport).
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// En-têtes supplémentaires déclarés (pas encore assainis — l'assainissement
+    /// a lieu au départ de la réponse).
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+}
+
+/// Signature d'un hook de requête — voir
+/// [`ServerBuilder::on_request`](crate::server::ServerBuilder::on_request).
+pub type RequestHook = dyn Fn(&RequestContext<'_>) -> Result<(), RequestRejection> + Send + Sync;
+
 /// Serveur HTTP attaché à un socket bindé
 /// (résultat de [`crate::ServerBuilder::bind`]).
 pub struct BoundServer {
@@ -135,6 +300,9 @@ pub struct BoundServer {
     /// Partagés par `Arc` : aucun clone par connexion sur le chemin d'accept.
     pub(crate) route: Arc<String>,
     pub(crate) allow_origins: Arc<Vec<String>>,
+    /// Hooks de requête ([`crate::ServerBuilder::on_request`]) — vide : le
+    /// transport ne retient aucun en-tête et le chemin chaud est inchangé.
+    pub(crate) request_hooks: Arc<Vec<Arc<RequestHook>>>,
     pub(crate) read_timeout: Duration,
     pub(crate) max_connections: usize,
     /// Durée de vie maximale d'une connexion (garde-fou anti-saturation).
@@ -327,6 +495,7 @@ impl BoundServer {
             let core = Arc::clone(&self.core);
             let route = Arc::clone(&self.route);
             let allow_origins = Arc::clone(&self.allow_origins);
+            let request_hooks = Arc::clone(&self.request_hooks);
             let live = Arc::clone(&self.live_connections);
             let shutdown = Arc::clone(&self.shutdown);
             // Clone pour le chemin d'erreur ci-dessous : la closure appartient
@@ -351,12 +520,15 @@ impl BoundServer {
                     let _guard = LiveGuard(live);
                     let _ = handle_connection(
                         spawn_stream,
-                        &core,
-                        &route,
-                        &allow_origins,
-                        read_timeout,
-                        connection_ttl,
-                        &shutdown,
+                        ConnectionEnv {
+                            core: &core,
+                            route: &route,
+                            allow_origins: &allow_origins,
+                            request_hooks: &request_hooks,
+                            read_timeout,
+                            connection_ttl,
+                            shutdown: &shutdown,
+                        },
                     );
                 });
             if spawned.is_err() {
@@ -565,15 +737,40 @@ fn read_line_capped(
     }
 }
 
-fn handle_connection(
-    stream: TcpStream,
-    core: &ServerCore,
-    route: &str,
-    allow_origins: &[String],
+/// État partagé d'une connexion — tout ce qui vit au-delà d'une requête,
+/// référencé depuis le [`BoundServer`] (cloné en `Arc` par la boucle
+/// d'accept).
+struct ConnectionEnv<'a> {
+    core: &'a ServerCore,
+    route: &'a str,
+    allow_origins: &'a [String],
+    request_hooks: &'a [Arc<RequestHook>],
     read_timeout: Duration,
     connection_ttl: Duration,
-    shutdown: &std::sync::atomic::AtomicBool,
-) -> std::io::Result<()> {
+    shutdown: &'a std::sync::atomic::AtomicBool,
+}
+
+fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Result<()> {
+    // Déstructuration : le corps de la fonction garde ses références
+    // directes (`core`, `route`…) sans un seul renommage interne.
+    let ConnectionEnv {
+        core,
+        route,
+        allow_origins,
+        request_hooks,
+        read_timeout,
+        connection_ttl,
+        shutdown,
+    } = env;
+    // Un hook de requête est enregistré ? Sans lui, la rétention des en-têtes
+    // bruts n'existe pas : le chemin chaud ne réserve rien, ne copie rien.
+    let hook_present = !request_hooks.is_empty();
+    // Entrepôt des en-têtes bruts — alloué une fois par connexion et
+    // réinitialisé (sans désallocation) à chaque requête de la keep-alive.
+    // Borné par construction : MAX_HEADERS (64) lignes de MAX_LINE (16 Kio)
+    // chacune.
+    let mut header_store = String::new();
+    let mut header_spans: Vec<(u32, u32, u32, u32)> = Vec::new();
     // Buffer de lecture 4 Ko (et non les 8 Ko par défaut) : les en-têtes
     // tiennent largement dedans, et un corps plus grand que la capacité est
     // lu directement depuis la socket — moitié moins de mémoire par
@@ -741,6 +938,19 @@ fn handle_connection(
         let is_head = verb == "HEAD";
         let route_matched = path == route;
         let health_probe = path == HEALTH_ROUTE;
+        // Copies possédées pour le hook de requête : `verb` et `full_path`
+        // dérivent de `line`, réemprunté en mutable par la lecture des
+        // en-têtes. Sans hook, aucune copie (chemin chaud inchangé).
+        let hook_method = if hook_present {
+            verb.to_string()
+        } else {
+            String::new()
+        };
+        let hook_full_path = if hook_present {
+            full_path.to_string()
+        } else {
+            String::new()
+        };
 
         let mut content_length: Option<usize> = None;
         let mut saw_content_length = false;
@@ -782,6 +992,13 @@ fn handle_connection(
         let mut connection_close_seen = false;
         let mut close = http10; // HTTP/1.0 : fermeture par défaut
         let mut header_count = 0usize;
+        // Rétention des en-têtes de CETTE requête — l'entrepôt est vidé
+        // (capacité conservée) à chaque itération keep-alive : le hook ne
+        // doit jamais voir un en-tête de la requête précédente.
+        if hook_present {
+            header_store.clear();
+            header_spans.clear();
+        }
         loop {
             match read_line_capped(
                 &mut reader,
@@ -906,6 +1123,21 @@ fn handle_connection(
                 }
                 let name = name_raw;
                 let value = trim_ows(value_raw);
+                if hook_present {
+                    // Rétention brute (nom + valeur) pour le hook : copie
+                    // dans l'entrepôt réutilisé, la ligne courante va être
+                    // écrasée par la lecture suivante.
+                    let name_start = header_store.len();
+                    header_store.push_str(name);
+                    let value_start = header_store.len();
+                    header_store.push_str(value);
+                    header_spans.push((
+                        name_start as u32,
+                        value_start as u32,
+                        value_start as u32,
+                        header_store.len() as u32,
+                    ));
+                }
                 if name.eq_ignore_ascii_case("content-length") {
                     if saw_content_length {
                         duplicate_length = true;
@@ -1266,6 +1498,51 @@ fn handle_connection(
             return Ok(());
         }
 
+        // Verrou utilisateur (auth / rate-limit) — voir
+        // [`crate::ServerBuilder::on_request`]. Placé **après** tous les
+        // verdicts de protocole (400/431/403 Origin/411/413/404) : le
+        // durcissement intégré reste arbitre, le hook ne fait qu'autoriser
+        // l'accès à la route MCP. Placé **avant** la méthode, le
+        // `Expect: 100-continue` et la lecture du corps : un rejet ne paie
+        // ni le feu vert ni le transport du payload — la connexion ferme
+        // (corps non lu, impossible à réinterpréter). `/health` (sondes sans
+        // authentification) et les routes inconnues n'y passent jamais.
+        if hook_present {
+            let peer = stream
+                .peer_addr()
+                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+            let (hook_path, hook_query) = match hook_full_path.split_once('?') {
+                Some((only_path, query)) => (only_path, Some(query)),
+                None => (hook_full_path.as_str(), None),
+            };
+            let context = RequestContext {
+                method: &hook_method,
+                path: hook_path,
+                query: hook_query,
+                peer,
+                store: &header_store,
+                spans: &header_spans,
+            };
+            for hook in request_hooks {
+                // Panique du hook contenue : verdict `500`, connexion fermée,
+                // le serveur continue — comme une panique de handler.
+                let verdict = std::panic::catch_unwind(AssertUnwindSafe(|| hook(&context)));
+                match verdict {
+                    Ok(Ok(())) => {}
+                    Ok(Err(rejection)) => {
+                        respond_rejection(&mut stream, &rejection, is_head)?;
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        let rejection =
+                            RequestRejection::new(500, "internal error (request hook panicked)");
+                        respond_rejection(&mut stream, &rejection, is_head)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         if !is_post {
             respond_error(
                 &mut stream,
@@ -1481,6 +1758,72 @@ fn error_payload(message: &str) -> Vec<u8> {
     })
     .to_string()
     .into_bytes()
+}
+
+/// Répond un rejet émis par un hook de requête — voir
+/// [`crate::ServerBuilder::on_request`].
+///
+/// En-têtes supplémentaires **assainis au départ** : un nom hors jeton
+/// RFC 9110 ou une valeur portant un contrôle (CRLF inclus) est écarté —
+/// le rejet ne doit jamais devenir une injection d'en-têtes. Connexion
+/// **toujours fermée** (le corps de la requête n'a pas été lu), même
+/// traitement que [`respond_error`].
+fn respond_rejection(
+    stream: &mut TcpStream,
+    rejection: &RequestRejection,
+    head: bool,
+) -> std::io::Result<()> {
+    let mut extra_headers = String::new();
+    for (name, value) in rejection.headers() {
+        if is_valid_token(name) && is_valid_field_value(value) {
+            extra_headers.push_str(name);
+            extra_headers.push_str(": ");
+            extra_headers.push_str(value);
+            extra_headers.push_str("\r\n");
+        }
+    }
+    let status_line = format!(
+        "{} {}",
+        rejection.status(),
+        reason_phrase(rejection.status())
+    );
+    let payload = error_payload(&rejection.message);
+    respond(
+        stream,
+        &status_line,
+        &extra_headers,
+        "application/json",
+        &payload,
+        false,
+        head,
+    )?;
+    shutdown_gracefully(stream);
+    Ok(())
+}
+
+/// Phrase de raison des statuts qu'un rejet de hook peut porter — les
+/// autres reçoivent un libellé générique (la ligne de statut exige un
+/// jeton ; le code numérique reste la référence pour le client).
+fn reason_phrase(code: u16) -> &'static str {
+    match code {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        407 => "Proxy Authentication Required",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        418 => "I'm a teapot",
+        429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Rejected",
+    }
 }
 
 /// Lit un corps de `len` octets **par tranches** dans `body`.

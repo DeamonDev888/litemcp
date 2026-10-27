@@ -107,6 +107,15 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 
 **Jalon** : conformance verte + tableau de bench → tag `1.0.0`.
 
+### Phase 7 — Écosystème entreprise (issue d'un retour utilisateur « grosse boite »)
+
+Retour terrain (2026-10-27) : dans un déploiement MCP à grande échelle, la perf est un critère d'hygiène regardé en dernier ; ce qui fait la décision, ce sont l'auth, l'audit, le rate-limit et l'intégration dans l'écosystème du groupe — et un serveur exposé en HTTP nu est refusé d'office par les équipes sécu.
+
+- [x] **Verrou de requête `.on_request()`** — auth token / rate-limit par source ou par clé en process, rejet `401`/`403`/`429` avant la lecture du corps (2026-10-27) ;
+- [ ] **Guide de déploiement entreprise** : TLS termination au gateway / sidecar mesh (mTLS), OIDC à la périphérie, rate-limit par identité — le « HTTP only » assumé est un montage d'infra standard, pas une faiblesse de la lib ; configs prêtes à copier (nginx/Envoy, ingress k8s, mesh) ;
+- [ ] **Recette Prometheus** : exporter compteurs/latences/histogrammes à partir du hook `on_call` sans dépendance dans le cœur du crate ;
+- [ ] **Story stateless documentée** : pas de sessions ⇒ pas d'affinité ⇒ scaling horizontal par réplicas derrière un load balancer (l'argument scalabilité du segment entreprise).
+
 ## 4. SLO (hypothèses, première mesure en Phase 3)
 
 | Métrique | Cible | Mesure |
@@ -138,3 +147,4 @@ Cible : serveurs MCP embarqués (CLI, app, edge, IoT), tests unitaires rapides, 
 - **2026-10-22 v10** — **Publication 0.3.1** : lot « léger & rapide » (keep-alive ~−35 % in-repo, −13 % côté consommateur, binaire −18,5 %, buffer lecture 4 Ko) + sonde `GET /health` + comparatif ViteMCP chiffré. Vérifications : 70 tests, clippy `-D warnings`, fmt, package 19 fichiers, `.cargo_vcs_info.json` = commit tagué. Le README crates.io (section « Pourquoi » réécrite) est rafraîchi à cette occasion.
 - **2026-10-22 v11** — **Anti-tampon SSE** (problème des VPS derrière un proxy tamponneur) : en-têtes `X-Accel-Buffering: no` + `Cache-Control: no-cache, no-transform` sur toute réponse SSE (`SSE_ANTI_BUFFERING`, JSON non affecté) ; **choix architectural documenté** : pas de SSE longue durée — request-scoped, un événement puis clôture (le transport ne peut pas empiler) ; contrat d'écriture SSE écrit dans le code (flush par événement + en-têtes). README : section « Hébergement VPS & proxies » (recette nginx, repli JSON). 72 tests verts. `outputSchema` reste le chantier 0.4 (mesuré : +0,2–1,4 % du trajet réseau).
 - **2026-10-22 v12** — **Publication 0.3.2** : anti-tampon SSE + docs (Hébergement VPS, FAQ WebSocket, sonde `/health` dans la configuration). Relecture complète du README de bout en bout avant publication ; cible d'audit `examples/audit_target.rs` exclue du dépôt et du package (`.gitignore`). 72 tests, clippy `-D warnings`, fmt.
+- **2026-10-27 v13** — **Phase 7 ouverte : verrou de requête `.on_request()`** (issue directe d'un retour utilisateur « grosse boite » : auth/audit/rate-limit avant la perf, et « http only → lol nope » des équipes sécu). Le hook reçoit `RequestContext` (méthode, chemin, query, pair, en-têtes par lookup insensible à la casse ; `Debug` n'imprime que les noms) et rend `Ok(())` ou un `RequestRejection` (`401`/`403`/`429`+`Retry-After`, statut arbitraire borné à `400..=599`, `with_header` assaini au départ — CRLF écartés). Verdict **avant la lecture du corps** et avant `100-continue` ; `/health` et routes inconnues exemptes ; `401` gagne sur `405` ; paniques contenues (`500`) ; hooks cumulables ; sans hook, zéro rétention d'en-têtes et chemin chaud inchangé. Types publics `RequestContext`/`RequestRejection`, 11 tests dédiés — **252 tests verts**, clippy `-D warnings`, fmt. Suite de la phase : guide de déploiement entreprise (TLS au gateway/mesh, OIDC), recette Prometheus sur `on_call`, story stateless/scaling.

@@ -6,7 +6,7 @@
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.7.1%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.8.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
 [![crates.io](https://img.shields.io/crates/v/litemcp.svg)](https://crates.io/crates/litemcp) [![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI)](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml) [![Docs](https://img.shields.io/docsrs/litemcp)](https://docs.rs/litemcp)
 
@@ -82,6 +82,7 @@ Les features sont **additives** : sans aucune feature, le cœur ne compile **que
 | 📚 **Resources & Prompts** | `resources/list`·`read`, `prompts/list`·`get` — mêmes indices de cache que `tools/list` (SEP-2549) |
 | ⏱️ **Handlers bornés** | `.tool_timeout(duration)` : un handler qui dépasse rend une erreur, la connexion n'est plus retenue indéfiniment |
 | 🩺 **Erreurs structurées & observabilité** | `ToolError` (`rate_limited`, `timeout`, `upstream`… avec `retryable`/`retryAfterMs`) + `.on_call(hook)` pour métriques et latences |
+| 🔐 **Verrou de requête** | `.on_request(hook)` : verdict par requête **avant la lecture du corps** — auth par token, rate-limit par source ; rejet `401`/`403`/`429` + `Retry-After`, paniques contenues |
 | 🛑 **Arrêt propre** | `bound.handle()` puis `handle.shutdown()` : `serve()` rend `Ok(())`, les connexions ferment entre deux requêtes |
 | 🛡️ **Sûr par défaut** | `#![forbid(unsafe_code)]`, garde DNS-rebinding, corps limité |
 
@@ -89,12 +90,12 @@ Les features sont **additives** : sans aucune feature, le cœur ne compile **que
 
 ```toml
 [dependencies]
-litemcp = "0.7.1"
+litemcp = "0.8.0"
 
 # pour la macro #[tool] (deps de compilation seulement) :
-# litemcp = { version = "0.7.1", features = ["macros"] }
+# litemcp = { version = "0.8.0", features = ["macros"] }
 # pour l'adaptateur schemars (#[derive(JsonSchema)] en schéma exécuteur) :
-# litemcp = { version = "0.7.1", features = ["schemars"] }
+# litemcp = { version = "0.8.0", features = ["schemars"] }
 ```
 
 ## Démarrage rapide
@@ -360,6 +361,7 @@ La valeur de retour d'un outil devient `structuredContent` — un objet JSON pas
 | `.connection_ttl(duration)` | 5 min | durée de vie maximale d'une connexion keep-alive — borne le temps d'occupation d'un slot (sans elle, un client qui drip-feed des requêtes valides retient son slot indéfiniment) ; `0` désactive le TTL |
 | `.tool_timeout(duration)` | illimité | délai maximal d'exécution des handlers (outils, ressources, prompts) — au-delà : résultat `isError` (`ErrorCode::Timeout`, retentable) pour un outil, `-32000` pour une ressource/prompt ; les arguments d'un `tools/call` sont clonés une fois par appel quand il est actif |
 | `.on_call(hook)` | aucun | callback d'observabilité appelé après chaque message JSON-RPC (`CallEvent { method, name, duration, status }`) ; cumulable, paniques du hook contenues |
+| `.on_request(hook)` | aucun | **verrou d'accès par requête** — le hook reçoit un `RequestContext` (méthode, chemin, query, **adresse du pair**, en-têtes via `ctx.header(nom)` insensible à la casse) et rend `Ok(())` ou un `RequestRejection` : `unauthorized` (401), `forbidden` (403), `rate_limited(retry_after)` (429 + `Retry-After`), `new(status, msg)` (hors 4xx/5xx → 400), `.with_header("WWW-Authenticate", …)`. Rejet = statut + corps JSON + **fermeture de connexion**, avant la lecture du corps ; jamais appelé sur `/health` ni sur une route inconnue ; cumulable (premier rejet gagne), paniques contenues (`500`). Voir [Sécurité](#sécurité) |
 | `.announce()` | désactivée | publie une annonce JSON dans le dossier temporaire partagé (`%TEMP%/litemcp-registry/<nom>.json`) au bind réussi — port effectif, PID, exe, args, cwd, ts — retirée à la fin de vie du serveur ; intégration native avec le [MCP Control](#client--mcp-control) (voir ce qui suit) |
 | Threads de handlers (`MAX_INFLIGHT_HANDLERS`) | 256 | plafond de threads de handlers simultanés (actifs ou détachés après un timeout de `tool_timeout`) — au-delà : `rate_limited` pour un outil, `-32000` pour une ressource/prompt ; le slot n'est rendu qu'à la terminaison effective du thread |
 | Réponse JSON-RPC (`MAX_RESPONSE_BYTES`) | 16 Mio | une réponse sérialisée qui dépasse ce plafond est remplacée par `-32603` (« response size … exceeds maximum … ») — un handler ne peut pas pousser un corps illimité |
@@ -370,9 +372,28 @@ La valeur de retour d'un outil devient `structuredContent` — un objet JSON pas
 
 ## Sécurité
 
-**Modèle de menace assumé : LiteMCP est une bibliothèque réseau, pas un service exposé.** Quiconque peut joindre le socket peut appeler vos outils — il n'y a ni authentification ni TLS intégrés (choix architectural : voir le comparatif ViteMCP, « OAuth 2.1 intégré » est écarté volontairement). Le durcissement intégré couvre le protocole ; la périphérie est à votre charge :
+**Modèle de menace assumé : LiteMCP est une bibliothèque réseau, pas un service exposé.** Quiconque peut joindre le socket peut appeler vos outils — sauf si vous posez un **verrou de requête** [`on_request`](#configuration) : un verdict par requête, avant même la lecture du corps (auth par token, rate-limit par source ou par clé), rejet `401`/`403`/`429` avec en-têtes libres (`WWW-Authenticate`, `Retry-After`) :
 
-- **Liaison** : bind `127.0.0.1:8080` (comme dans tous les exemples) si le serveur ne parle qu'à des processus locaux ; sinon, exposez derrière un **reverse proxy** qui apporte TLS, authentification (par ex. OAuth 2.1) et rate-limiting **par IP** — le plafond de connexions de LiteMCP est **global au serveur** (256 par défaut) : 256 clients lents peuvent l'occuper et renvoyer `503` aux autres, c'est à ça que sert le quota par IP du proxy (le TTL de connexion de 5 min borne par ailleurs la durée d'occupation d'un slot) ;
+```rust
+use litemcp::prelude::*;
+
+const TOKEN: &str = "s3cret"; // token « quick fix » — l'OIDC/SAML reste au gateway
+
+ServerBuilder::new("calc", "1.0.0")
+    .on_request(|ctx| {
+        match ctx.header("Authorization").and_then(|v| v.strip_prefix("Bearer ")) {
+            Some(t) if t == TOKEN => Ok(()),
+            _ => Err(RequestRejection::unauthorized("missing or invalid bearer token")
+                .with_header("WWW-Authenticate", "Bearer")),
+        }
+    })
+    .bind("127.0.0.1:8080")?
+    .serve()?;
+```
+
+Le **TLS**, lui, n'est pas implémenté (choix architectural : voir le comparatif ViteMCP, « OAuth 2.1 intégré » est écarté volontairement) — il vit à la périphérie, exactement comme pour tout service interne d'un SI. Le durcissement intégré couvre le protocole ; l'identité et le chiffrement sont à votre charge :
+
+- **Liaison** : bind `127.0.0.1:8080` (comme dans tous les exemples) si le serveur ne parle qu'à des processus locaux ; sinon, exposez derrière un **reverse proxy** qui apporte TLS, l'authentification forte (OIDC/SAML, OAuth 2.1 — l'OIDC intégré au serveur reste écarté volontairement : c'est le métier du gateway) et le rate-limiting **par identité/IP** — pour l'auth token « quick fix » ou un rate-limit maison, le verrou `.on_request` suffit en process (derrière un proxy, `ctx.peer` est l'adresse du proxy : ne croyez `X-Forwarded-For` qu'après avoir vérifié le pair). Le plafond de connexions de LiteMCP est **global au serveur** (256 par défaut) : 256 clients lents peuvent l'occuper et renvoyer `503` aux autres, c'est à ça que sert le quota par IP du proxy (le TTL de connexion de 5 min borne par ailleurs la durée d'occupation d'un slot) ;
 - **Navigateurs** : garde DNS-rebinding intégrée — toute requête portant un `Origin` non listé dans `.allow_origins` est refusée (`403`), et les préflights CORS échouent par défaut (`OPTIONS` → `405`) ;
 - **Handlers bloquants** : par défaut il n'y a pas de timeout d'exécution — un handler qui bloque retient son thread et son slot de connexion. `.tool_timeout(duration)` borne la **réponse** (résultat `isError`/`-32000` passé le délai) mais ne peut pas tuer le thread du handler (Rust n'a pas d'annulation de thread) : il termine en arrière-plan et son résultat est ignoré. Pour des effets de bord annulables, encadrez vos appels lents vous-même ;
 - **Validation** : privilégiez `tool_typed`/`tool_parse` (schéma appliqué **avant** votre code) ; `tool` brut vous laisse la validation des arguments — c'est là que naissent les bugs d'injection côté handler, pas dans le transport. Le schéma publié est **exécuteur** : ce qu'il annonce est exactement ce que la validation applique.
@@ -409,6 +430,7 @@ Le durcissement transport est intégré et vérifié par la suite de tests : lim
 | `Transfer-Encoding` présent (toute route) · `Content-Length` dupliqué | `400` (anti request-smuggling) |
 | `Content-Type` / `Mcp-Method` / `Mcp-Name` dupliqués | `400` (en-têtes à valeur unique — un proxy combine ou retient la première valeur : le verdict ne doit pas dépendre de l'ordre) |
 | En-tête `Origin` non autorisé | `403` (garde DNS-rebinding ; CLI sans `Origin` : libre) |
+| Requête refusée par un verrou `on_request` | statut du rejet (`401`/`403`/`429`… — hors `400`–`599` corrigé à `400`), message en corps JSON-RPC, en-têtes supplémentaires **assainis** (nom hors jeton ou valeur à CRLF écartés), connexion fermée · hook en panique : `500` générique, le serveur continue · `/health` et les routes inconnues ne passent jamais par le verrou |
 | Toute erreur JSON-RPC | l'`id` de la requête est **repris** dans la réponse (JSON-RPC 2.0 §5) |
 
 ## Benchmarks

@@ -51,6 +51,13 @@
 //! pour compteurs, latence et taux d'erreur sans instrumenter votre
 //! client.
 //!
+//! **Contrôle d'accès**
+//! ([`on_request`](crate::server::ServerBuilder::on_request)) : un verdict
+//! par requête HTTP — auth par token, rate-limit par source ou par clé —
+//! rejeté en `401`/`403`/`429` **avant la lecture du corps**. TLS et OIDC
+//! restent à la périphérie (gateway / mesh) ; le verrou applicatif, lui,
+//! vit ici.
+//!
 //! Spec cible : MCP **2026-07-28** — protocole **stateless**, sans handshake :
 //! chaque message est un `POST /mcp`, la réponse arrive en `application/json`
 //! (ou en `text/event-stream` si le client ne demande que du SSE).
@@ -114,6 +121,7 @@ pub mod server;
 pub mod zod;
 
 pub use error::{ErrorCode, ToolError};
+pub use http::{RequestContext, RequestRejection};
 pub use server::{CallEvent, CallStatus, ServerBuilder, ServerCore, ToolResult};
 
 /// Version du crate.
@@ -123,7 +131,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod prelude {
     pub use crate::VERSION;
     pub use crate::error::{ErrorCode, ToolError};
-    pub use crate::http::ServerHandle;
+    pub use crate::http::{RequestContext, RequestRejection, ServerHandle};
     #[cfg(feature = "macros")]
     pub use crate::macros::{prompt, resource, tool};
     pub use crate::protocol::{

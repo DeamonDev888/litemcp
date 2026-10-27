@@ -1,6 +1,7 @@
 //! Noyau de dispatch JSON-RPC + builder — indépendant du transport.
 
 use crate::error::{ErrorCode, ToolError};
+use crate::http::{RequestContext, RequestHook, RequestRejection};
 use crate::jsonrpc::{ErrorObject, Outgoing, RequestId};
 use crate::protocol;
 use crate::protocol::{
@@ -1296,6 +1297,9 @@ pub struct ServerBuilder {
     prompts: BTreeMap<String, PromptDef>,
     /// Hooks d'observation enregistrés par [`Self::on_call`].
     hooks: Vec<Arc<CallHook>>,
+    /// Hooks de requête enregistrés par [`Self::on_request`] — verdict
+    /// d'accès (auth, rate-limit) avant lecture du corps.
+    request_hooks: Vec<Arc<RequestHook>>,
     /// Annonce au MCP Control (voir [`Self::announce`]).
     announce: bool,
 }
@@ -1319,6 +1323,7 @@ impl ServerBuilder {
             connection_ttl: crate::http::CONNECTION_TTL,
             tool_timeout: None,
             hooks: Vec::new(),
+            request_hooks: Vec::new(),
             announce: false,
         }
     }
@@ -1380,6 +1385,68 @@ impl ServerBuilder {
         F: Fn(&CallEvent<'_>) + Send + Sync + 'static,
     {
         self.hooks.push(Arc::new(f));
+        self
+    }
+
+    /// Verrou d'accès par requête — **auth** et **rate-limit** en process,
+    /// avant toute exécution : le hook reçoit
+    /// [`RequestContext`](crate::http::RequestContext) (méthode, chemin,
+    /// query, adresse du pair, en-têtes) et rend `Ok(())` ou un
+    /// [`RequestRejection`](crate::http::RequestRejection) (`401`, `403`,
+    /// `429` + `Retry-After`, statut arbitraire). Le premier rejet gagne.
+    ///
+    /// ```no_run
+    /// use litemcp::prelude::*;
+    ///
+    /// const TOKEN: &str = "s3cret";
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// ServerBuilder::new("calc", "1.0.0")
+    ///     .tool("add", "Additionne", |_args| Ok(serde_json::json!({})))
+    ///     .on_request(|ctx| {
+    ///         match ctx.header("Authorization").and_then(|v| v.strip_prefix("Bearer ")) {
+    ///             Some(token) if token == TOKEN => Ok(()),
+    ///             _ => Err(RequestRejection::unauthorized("missing or invalid bearer token")
+    ///                 .with_header("WWW-Authenticate", "Bearer")),
+    ///         }
+    ///     })
+    ///     .bind("127.0.0.1:8080")?
+    ///     .serve()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// - le hook s'exécute **avant** la lecture du corps et avant le
+    ///   `Expect: 100-continue` : un rejet ne transporte jamais le payload ;
+    /// - il ne s'exécute **pas** sur `/health` (les probes k8s ne
+    ///   s'authentifient pas) ni sur une route inconnue (`404`) ni sur les
+    ///   requêtes déjà refusées par le durcissement de transport (`400`,
+    ///   `431`, `403` Origin, `411`, `413`) — le verrou utilisateur ne fait
+    ///   qu'autoriser la route MCP ;
+    /// - un rejet répond le statut avec le message en corps JSON et **ferme
+    ///   la connexion** (le corps non lu ne peut pas être réinterprété) ;
+    /// - les en-têtes supplémentaires ([`RequestRejection::with_header`])
+    ///   sont assainis au départ : un CRLF injecté dans une valeur est
+    ///   écarté, jamais réémis ;
+    /// - une panique du hook est contenue (`500`, connexion fermée, le
+    ///   serveur continue) ;
+    /// - le hook tourne dans le fil de la connexion : gardez-le rapide
+    ///   (vérification locale de signature/JWT) — un appel réseau distant
+    ///   (introspection OAuth) doit porter **son propre** timeout, sinon il
+    ///   retient le slot de connexion ;
+    /// - derrière un reverse proxy, [`RequestContext::peer`](crate::http::RequestContext)
+    ///   est l'adresse du proxy — pour un rate-limit par client final,
+    ///   lisez `X-Forwarded-For` **après** avoir vérifié que `peer` est bien
+    ///   votre proxy ;
+    /// - les hooks sont cumulables (chaque `.on_request` ajoute un verdict,
+    ///   exécuté dans l'ordre d'enregistrement) ; sans aucun hook, le
+    ///   transport ne retient aucun en-tête et le chemin chaud est inchangé.
+    #[must_use]
+    pub fn on_request<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&RequestContext<'_>) -> Result<(), RequestRejection> + Send + Sync + 'static,
+    {
+        self.request_hooks.push(Arc::new(f));
         self
     }
 
@@ -1856,6 +1923,7 @@ impl ServerBuilder {
             core,
             route: Arc::new(self.route),
             allow_origins: Arc::new(self.allow_origins),
+            request_hooks: Arc::new(self.request_hooks),
             read_timeout: self.read_timeout,
             max_connections: self.max_connections,
             connection_ttl: self.connection_ttl,
