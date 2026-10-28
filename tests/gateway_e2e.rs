@@ -28,22 +28,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // ---------------------------------------------------------------- helpers
 
 fn spawn_gateway(gateway: Arc<Gateway>) -> SocketAddr {
-    // App hôte : le dispatch embarqué est monté dans une route HTTP d'un
-    // serveur litemcp (le socket est déjà durci par la lib).
-    let bound = ServerBuilder::new("hote", "1.0.0")
-        .tool("hote_ping", "ping de l'hôte", |_a| {
-            Ok(json!({ "hote": true }))
-        })
-        .bind("127.0.0.1:0")
-        .unwrap();
-    let addr = bound.local_addr().unwrap();
+    // Bind **une seule fois, dans le thread appelant** : le socket écoute
+    // dès le retour de cette fonction (les connects s'empilent dans le
+    // backlog même avant que la boucle n'accepte). Re-binder la même
+    // adresse dans le thread spawné ouvrait une fenêtre de course —
+    // entre la fermeture du premier listener et le second bind, un
+    // connect du test recevait `ConnectionRefused` (vu une fois en CI).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
 
     // Le gateway est partagé : chaque requête HTTP prend le snapshot
     // courant au moment du dispatch.
     let gw = Arc::clone(&gateway);
 
     std::thread::spawn(move || {
-        let listener = std::net::TcpListener::bind(addr).unwrap();
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let gw = Arc::clone(&gw);
