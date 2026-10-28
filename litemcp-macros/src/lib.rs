@@ -37,7 +37,7 @@
 //!     .with_tool(register_add)
 //!     .with_tool(register_doc)
 //!     .with_tool(register_revue)
-//!     .bind("127.0.0.1:8080")?
+//!     .bind("127.0.0.1:23080")?
 //!     .serve()?;
 //! ```
 //!

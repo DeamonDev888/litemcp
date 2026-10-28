@@ -39,7 +39,7 @@
 //!         // arguments validés par le schéma dérivé du struct
 //! #         let _ = args; Ok(serde_json::json!({}))
 //!     })
-//!     .bind("127.0.0.1:8080")?
+//!     .bind("127.0.0.1:23080")?
 //!     .serve()?;
 //! ```
 //!
@@ -71,7 +71,7 @@ use std::sync::OnceLock;
 ///
 /// ServerBuilder::new("app", "1.0.0")
 ///     .tool_typed("t", "t", schema, |args| Ok(args.clone()))
-///     .bind("127.0.0.1:8080")?
+///     .bind("127.0.0.1:23080")?
 ///     .serve()?;
 /// ```
 ///

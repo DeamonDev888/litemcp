@@ -1,5 +1,6 @@
-//! Serveur MCP minimal en HTTP stateless : `cargo run --example hello`
-//! puis `POST http://127.0.0.1:8080/mcp`.
+//! Serveur MCP minimal en HTTP stateless : `cargo run --example hello`,
+//! qui affiche le port effectif au démarrage — premier port libre de la
+//! tranche LiteMCP (`23080..=23099`), repli éphémère si elle est pleine.
 //!
 //! Montre les trois façons d'exposer un outil :
 //! 1. `tool`       — closure sur `Value` brut (rapide, sans schéma) ;
@@ -17,11 +18,7 @@ struct SearchArgs {
 }
 
 fn main() -> std::io::Result<()> {
-    println!(
-        "litemcp {} — MCP stateless sur http://127.0.0.1:8080/mcp",
-        VERSION
-    );
-    ServerBuilder::new("hello", "0.1.0")
+    let bound = ServerBuilder::new("hello", "0.1.0")
         // 1. Brut : la closure gère elle-même les arguments.
         .tool("hello", "Dit bonjour à quelqu'un", |args| {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("monde");
@@ -68,6 +65,10 @@ fn main() -> std::io::Result<()> {
                 .read_only(true)
                 .open_world(false),
         )
-        .bind("127.0.0.1:8080")?
-        .serve()
+        .bind_default()?;
+    println!(
+        "litemcp {VERSION} — MCP stateless sur http://{}/mcp",
+        bound.local_addr()?
+    );
+    bound.serve()
 }

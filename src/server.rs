@@ -1397,7 +1397,7 @@ impl ServerBuilder {
     ///             event.duration
     ///         );
     ///     })
-    ///     .bind("127.0.0.1:8080")?
+    ///     .bind("127.0.0.1:23080")?
     ///     .serve()?;
     /// # Ok(())
     /// # }
@@ -1444,7 +1444,7 @@ impl ServerBuilder {
     ///                 .with_header("WWW-Authenticate", "Bearer")),
     ///         }
     ///     })
-    ///     .bind("127.0.0.1:8080")?
+    ///     .bind("127.0.0.1:23080")?
     ///     .serve()?;
     /// # Ok(())
     /// # }
@@ -1822,7 +1822,7 @@ impl ServerBuilder {
     ///             .field("b", zod::integer()),
     ///         |args: AddArgs| Ok(serde_json::json!({ "somme": args.a + args.b })),
     ///     )
-    ///     .bind("127.0.0.1:8080")?
+    ///     .bind("127.0.0.1:23080")?
     ///     .serve()?;
     /// # Ok::<(), std::io::Error>(())
     /// # }
@@ -1944,7 +1944,56 @@ impl ServerBuilder {
     /// La route est validée ici (voir [`ServerBuilder::route`]) : une route
     /// qui ne peut jamais matcher ou qui masque la sonde de vie est refusée
     /// en `InvalidInput` plutôt que de démarrer un serveur injoignable.
-    pub fn bind(mut self, addr: &str) -> std::io::Result<crate::http::BoundServer> {
+    pub fn bind(self, addr: &str) -> std::io::Result<crate::http::BoundServer> {
+        self.validate_route()?;
+        let listener = std::net::TcpListener::bind(addr)?;
+        self.finish(listener)
+    }
+
+    /// Bind sur `127.0.0.1` en **cherchant un port libre** dans la tranche
+    /// LiteMCP ([`crate::DEFAULT_PORT_RANGE`] — `23080..=23099`) : le
+    /// premier port disponible gagne, de sorte que le deuxième, le
+    /// dixième… serveur LiteMCP d'une machine démarre sans coordination
+    /// ni collision. Si la tranche entière est occupée, repli sur un
+    /// **port éphémère** alloué par l'OS — jamais d'échec faute de place
+    /// dans la tranche. Le port effectif est lisible via
+    /// [`crate::http::BoundServer::local_addr`] et publié par
+    /// [`ServerBuilder::announce`] si elle est active. La validation de
+    /// route est identique à [`ServerBuilder::bind`].
+    ///
+    /// ```no_run
+    /// use litemcp::prelude::*;
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let bound = ServerBuilder::new("calc", "1.0.0")
+    ///     .tool("add", "Additionne", |_args| Ok(serde_json::json!({})))
+    ///     .bind_default()?;
+    /// eprintln!("MCP sur http://{}", bound.local_addr()?);
+    /// bound.serve()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn bind_default(self) -> std::io::Result<crate::http::BoundServer> {
+        self.validate_route()?;
+        for port in crate::DEFAULT_PORT_RANGE {
+            match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                Ok(listener) => return self.finish(listener),
+                // Port pris : le suivant de la tranche — le cas nominal du
+                // deuxième serveur LiteMCP sur la même machine.
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(error) => return Err(error),
+            }
+        }
+        // Tranche entière occupée : port éphémère (0). L'OS ne peut pas
+        // donner un port de la tranche — elle est sous toutes les plages
+        // éphémères par défaut et ses vingt ports sont liés ci-dessus.
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        self.finish(listener)
+    }
+
+    /// Validation de route partagée par [`Self::bind`] et
+    /// [`Self::bind_default`] — voir [`Self::route`].
+    fn validate_route(&self) -> std::io::Result<()> {
         if !self.route.starts_with('/')
             || self.route.contains(['?', '#'])
             || self
@@ -1970,7 +2019,15 @@ impl ServerBuilder {
                 ),
             ));
         }
-        let listener = std::net::TcpListener::bind(addr)?;
+        Ok(())
+    }
+
+    /// Construit le [`crate::http::BoundServer`] sur un listener **déjà
+    /// lié** — corps commun de [`Self::bind`] et [`Self::bind_default`].
+    fn finish(
+        mut self,
+        listener: std::net::TcpListener,
+    ) -> std::io::Result<crate::http::BoundServer> {
         // Annonce MCP Control : le listener est lié — le port effectif est
         // connu même après un bind sur le port 0. Un échec d'écriture est
         // silencieux (commodité d'intégration, jamais une condition).

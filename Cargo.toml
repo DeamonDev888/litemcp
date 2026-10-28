@@ -3,7 +3,7 @@ members = [".", "litemcp-macros"]
 
 [package]
 name = "litemcp"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 rust-version = "1.85"
 description = "LiteMCP — la lib MCP la plus légère en mémoire et la plus rapide : votre serveur MCP en quelques lignes. Streamable HTTP stateless uniquement (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement."

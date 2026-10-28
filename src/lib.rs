@@ -126,8 +126,8 @@
 //!         eprintln!("{} {} -> {:?} in {:?}", event.method,
 //!             event.name.unwrap_or("-"), event.status, event.duration);
 //!     })
-//!     .bind("127.0.0.1:8080")?   // socket bindé — un thread par connexion
-//!     .serve()?;                 // bloque : POST /mcp → JSON ou SSE
+//!     .bind_default()?  // premier port libre de la tranche 23080–23099, repli éphémère
+//!     .serve()?;        // bloque : POST /mcp → JSON ou SSE
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
@@ -162,9 +162,37 @@ pub use server::{CallEvent, CallStatus, ServerBuilder, ServerCore, ToolResult};
 /// Version du crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Port par défaut des exemples et de la documentation — **23080**.
+///
+/// Un choix délibéré, opposé au conventionnel 8080 : c'est le port
+/// HTTP-alternatif le plus squatté (proxys, Tomcat, serveurs de dev),
+/// avec collisions garanties dans un arbre de processus local. **23080**
+/// est en dessous de toutes les plages éphémères par défaut (Linux
+/// `32768–60999`, Windows/macOS `49152–65535` — jamais alloué par l'OS
+/// comme port source), non attribuée par l'IANA et sans serveur de
+/// développement connu dessus. Pour plusieurs instances côte à côte,
+/// ne choisissez rien à la main :
+/// [`DEFAULT_PORT_RANGE`] + [`ServerBuilder::bind_default`] attribuent
+/// automatiquement le premier port libre de la tranche.
+pub const DEFAULT_PORT: u16 = 23080;
+
+/// Adresse de bind explicite par défaut — [`DEFAULT_PORT`] sur le bouclage
+/// local (pour [`ServerBuilder::bind`] ; l'auto-attribution vit dans
+/// [`ServerBuilder::bind_default`]).
+pub const DEFAULT_ADDRESS: &str = "127.0.0.1:23080";
+
+/// Tranche de ports LiteMCP — **23080..=23099**.
+///
+/// Vingt ports pour vingt serveurs côte à côte (un par vendor d'infra,
+/// par exemple) **sans coordination** : [`ServerBuilder::bind_default`]
+/// prend le premier libre, et ne retombe sur un port éphémère alloué par
+/// l'OS que si la tranche entière est occupée. La tranche est **sous**
+/// toutes les plages éphémères par défaut — l'OS ne la donne donc jamais
+/// spontanément à un socket sortant, et les serveurs LiteMCP y sont seuls.
+pub const DEFAULT_PORT_RANGE: std::ops::RangeInclusive<u16> = 23080..=23099;
+
 /// Tout ce qu'il faut pour écrire un serveur en quelques lignes.
 pub mod prelude {
-    pub use crate::VERSION;
     pub use crate::error::{ErrorCode, ToolError};
     pub use crate::gateway::Gateway;
     pub use crate::http::{RequestContext, RequestRejection, ServerHandle};
@@ -178,4 +206,5 @@ pub mod prelude {
     pub use crate::schemars::{from_json_schema, from_schemars};
     pub use crate::server::{CallEvent, CallStatus, McpHeaders, ServerBuilder, ToolResult};
     pub use crate::zod::{self, Schema};
+    pub use crate::{DEFAULT_ADDRESS, DEFAULT_PORT, DEFAULT_PORT_RANGE, VERSION};
 }

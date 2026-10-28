@@ -6,13 +6,13 @@
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.9.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.9.1%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
 [![crates.io](https://img.shields.io/crates/v/litemcp.svg)](https://crates.io/crates/litemcp) [![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI)](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml) [![Docs](https://img.shields.io/docsrs/litemcp)](https://docs.rs/litemcp)
 
 📦 **Crate officiel : [crates.io/crates/litemcp](https://crates.io/crates/litemcp)** · 📖 **Docs : [docs.rs/litemcp](https://docs.rs/litemcp)**
 
-[Installation](#installation) · [Démarrage rapide](#démarrage-rapide) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/) · [Stack](#stack-par-défaut-et-options) · [Concepts](#concepts) · [Configuration](#configuration) · [Sécurité](#sécurité) · [Protocole](#protocole) · [FAQ](#faq) · [Client](#client--mcp-control)
+[Installation](#installation) · [Intégration](#intégration) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/) · [Stack](#stack-par-défaut-et-options) · [Concepts](#concepts) · [Configuration](#configuration) · [Sécurité](#sécurité) · [Protocole](#protocole) · [FAQ](#faq) · [Client](#client--mcp-control)
 
 </div>
 
@@ -65,8 +65,8 @@ Le tableau suivant fixe le contrat : ce qui est **toujours** là (stack par déf
 | Transport | HTTP/1.1 maison sur `std::net::TcpListener` (POST / SSE request-scoped, keep-alive) | — |
 | Sûreté mémoire | `#![forbid(unsafe_code)]` sur tout le crate | — |
 | MSRV | **1.85** (`rust-version = "1.85"`, edition 2024) | — |
-| Schémas & validation | module [`zod`](#outils--schémas-à-la-zod) intégré : dérivation JSON Schema + validation exécuteur, **sans dépendance de plus** | feature **`schemars`** : adaptateur `#[derive(JsonSchema)]` (`schemars`) + validateur `jsonschema` avec **formats appliqués** — +51 crates transitives, +5,9 Mio de binaire (mesuré ci-dessus) |
-| Macros `#[tool]` · `#[resource]` · `#[prompt]` | — (le DSL `zod` couvre le même terrain) | feature **`macros`** : ajoute `litemcp-macros`, **zéro dépendance externe** (pur `proc_macro` standard, sans `syn`/`quote`) — +1 crate, +67 Kio (mesuré ci-dessus) |
+| Schémas & validation | module [`zod`](#outils--schémas-à-la-zod) intégré : dérivation JSON Schema + validation exécuteur, **sans dépendance de plus** | feature **`schemars`** : adaptateur `#[derive(JsonSchema)]` (`schemars`) + validateur `jsonschema` avec **formats appliqués** — +55 crates transitives, +5,8 Mio de binaire (mesuré ci-dessus) |
+| Macros `#[tool]` · `#[resource]` · `#[prompt]` | — (le DSL `zod` couvre le même terrain) | feature **`macros`** : ajoute `litemcp-macros`, **zéro dépendance externe** (pur `proc_macro` standard, sans `syn`/`quote`) — +1 crate, +57 Kio (mesuré ci-dessus) |
 
 Les features sont **additives** : sans aucune feature, le cœur ne compile **que** `serde` + `serde_json` — le code des options n'existe même pas au build par défaut, donc **aucun coût** (ni binaire, ni compilation, ni surface d'API). Activer une feature ne renchérit qu'elle-même (coûts mesurés dans [Le coût réel des features](#le-coût-réel-des-features)) ; les désactiver toutes restitue exactement la stack minimale du tableau. Le noyau — JSON-RPC, transport, registres, schémas `zod`, erreurs structurées, observabilité — n'a jamais besoin d'option.
 
@@ -91,37 +91,42 @@ Les features sont **additives** : sans aucune feature, le cœur ne compile **que
 
 ```toml
 [dependencies]
-litemcp = "0.9.0"
+litemcp = "0.9.1"
 
 # pour la macro #[tool] (deps de compilation seulement) :
-# litemcp = { version = "0.9.0", features = ["macros"] }
+# litemcp = { version = "0.9.1", features = ["macros"] }
 # pour l'adaptateur schemars (#[derive(JsonSchema)] en schéma exécuteur) :
-# litemcp = { version = "0.9.0", features = ["schemars"] }
+# litemcp = { version = "0.9.1", features = ["schemars"] }
 ```
 
-## Démarrage rapide
+## Intégration
+
+LiteMCP est une **bibliothèque**, pas un serveur à lancer : rien à installer, rien à démarrer — vous ajoutez la dépendance à un projet existant et **votre programme** devient un serveur MCP. La preuve, dans un `main` déjà à vous :
 
 ```rust
 use litemcp::prelude::*;
 
 fn main() -> std::io::Result<()> {
-    ServerBuilder::new("calc", "1.0.0")
+    let bound = ServerBuilder::new("calc", "1.0.0")
         .tool("add", "Additionne deux nombres", |args| {
             let a = args["a"].as_i64().ok_or("a manquant")?;
             let b = args["b"].as_i64().ok_or("b manquant")?;
             Ok(serde_json::json!({ "somme": a + b }))
         })
-        .bind("127.0.0.1:8080")?   // socket bindé, un thread par connexion
-        .serve()                    // bloque : POST /mcp → JSON ou SSE
+        .bind_default()?;          // premier port libre de la tranche 23080–23099, repli éphémère
+    println!("MCP sur http://{}", bound.local_addr()?);
+    bound.serve()                   // bloque : POST /mcp → JSON ou SSE
 }
 ```
 
-C'est tout — votre serveur MCP écoute. Aucune session, aucun handshake, aucun runtime.
+C'est tout — votre binaire expose maintenant ses outils en MCP, dans son propre process. Aucune session, aucun handshake, aucun runtime.
 
-Vérifiez-le avec curl :
+**La lib n'affiche rien, par design** : aucun log, aucun banner — stdout et stderr vous appartiennent. C'est pourquoi l'exemple capture `bound` et affiche lui-même l'adresse : ce `println!` est du code utilisateur, pas de la lib. `bind_default()` prend **le premier port libre** de la tranche LiteMCP (`23080..=23099`) : le deuxième serveur LiteMCP de la machine démarre sans coordination ni collision, repli sur un port éphémère si la tranche est pleine. Un port explicite reste possible : `.bind("127.0.0.1:23080")`.
+
+Vérifiez-le avec curl (23080 dans le cas nominal — aucun autre serveur LiteMCP déjà lancé ; sinon, le port effectif est celui affiché par votre `main`) :
 
 ```bash
-curl -s http://127.0.0.1:8080/mcp \
+curl -s http://127.0.0.1:23080/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"a":5,"b":7}}}'
@@ -131,7 +136,7 @@ curl -s http://127.0.0.1:8080/mcp \
 {"jsonrpc":"2.0","id":1,"result":{"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"calc","version":"1.0.0"}},"content":[{"text":"{\"somme\":12}","type":"text"}],"resultType":"complete","structuredContent":{"somme":12}}}
 ```
 
-Ou avec MCP Inspector en mode URL : `npx @modelcontextprotocol/inspector` → `http://127.0.0.1:8080/mcp`.
+Ou avec MCP Inspector en mode URL : `npx @modelcontextprotocol/inspector` → `http://127.0.0.1:23080/mcp` (le port effectif est celui affiché par votre `main`).
 
 Un exemple complet (les trois registres d'outils + annotations) : `cargo run --example hello`.
 
@@ -166,7 +171,7 @@ ServerBuilder::new("recherche", "1.0.0")
         },
     )
     .annotate("search", ToolAnnotations::new().title("Recherche").read_only(true))
-    .bind("127.0.0.1:8080")?
+    .bind("127.0.0.1:23080")?
     .serve()?;
 ```
 
@@ -258,7 +263,7 @@ ServerBuilder::new("calc", "1.0.0")
     .with_tool(register_add)
     .with_tool(register_doc)
     .with_tool(register_revue)
-    .bind("127.0.0.1:8080")?
+    .bind("127.0.0.1:23080")?
     .serve()?;
 ```
 
@@ -290,7 +295,7 @@ ServerBuilder::new("recherche", "1.0.0")
         // arguments validés par le schéma dérivé du struct
         Ok(serde_json::json!({}))
     })
-    .bind("127.0.0.1:8080")?
+    .bind("127.0.0.1:23080")?
     .serve()?;
 ```
 
@@ -310,7 +315,7 @@ let schema = from_json_schema(json!({
 
 ServerBuilder::new("app", "1.0.0")
     .tool_typed("t", "t", schema, |args| Ok(args.clone()))
-    .bind("127.0.0.1:8080")?
+    .bind("127.0.0.1:23080")?
     .serve()?;
 ```
 
@@ -333,7 +338,7 @@ ServerBuilder::new("doc", "1.0.0")
         let fichier = args.get("fichier").and_then(|v| v.as_str()).unwrap_or("src/main.rs");
         Ok(vec![PromptMessage::user(format!("Relis {fichier} et liste les risques."))])
     })
-    .bind("127.0.0.1:8080")?
+    .bind("127.0.0.1:23080")?
     .serve()?;
 ```
 
@@ -356,6 +361,7 @@ La valeur de retour d'un outil devient `structuredContent` — un objet JSON pas
 | Méthode | Défaut | Rôle |
 |---|---|---|
 | `.route(path)` | `/mcp` | chemin unique du serveur — **validé au bind** : doit commencer par `/`, sans query, et ne pas masquer `/health` (sinon erreur `InvalidInput`, pas de serveur silencieusement injoignable) |
+| `.bind_default()` | premier libre dans `23080..=23099` ([`DEFAULT_PORT_RANGE`](#intégration)) | auto-attribution sur `127.0.0.1` : le premier port libre de la tranche LiteMCP gagne (le 2ᵉ, 10ᵉ… process démarre sans collision) ; tranche pleine → port éphémère OS ; port effectif via `local_addr()` et publié par `.announce()`. `.bind(addr)` reste le bind explicite |
 | `.allow_origins(&[..])` | vide | origines `Origin` autorisées (clients navigateur) — toute requête avec `Origin` non listée est refusée (garde DNS-rebinding) ; les clients CLI n'en envoient pas. Format : l'origine **normalisée navigateur** — schéma + hôte en minuscules, **sans port par défaut** (un navigateur écrit `https://a.example`, jamais `https://a.example:443`) ; comparaison exacte insensible à la casse |
 | `.read_timeout(duration)` | 30 s | timeout de lecture par opération (anti-slowloris) — un client trop lent est déconnecté sans réponse |
 | `.max_connections(n)` | 256 (par serveur) | plafond de connexions simultanées — au-delà, `503` immédiat, pas de spawn |
@@ -388,13 +394,13 @@ ServerBuilder::new("calc", "1.0.0")
                 .with_header("WWW-Authenticate", "Bearer")),
         }
     })
-    .bind("127.0.0.1:8080")?
+    .bind("127.0.0.1:23080")?
     .serve()?;
 ```
 
 Le **TLS**, lui, n'est pas implémenté (choix architectural : voir le comparatif ViteMCP, « OAuth 2.1 intégré » est écarté volontairement) — il vit à la périphérie, exactement comme pour tout service interne d'un SI. Le durcissement intégré couvre le protocole ; l'identité et le chiffrement sont à votre charge :
 
-- **Liaison** : bind `127.0.0.1:8080` (comme dans tous les exemples) si le serveur ne parle qu'à des processus locaux ; sinon, exposez derrière un **reverse proxy** qui apporte TLS, l'authentification forte (OIDC/SAML, OAuth 2.1 — l'OIDC intégré au serveur reste écarté volontairement : c'est le métier du gateway) et le rate-limiting **par identité/IP** — pour l'auth token « quick fix » ou un rate-limit maison, le verrou `.on_request` suffit en process (derrière un proxy, `ctx.peer` est l'adresse du proxy : ne croyez `X-Forwarded-For` qu'après avoir vérifié le pair). Le plafond de connexions de LiteMCP est **global au serveur** (256 par défaut) : 256 clients lents peuvent l'occuper et renvoyer `503` aux autres, c'est à ça que sert le quota par IP du proxy (le TTL de connexion de 5 min borne par ailleurs la durée d'occupation d'un slot) ;
+- **Liaison** : bind `127.0.0.1:23080` (comme dans tous les exemples) si le serveur ne parle qu'à des processus locaux ; sinon, exposez derrière un **reverse proxy** qui apporte TLS, l'authentification forte (OIDC/SAML, OAuth 2.1 — l'OIDC intégré au serveur reste écarté volontairement : c'est le métier du gateway) et le rate-limiting **par identité/IP** — pour l'auth token « quick fix » ou un rate-limit maison, le verrou `.on_request` suffit en process (derrière un proxy, `ctx.peer` est l'adresse du proxy : ne croyez `X-Forwarded-For` qu'après avoir vérifié le pair). Le plafond de connexions de LiteMCP est **global au serveur** (256 par défaut) : 256 clients lents peuvent l'occuper et renvoyer `503` aux autres, c'est à ça que sert le quota par IP du proxy (le TTL de connexion de 5 min borne par ailleurs la durée d'occupation d'un slot) ;
 - **Navigateurs** : garde DNS-rebinding intégrée — toute requête portant un `Origin` non listé dans `.allow_origins` est refusée (`403`), et les préflights CORS échouent par défaut (`OPTIONS` → `405`) ;
 - **Handlers bloquants** : par défaut il n'y a pas de timeout d'exécution — un handler qui bloque retient son thread et son slot de connexion. `.tool_timeout(duration)` borne la **réponse** (résultat `isError`/`-32000` passé le délai) mais ne peut pas tuer le thread du handler (Rust n'a pas d'annulation de thread) : il termine en arrière-plan et son résultat est ignoré. Pour des effets de bord annulables, encadrez vos appels lents vous-même ;
 - **Validation** : privilégiez `tool_typed`/`tool_parse` (schéma appliqué **avant** votre code) ; `tool` brut vous laisse la validation des arguments — c'est là que naissent les bugs d'injection côté handler, pas dans le transport. Le schéma publié est **exécuteur** : ce qu'il annonce est exactement ce que la validation applique.
@@ -507,7 +513,7 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 | Mémoire après 2 300 requêtes | < 10 Mo | **2,7 Mio `VmRSS`, +4 Kio pendant la charge** ✅ |
 | Démarrage in-process | < 10 ms | **~0,4 ms** ✅ |
 
-`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **278 tests** (dont fuzz proptest ; 260 sans feature optionnelle) est vérifiée sur les deux OS.
+`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **289 tests** (dont fuzz proptest ; 271 sans feature optionnelle) est vérifiée sur les deux OS.
 
 ## Comparatif — ViteMCP (TypeScript)
 
@@ -546,7 +552,7 @@ Si vous contrôlez le proxy, la configuration propre :
 
 ```nginx
 location /mcp {
-    proxy_pass http://127.0.0.1:8080;
+    proxy_pass http://127.0.0.1:23080;
     proxy_http_version 1.1;
     proxy_buffering off;        # optionnel : X-Accel-Buffering: no suffit
     proxy_read_timeout 3600s;
@@ -586,7 +592,7 @@ Le détail — jalons, SLO, risques, journal : [docs/ROADMAP.md](https://github.
 ## FAQ
 
 **Par où commencer ?**
-Par le [tutoriel pas à pas](https://deamondev888.github.io/litemcp-tuto/) — il construit un serveur MCP complet avec LiteMCP, du premier `#[tool]` aux schémas, ressources et prompts. Le [Démarrage rapide](#démarrage-rapide) ci-dessus suffit pour un premier serveur en dix lignes ; les [Concepts](#concepts) détaillent chaque surface ; la [doc du crate](https://docs.rs/litemcp) (docs.rs) référence aussi le tutoriel.
+Par le [tutoriel pas à pas](https://deamondev888.github.io/litemcp-tuto/) — il construit un serveur MCP complet avec LiteMCP, du premier `#[tool]` aux schémas, ressources et prompts. L'[Intégration](#intégration) ci-dessus suffit pour exposer vos premiers outils depuis un programme existant en dix lignes ; les [Concepts](#concepts) détaillent chaque surface ; la [doc du crate](https://docs.rs/litemcp) (docs.rs) référence aussi le tutoriel.
 
 **Pourquoi un seul transport ?**
 Parce qu'un serveur lancé comme sous-processus d'un client meurt avec lui et n'accepte qu'un seul pair — c'est le modèle du client, pas de la lib. LiteMCP fait le choix inverse : **votre programme devient un démon Streamable HTTP stateless**, bindé sur un socket TCP, que plusieurs agents peuvent joindre, qui survit aux clients et se déploie derrière nginx. Le MCP local en sous-processus est hors périmètre, par conception.

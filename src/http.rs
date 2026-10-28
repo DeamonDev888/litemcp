@@ -347,7 +347,7 @@ impl BoundServer {
     /// # fn main() -> std::io::Result<()> {
     /// let bound = ServerBuilder::new("calc", "1.0.0")
     ///     .tool("add", "Additionne", |_args| Ok(serde_json::json!({})))
-    ///     .bind("127.0.0.1:8080")?;
+    ///     .bind("127.0.0.1:23080")?;
     /// let handle = bound.handle();
     /// std::thread::spawn(move || {
     ///     let _ = bound.serve();

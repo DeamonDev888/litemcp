@@ -12,6 +12,22 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
+### Prévu (suite)
+
+- Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur ;
+- Phase 7 « écosystème entreprise » : guide de déploiement (TLS au gateway/mesh, OIDC à la périphérie), recette Prometheus sur `on_call`, story stateless/scaling.
+
+## [0.9.1] - 2026-10-28
+
+### Ajouté
+
+- **`ServerBuilder::bind_default()` — auto-attribution du port** : bind sur `127.0.0.1` en prenant **le premier port libre** de la tranche LiteMCP `23080..=23099` (nouvelle constante `litemcp::DEFAULT_PORT_RANGE`, prelude inclus) — le deuxième, le dixième… serveur LiteMCP d'une machine démarre sans coordination ni collision, et si les vingt ports sont occupés, repli sur un **port éphémère** alloué par l'OS (jamais d'échec faute de place dans la tranche). Le port effectif reste lisible via `BoundServer::local_addr()` et publié par `.announce()` (MCP Control connaît toujours le port réel, y compris après repli). La validation de route est identique à `.bind(addr)`, qui reste inchangé pour un port explicite — le corps commun (`validate_route` + construction) est partagé par les deux ;
+
+### Modifié
+
+- **Port par défaut des exemples et de la documentation : 23080** (remplace 8080) — le 8080 est le port HTTP-alternatif le plus squatté (proxys, Tomcat, serveurs de dev) ; 23080 est en dessous de toutes les plages éphémères par défaut (Linux `32768–60999`, Windows/macOS `49152–65535`) et non attribué par l'IANA ; la seule ressource connue sur ce port (Soracom Funnel/Beam) est un point d'entrée cloud distant, jamais un socket local. Nouvelles constantes `litemcp::DEFAULT_PORT` (23080) et `litemcp::DEFAULT_ADDRESS` (`127.0.0.1:23080`, prelude inclus) ; la tranche `DEFAULT_PORT_RANGE` (23080–23099) est parcourue automatiquement par `bind_default()` (ci-dessus) ;
+- **README recentré sur la nuance lib/serveur** : la section « Démarrage rapide » devient **« Intégration »** — LiteMCP est une bibliothèque, pas un serveur à lancer : rien à installer, rien à démarrer, on ajoute la dépendance à un projet existant et *son programme* devient un serveur MCP ; l'exemple capture `bound` et affiche lui-même l'adresse effective (la lib reste **silencieuse par design** : aucun log, aucun banner, stdout/stderr appartiennent à l'utilisateur).
+
 ## [0.9.0] — 2026-10-27
 
 ### Ajouté
