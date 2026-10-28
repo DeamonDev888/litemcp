@@ -254,6 +254,40 @@ impl<T: ::schemars::JsonSchema + 'static> Schema for FromSchemars<T> {
         self.document().clone()
     }
 
+    // **Le défaut publié est APPLIÉ** (règle « publié = appliqué ») :
+    // `schemars` publie `"default"` pour un champ `#[serde(default)]` et le
+    // retire de `required` — sans injection, le handler recevrait un objet
+    // privé du champ que le schéma annonce couvrir. La valeur vit dans
+    // `properties.<nom>.default` du document ; l'injection est récursive
+    // (objets imbriqués, tableaux d'objets), guidée par le même document que
+    // celui publié dans `tools/list`.
+    fn default_value(&self) -> Option<&Value> {
+        self.document().get("default")
+    }
+
+    fn apply_defaults(&self, value: &mut Value) {
+        let document = self.document();
+        let Some(properties) = document.get("properties").and_then(Value::as_object) else {
+            return;
+        };
+        apply_defaults_into(document, properties, value, 0);
+    }
+
+    fn has_defaults(&self) -> bool {
+        // Échappatoire zéro-allocation : parcourir le document publié (une
+        // fois caché par `document()`), sans toucher aux arguments. Les
+        // `$ref` locaux sont résolus (un sous-objet peut porter ses propres
+        // défauts derrière un `#/$defs/…`).
+        let document = self.document();
+        let Some(properties) = document.get("properties").and_then(Value::as_object) else {
+            return document_has_default(document);
+        };
+        properties.values().any(|property| {
+            let resolved = resolve_local_ref(document, property);
+            document_has_default(resolved)
+        }) || document_has_default(document)
+    }
+
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         // Le validateur **avec `format` activé** : la promesse de litemcp
         // est que le schéma publié est exécuté — or `format` est une
@@ -284,6 +318,162 @@ impl<T: ::schemars::JsonSchema + 'static> Schema for FromSchemars<T> {
             }
         }
     }
+}
+
+/// Profondeur maximale de résolution des `$ref` locaux — borne la
+/// récursion (un schéma auto-référent ne doit pas boucler).
+const MAX_REF_DEPTH: usize = 16;
+
+/// Résout un `$ref` **local** (`#/$defs/…`, `#/definitions/…`) vers le
+/// sous-document qu'il désigne.
+///
+/// Seules les références internes au document publié sont résolues : aucune
+/// résolution réseau, aucune référence externe (SEP-2106 — un `$ref` distant
+/// ne doit jamais déclencher de requête).
+fn resolve_local_ref<'a>(document: &'a Value, node: &'a Value) -> &'a Value {
+    let Some(reference) = node.get("$ref").and_then(Value::as_str) else {
+        return node;
+    };
+    let Some(pointer) = reference.strip_prefix('#') else {
+        // Référence externe : laissée telle quelle (jamais résolue).
+        return node;
+    };
+    // Pointeur JSON : `#/$defs/Nested` → `$defs` → `Nested`.
+    let mut current = document;
+    for segment in pointer.split('/').filter(|s| !s.is_empty()) {
+        let segment = segment.replace("~1", "/").replace("~0", "~");
+        match current.get(&segment) {
+            Some(next) => current = next,
+            None => return node,
+        }
+    }
+    current
+}
+
+/// Injecte les défauts publiés dans `value` (objet racine d'arguments),
+/// d'après les `properties` du document.
+fn apply_defaults_into(
+    document: &Value,
+    properties: &serde_json::Map<String, Value>,
+    value: &mut Value,
+    depth: usize,
+) {
+    if depth > MAX_REF_DEPTH {
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for (name, raw_property) in properties {
+        let property = resolve_local_ref(document, raw_property);
+        match object.get_mut(name) {
+            // Champ présent : descendre (l'objet imbriqué porte ses propres
+            // défauts).
+            Some(child) => apply_defaults_document(document, property, child, depth + 1),
+            // Champ absent : injecter le défaut publié, puis le valider
+            // contre sa sous-structure (un défaut objet peut porter ses
+            // propres défauts imbriqués).
+            None => {
+                if let Some(default) = property.get("default") {
+                    let mut injected = default.clone();
+                    apply_defaults_document(document, property, &mut injected, depth + 1);
+                    object.insert(name.clone(), injected);
+                }
+            }
+        }
+    }
+}
+
+/// Injecte récursivement les défauts d'un **sous-document** dans une valeur
+/// déjà présente ou fraîchement injectée — objets (`properties`) et tableaux
+/// (`items`). Guidée par le même document que celui publié.
+fn apply_defaults_document(document: &Value, property: &Value, value: &mut Value, depth: usize) {
+    if depth > MAX_REF_DEPTH {
+        return;
+    }
+    // Objet : chaque propriété absente portant un `default` est injectée.
+    if let Some(object) = value.as_object_mut() {
+        let resolved = resolve_local_ref(document, property);
+        if let Some(properties) = resolved.get("properties").and_then(Value::as_object) {
+            for (name, raw_sub) in properties {
+                let sub = resolve_local_ref(document, raw_sub);
+                match object.get_mut(name) {
+                    Some(child) => apply_defaults_document(document, sub, child, depth + 1),
+                    None => {
+                        if let Some(default) = sub.get("default") {
+                            let mut injected = default.clone();
+                            apply_defaults_document(document, sub, &mut injected, depth + 1);
+                            object.insert(name.clone(), injected);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    // Tableau : le schéma `items` s'applique à chaque élément.
+    if let Some(array) = value.as_array_mut() {
+        let resolved = resolve_local_ref(document, property);
+        if let Some(items) = resolved.get("items") {
+            for element in array {
+                apply_defaults_document(document, items, element, depth + 1);
+            }
+        }
+    }
+}
+
+/// Le document (ou l'un de ses sous-schémas) porte-t-il un mot-clé `default` ?
+/// Recherche récursive bornée aux mots-clés de structure (`properties`,
+/// `items`, `additionalProperties`, les combinateurs), jamais sur les valeurs
+/// utilisateur : un `default: {"properties": ...}` littéral n'est pas suivi.
+fn document_has_default(document: &Value) -> bool {
+    document.as_object().is_some_and(object_has_default)
+}
+
+/// Variante sur la carte (évite tout clone dans la récursion).
+///
+/// Les mots-clés de structure n'ont pas tous la même forme :
+/// - `properties` et `patternProperties` sont des **cartes nom → schéma**
+///   (chaque VALEUR est un schéma) ;
+/// - `items` et `additionalProperties` sont un schéma (ou un tableau de
+///   schémas pour `items`) ;
+/// - `allOf`/`anyOf`/`oneOf` sont des **tableaux de schémas** ;
+/// - `not` est un schéma.
+fn object_has_default(object: &serde_json::Map<String, Value>) -> bool {
+    if object.contains_key("default") {
+        return true;
+    }
+    // `properties` / `patternProperties` : chaque valeur est un schéma.
+    for key in ["properties", "patternProperties"] {
+        if let Some(map) = object.get(key).and_then(Value::as_object) {
+            if map.values().any(document_has_default) {
+                return true;
+            }
+        }
+    }
+    // `items` (schéma ou tableau de schémas) et `additionalProperties`.
+    for key in ["items", "additionalProperties"] {
+        if let Some(sub) = object.get(key) {
+            if document_has_default(sub) {
+                return true;
+            }
+        }
+    }
+    // Combinateurs : tableaux de schémas.
+    for key in ["allOf", "anyOf", "oneOf"] {
+        if let Some(items) = object.get(key).and_then(Value::as_array) {
+            if items.iter().any(document_has_default) {
+                return true;
+            }
+        }
+    }
+    // `not` : un schéma.
+    if let Some(sub) = object.get("not") {
+        if document_has_default(sub) {
+            return true;
+        }
+    }
+    false
 }
 
 /// `/a/0/b` → `.a[0].b` (segments numériques en index).

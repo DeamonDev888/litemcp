@@ -6,7 +6,7 @@
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.8.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.9.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
 [![crates.io](https://img.shields.io/crates/v/litemcp.svg)](https://crates.io/crates/litemcp) [![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI)](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml) [![Docs](https://img.shields.io/docsrs/litemcp)](https://docs.rs/litemcp)
 
@@ -84,18 +84,19 @@ Les features sont **additives** : sans aucune feature, le cœur ne compile **que
 | 🩺 **Erreurs structurées & observabilité** | `ToolError` (`rate_limited`, `timeout`, `upstream`… avec `retryable`/`retryAfterMs`) + `.on_call(hook)` pour métriques et latences |
 | 🔐 **Verrou de requête** | `.on_request(hook)` : verdict par requête **avant la lecture du corps** — auth par token, rate-limit par source ; rejet `401`/`403`/`429` + `Retry-After`, paniques contenues |
 | 🛑 **Arrêt propre** | `bound.handle()` puis `handle.shutdown()` : `serve()` rend `Ok(())`, les connexions ferment entre deux requêtes |
+| 🔀 **Gateways dynamiques** | `Gateway` : la surface d'outils change **pendant que le serveur sert** — un serveur détecté apparaît/disparaît de `tools/list` sans redémarrage, les requêtes en vol finissent sur leur snapshot |
 | 🛡️ **Sûr par défaut** | `#![forbid(unsafe_code)]`, garde DNS-rebinding, corps limité |
 
 ## Installation
 
 ```toml
 [dependencies]
-litemcp = "0.8.0"
+litemcp = "0.9.0"
 
 # pour la macro #[tool] (deps de compilation seulement) :
-# litemcp = { version = "0.8.0", features = ["macros"] }
+# litemcp = { version = "0.9.0", features = ["macros"] }
 # pour l'adaptateur schemars (#[derive(JsonSchema)] en schéma exécuteur) :
-# litemcp = { version = "0.8.0", features = ["schemars"] }
+# litemcp = { version = "0.9.0", features = ["schemars"] }
 ```
 
 ## Démarrage rapide
@@ -506,7 +507,7 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 | Mémoire après 2 300 requêtes | < 10 Mo | **2,7 Mio `VmRSS`, +4 Kio pendant la charge** ✅ |
 | Démarrage in-process | < 10 ms | **~0,4 ms** ✅ |
 
-`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **196 tests** (dont fuzz proptest) est vérifiée sur les deux OS.
+`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **278 tests** (dont fuzz proptest ; 260 sans feature optionnelle) est vérifiée sur les deux OS.
 
 ## Comparatif — ViteMCP (TypeScript)
 
@@ -559,7 +560,7 @@ location /mcp {
 ## Tests
 
 ```bash
-cargo test --workspace --all-features   # 196 tests : unitaires + intégration (vraies sockets) + doctests
+cargo test --workspace --all-features   # 289 tests : unitaires + intégration (vraies sockets) + doctests
 cargo clippy --workspace --all-targets --all-features -- -D warnings   # CI stricte
 cargo fmt --check                       # formatage
 ```

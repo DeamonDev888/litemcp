@@ -484,6 +484,29 @@ impl ServerCore {
             }
             // Notification de protocole (`notifications/*`) : message de
             // contrôle sans effet en mode stateless — acceptée et ignorée.
+            //
+            // Une notification qui n'est NI une action NI un message
+            // `notifications/*` est **inconnue** : la traiter comme une
+            // notification de protocole reviendrait à valider par le silence
+            // une méthode que le serveur ne connaît pas (et à laisser un
+            // futur ajout de méthode d'action non listée s'exécuter en mode
+            // notification). Refus explicite, comme pour les actions.
+            if !protocol::is_protocol_notification(&incoming.method) {
+                return Some(self.protocol_failure(
+                    &Value::Null,
+                    &incoming,
+                    name,
+                    started,
+                    ErrorObject::new(
+                        ErrorObject::INVALID_REQUEST,
+                        format!(
+                            "unknown notification: `{}` — only `notifications/*` are accepted \
+                             (action methods require a request with an `id`)",
+                            sanitize_echo(&incoming.method)
+                        ),
+                    ),
+                ));
+            }
             self.emit_call(
                 &incoming.method,
                 None,
@@ -717,6 +740,14 @@ impl ServerCore {
             capabilities: self.capabilities(),
             meta: self.meta(),
         }
+    }
+
+    /// Noms des outils de CE snapshot, dans l'ordre du `tools/list` servi —
+    /// introspection sans sérialisation (journaux, tests, gateways qui
+    /// comparent leur registre à leur état détecté).
+    #[must_use]
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
     }
 
     fn list_tools(&self) -> ToolsListResult {
@@ -1300,6 +1331,8 @@ pub struct ServerBuilder {
     /// Hooks de requête enregistrés par [`Self::on_request`] — verdict
     /// d'accès (auth, rate-limit) avant lecture du corps.
     request_hooks: Vec<Arc<RequestHook>>,
+    /// Plafond d'octets d'une réponse JSON-RPC sérialisée (`0` : illimité).
+    max_response_bytes: usize,
     /// Annonce au MCP Control (voir [`Self::announce`]).
     announce: bool,
 }
@@ -1324,6 +1357,7 @@ impl ServerBuilder {
             tool_timeout: None,
             hooks: Vec::new(),
             request_hooks: Vec::new(),
+            max_response_bytes: MAX_RESPONSE_BYTES,
             announce: false,
         }
     }
@@ -1423,6 +1457,9 @@ impl ServerBuilder {
     ///   requêtes déjà refusées par le durcissement de transport (`400`,
     ///   `431`, `403` Origin, `411`, `413`) — le verrou utilisateur ne fait
     ///   qu'autoriser la route MCP ;
+    /// - il s'exécute **avant** le verdict de méthode (`405`) : une requête
+    ///   non autorisée ne doit pas apprendre que la route existe autrement
+    ///   que par un refus d'authentification (`401`/`403` gagne sur `405`) ;
     /// - un rejet répond le statut avec le message en corps JSON et **ferme
     ///   la connexion** (le corps non lu ne peut pas être réinterprété) ;
     /// - les en-têtes supplémentaires ([`RequestRejection::with_header`])
@@ -1502,6 +1539,22 @@ impl ServerBuilder {
     #[must_use]
     pub fn allow_origins(mut self, origins: &[&str]) -> Self {
         self.allow_origins = origins.iter().map(|o| (*o).to_string()).collect();
+        self
+    }
+
+    /// Plafond de taille d'une réponse JSON-RPC sérialisée (octets).
+    ///
+    /// Défaut : [`MAX_RESPONSE_BYTES`] (16 Mio). `0` = illimité (le contrôle
+    /// est désactivé).
+    ///
+    /// Le contrôle est appliqué sur la réponse **après** sérialisation : il
+    /// borne le transit, pas l'allocation. Pour borner la mémoire, c'est la
+    /// taille de la **valeur rendue par le handler** qu'il faut surveiller
+    /// (un handler qui rend 100 Mo consomme 100 Mo avant d'être refusé) —
+    /// ce plafond protège le réseau, pas le tas.
+    #[must_use]
+    pub fn max_response_bytes(mut self, max: usize) -> Self {
+        self.max_response_bytes = max;
         self
     }
 
@@ -1647,6 +1700,49 @@ impl ServerBuilder {
         let output_schema = self.output_schemas.remove(name).or(previous_output);
         let annotations = self.annotations.remove(name).or(previous_annotations);
         (output_schema, annotations)
+    }
+
+    /// Retire un outil du registre — le socle des gateways dynamiques
+    /// (module [`crate::gateway`]) : un serveur détecté disparaît, son outil
+    /// doit disparaître de `tools/list` sans redémarrer le process.
+    ///
+    /// Retourne `true` si l'outil existait. Les annotations et schémas de
+    /// sortie **en attente** pour ce nom sont purgés en même temps : un
+    /// ré-enregistrement ultérieur du même nom repart propre, sans
+    /// ressusciter des métadonnées que l'opérateur a explicitement retirées.
+    /// Un outil absent → `false`, aucun autre changement.
+    pub fn remove_tool(&mut self, name: &str) -> bool {
+        let existed = self.tools.remove(name).is_some();
+        self.annotations.remove(name);
+        self.output_schemas.remove(name);
+        existed
+    }
+
+    /// Retire une **ressource** du registre — le pendant retrait de
+    /// [`Self::remove_tool`] pour les ressources : un serveur détecté
+    /// disparaît, sa ressource disparaît de `resources/list`.
+    ///
+    /// Retourne `true` si la ressource existait. Une ressource absente →
+    /// `false`, aucun autre changement.
+    pub fn remove_resource(&mut self, uri: &str) -> bool {
+        self.resources.remove(uri).is_some()
+    }
+
+    /// Retire un **prompt** du registre — le pendant retrait de
+    /// [`Self::remove_tool`] pour les prompts.
+    ///
+    /// Retourne `true` si le prompt existait. Un prompt absent → `false`,
+    /// aucun autre changement.
+    pub fn remove_prompt(&mut self, name: &str) -> bool {
+        self.prompts.remove(name).is_some()
+    }
+
+    /// Noms des outils enregistrés, dans l'ordre alphabétique (ordre du
+    /// `tools/list` servi). Utile aux tests et aux gateways qui veulent
+    /// comparer le registre à leur état détecté sans sérialiser.
+    #[must_use]
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
     }
 
     /// Enregistre un outil.
@@ -1832,7 +1928,7 @@ impl ServerBuilder {
             tool_timeout: self.tool_timeout,
             max_inflight_handlers: MAX_INFLIGHT_HANDLERS,
             inflight_handlers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            max_response_bytes: MAX_RESPONSE_BYTES,
+            max_response_bytes: self.max_response_bytes,
             hooks: Arc::new(self.hooks.clone()),
             tools_list_cache: std::sync::OnceLock::new(),
             resources_list_cache: std::sync::OnceLock::new(),
@@ -1909,7 +2005,7 @@ impl ServerBuilder {
             tool_timeout: self.tool_timeout,
             max_inflight_handlers: MAX_INFLIGHT_HANDLERS,
             inflight_handlers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            max_response_bytes: MAX_RESPONSE_BYTES,
+            max_response_bytes: self.max_response_bytes,
             hooks: Arc::new(self.hooks),
             tools_list_cache: std::sync::OnceLock::new(),
             resources_list_cache: std::sync::OnceLock::new(),

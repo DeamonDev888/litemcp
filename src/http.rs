@@ -474,12 +474,17 @@ impl BoundServer {
                         }
                     }
                 } else {
-                    // Trop de refus en vol : on rend le slot et on ferme net.
+                    // Trop de refus en vol : on rend le slot et on ferme SANS
+                    // répondre — écrire un 503 inline (drain 50 ms) bloquerait
+                    // la boucle d'accept (latence d'acceptation ×N pendant la
+                    // vague). Mieux vaut un RST pour CE client qu'un serveur
+                    // gelé pour tous : c'est ce que la doc promet.
                     pending.fetch_sub(1, Ordering::Relaxed);
+                    drop(stream);
+                    continue;
                 }
-                // Repli : écriture inline (bloquante, bornée par
-                // `shutdown_gracefully`) — utilisé seulement si le thread n'a
-                // pas pu être créé.
+                // Repli (spawn impossible uniquement) : écriture inline
+                // bloquante, bornée par `shutdown_gracefully`.
                 let _ = respond(
                     &mut stream,
                     "503 Service Unavailable",
@@ -823,6 +828,15 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 deadline = conn_end;
             }
         }
+        // **Restauration du timeout de lecture** : `tighten_read_timeout`
+        // ne fait que RESSERRER le timeout du socket (budget résiduel
+        // < read_timeout). Sans restauration explicite, une requête lente
+        // laisse le socket avec un timeout résiduel minuscule — la requête
+        // keep-alive SUIVANTE est alors coupée sans réponse alors que son
+        // gap est légal (< read_timeout). On repose le timeout nominal à
+        // chaque tour ; `tighten_read_timeout` le resserrera si le budget
+        // de cette requête l'exige.
+        let _ = reader.get_ref().set_read_timeout(Some(read_timeout));
 
         // Ligne de requête — bornée, deadline globale.
         match read_line_capped(
@@ -919,6 +933,10 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
         // Version sensible à la casse (RFC 9112 §2.3 : le protocole est un
         // jeton exact) — `http/1.1` n'est pas une version, c'est du garbage.
         let http10 = version == "HTTP/1.0";
+        // Version annoncée dans la ligne de statut : on répond dans la
+        // version de la requête (un client HTTP/1.0 strict refuse une
+        // réponse `HTTP/1.1`).
+        let response_version = if http10 { "HTTP/1.0" } else { "HTTP/1.1" };
         if !http10 && version != "HTTP/1.1" {
             respond_error(
                 &mut stream,
@@ -986,6 +1004,17 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
         let mut mcp_name: Option<String> = None;
         let mut mcp_method_duplicate = false;
         let mut mcp_name_duplicate = false;
+        // En-têtes d'identité (auth / cookies / proxy) : un doublon rend le
+        // verdict d'authentification dépendant de l'ordre de lecture (la
+        // première occurrence ici, une combinaison ou la dernière occurrence
+        // chez un reverse proxy) — refusé comme les autres en-têtes à valeur
+        // unique.
+        let mut authorization_seen = false;
+        let mut authorization_duplicate = false;
+        let mut cookie_seen = false;
+        let mut cookie_duplicate = false;
+        let mut x_forwarded_for_seen = false;
+        let mut x_forwarded_for_duplicate = false;
         // `Connection: close` a-t-il été vu ? (HTTP/1.0 : la connexion est
         // fermée par défaut, `keep-alive` doit pouvoir la maintenir ouverte,
         // mais `close` reste ABSORBANT s'il apparaît).
@@ -1220,6 +1249,24 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                     } else {
                         mcp_name = Some(value.to_string());
                     }
+                } else if name.eq_ignore_ascii_case("authorization") {
+                    if authorization_seen {
+                        authorization_duplicate = true;
+                    } else {
+                        authorization_seen = true;
+                    }
+                } else if name.eq_ignore_ascii_case("cookie") {
+                    if cookie_seen {
+                        cookie_duplicate = true;
+                    } else {
+                        cookie_seen = true;
+                    }
+                } else if name.eq_ignore_ascii_case("x-forwarded-for") {
+                    if x_forwarded_for_seen {
+                        x_forwarded_for_duplicate = true;
+                    } else {
+                        x_forwarded_for_seen = true;
+                    }
                 } else if name.eq_ignore_ascii_case("connection") {
                     let mut has_close = false;
                     let mut has_keep_alive = false;
@@ -1304,6 +1351,9 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
             || sec_fetch_site_duplicate
             || mcp_method_duplicate
             || mcp_name_duplicate
+            || authorization_duplicate
+            || cookie_duplicate
+            || x_forwarded_for_duplicate
         {
             respond_error(
                 &mut stream,
@@ -1435,11 +1485,20 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
         if len > MAX_BODY {
             // Le client peut déjà streamer le corps : on répond puis on
             // ferme — drainer 1 Mio+ nourrirait l'attaque qu'on refuse.
-            respond_error(
+            //
+            // Le drain de `respond_error` est borné à 64 Kio : au-delà, le
+            // tampon de réception n'est pas vidé et le `close()` émet un
+            // **RST** qui purge chez le client la réponse qu'on vient
+            // d'écrire (le 413 était perdu de façon non déterministe —
+            // mesuré : 4/8 à 8/8 selon la taille du corps et le délai de
+            // lecture). On passe donc par une réponse 413 **sans drain** :
+            // le FIN part, le client lit le 413, et le corps restant est
+            // abandonné (il sera jeté par le RST de fin de connexion, après
+            // que le client a lu la réponse).
+            respond_413_without_drain(
                 &mut stream,
                 "413 Payload Too Large",
                 "body too large",
-                "",
                 is_head,
             )?;
             return Ok(());
@@ -1469,11 +1528,14 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                     )?;
                     return Ok(());
                 }
-                respond(
+                respond_version(
                     &mut stream,
-                    "200 OK",
+                    &ResponseHead {
+                        version: response_version,
+                        status: "200 OK",
+                        content_type: "text/plain",
+                    },
                     "",
-                    "text/plain",
                     b"ok",
                     !close,
                     is_head,
@@ -1543,6 +1605,10 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
             }
         }
 
+        // Verdict de **méthode** : APRÈS le verrou utilisateur (l'auth gagne
+        // sur le `405` — un client non autorisé ne doit pas apprendre que la
+        // route existe autrement que par un refus d'authentification ; voir
+        // `tests/request_hook.rs::gate_runs_before_method_check`).
         if !is_post {
             respond_error(
                 &mut stream,
@@ -1612,6 +1678,28 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
             return Ok(());
         }
 
+        // **Cadrage de la requête** : le corps a été lu en entier ; s'il
+        // reste des octets DÉJÀ reçus dans le tampon, le client a envoyé plus
+        // que son `Content-Length`. Ces octets sont le début de la requête
+        // SUIVANTE (c'est ainsi que fonctionne le pipelining HTTP, supporté
+        // ici) — mais s'ils ne commencent pas par une ligne de requête
+        // plausible, le cadrage est ambigu : le résidu est alors attribué à
+        // CETTE requête (qui a mal annoncé sa longueur) au lieu de devenir
+        // une requête fantôme. Sans ce contrôle, un résidu non conforme
+        // produisait une réponse `400` parasite intercalée entre la réponse
+        // attendue et la requête suivante, et la fermeture de la connexion
+        // faisait perdre la réponse du client.
+        if !reader.buffer().is_empty() && !starts_a_request_line(reader.buffer()) {
+            let _ = respond_error(
+                &mut stream,
+                "400 Bad Request",
+                "request body larger than Content-Length",
+                "",
+                is_head,
+            );
+            return Ok(());
+        }
+
         let dispatch_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             // En-têtes de routage MCP (SEP-2243) — optionnels, mais
             // vérifiés s'ils sont présents.
@@ -1630,11 +1718,14 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
             Ok(Some(reply)) => reply,
             Ok(None) => {
                 // Notification : aucune réponse JSON-RPC attendue.
-                respond(
+                respond_version(
                     &mut stream,
-                    "202 Accepted",
+                    &ResponseHead {
+                        version: response_version,
+                        status: "202 Accepted",
+                        content_type: "application/json",
+                    },
                     "",
-                    "application/json",
                     b"",
                     !close,
                     false,
@@ -1659,11 +1750,14 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                     "id": request_id,
                     "error": { "code": -32603, "message": "internal error" }
                 });
-                respond(
+                respond_version(
                     &mut stream,
-                    "200 OK",
+                    &ResponseHead {
+                        version: response_version,
+                        status: "200 OK",
+                        content_type: "application/json",
+                    },
                     "",
-                    "application/json",
                     payload.to_string().as_bytes(),
                     false,
                     false,
@@ -1688,11 +1782,14 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
         // [`SSE_ANTI_BUFFERING`].
         if accept_sse && !accept_json {
             let event = format_sse_event(&reply);
-            respond(
+            respond_version(
                 &mut stream,
-                "200 OK",
+                &ResponseHead {
+                    version: response_version,
+                    status: "200 OK",
+                    content_type: "text/event-stream",
+                },
                 SSE_ANTI_BUFFERING,
-                "text/event-stream",
                 &event,
                 false,
                 false,
@@ -1701,11 +1798,14 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
             break; // un seul événement de réponse, puis clôture
         }
 
-        respond(
+        respond_version(
             &mut stream,
-            "200 OK",
+            &ResponseHead {
+                version: response_version,
+                status: "200 OK",
+                content_type: "application/json",
+            },
             "",
-            "application/json",
             &reply,
             !close,
             false,
@@ -1747,6 +1847,27 @@ fn respond_error(
     // vient d'écrire (404/415/431 perdus quand la requête n'a pas été
     // intégralement consommée).
     shutdown_gracefully(stream);
+    Ok(())
+}
+
+/// Réponse `413` **sans drain** du corps restant.
+///
+/// Le drain de [`respond_error`] est borné à 64 Kio / 50 ms : au-delà, le
+/// tampon de réception garde des octets et le `close()` émet un RST qui
+/// purge la réponse chez le client (le 413 est perdu). Ici, on écrit la
+/// réponse puis on envoie **seulement** un FIN (`shutdown(Write)`) : le
+/// client lit le 413, et les octets résiduels du corps sont abandonnés —
+/// la connexion n'est de toute façon pas réutilisable (le cadrage de la
+/// requête est rompu).
+fn respond_413_without_drain(
+    stream: &mut TcpStream,
+    status: &str,
+    message: &str,
+    head: bool,
+) -> std::io::Result<()> {
+    let payload: &[u8] = &error_payload(message);
+    respond(stream, status, "", "application/json", payload, false, head)?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
     Ok(())
 }
 
@@ -1883,16 +2004,58 @@ fn respond(
     keep_alive: bool,
     head: bool,
 ) -> std::io::Result<()> {
+    respond_version(
+        stream,
+        &ResponseHead {
+            version: "HTTP/1.1",
+            status,
+            content_type,
+        },
+        extra_headers,
+        body,
+        keep_alive,
+        head,
+    )
+}
+
+/// En-tête de réponse — version HTTP, statut et type de contenu regroupés
+/// pour éviter une signature à huit arguments.
+struct ResponseHead<'a> {
+    /// Version annoncée dans la ligne de statut (`HTTP/1.0` ou `HTTP/1.1`).
+    version: &'a str,
+    /// Ligne de statut (`"200 OK"`, `"400 Bad Request"`…).
+    status: &'a str,
+    /// Type de contenu du corps.
+    content_type: &'a str,
+}
+
+/// Idem [`respond`] — la **ligne de statut** reflète la version HTTP de la
+/// requête (`HTTP/1.0` → `HTTP/1.0 200 OK`). Un client HTTP/1.0 strict peut
+/// refuser une réponse annoncée en `HTTP/1.1` ; la RFC 9112 §2.3 impose au
+/// récepteur HTTP/1.1 d'accepter `HTTP/1.0`, mais l'inverse n'est pas vrai.
+fn respond_version(
+    stream: &mut impl Write,
+    head_meta: &ResponseHead<'_>,
+    extra_headers: &str,
+    body: &[u8],
+    keep_alive: bool,
+    head: bool,
+) -> std::io::Result<()> {
+    let ResponseHead {
+        version,
+        status,
+        content_type,
+    } = *head_meta;
     let connection = if keep_alive { "keep-alive" } else { "close" };
     // En-tête et corps assemblés dans un seul buffer → **un seul write** :
     // avec nodelay, tête et corps partent dans le même segment TCP (deux
     // syscalls et un paquet de gagnés par réponse).
     let mut buf = Vec::with_capacity(
-        96 + status.len() + extra_headers.len() + content_type.len() + body.len(),
+        96 + version.len() + status.len() + extra_headers.len() + content_type.len() + body.len(),
     );
     write!(
         buf,
-        "HTTP/1.1 {status}\r\n{extra_headers}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
+        "{version} {status}\r\n{extra_headers}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
         body.len()
     )?;
     // Réponse à HEAD : en-têtes du GET équivalent, **sans corps** (RFC 9110
@@ -1903,6 +2066,38 @@ fn respond(
     }
     stream.write_all(&buf)?;
     stream.flush()
+}
+
+/// Le tampon résiduel commence-t-il par une **ligne de requête plausible** ?
+///
+/// Une ligne de requête commence par un jeton de méthode (`tchar`, RFC 9110
+/// §5.6.2) suivi d'un espace. Le test est volontairement tolérant :
+/// - pas encore d'espace dans le tampon → le jeton est encore en cours
+///   (pipelining partiel) : accepté si tous les caractères vus sont des
+///   `tchar` ;
+/// - espace présent → le jeton de méthode doit être complet et valide.
+///
+/// Un résidu qui ne ressemble à rien (binaire, JSON, texte arbitraire)
+/// n'est pas une requête : le cadrage est ambigu et la requête courante est
+/// refusée plutôt que de laisser un résidu devenir une requête fantôme.
+fn starts_a_request_line(buffer: &[u8]) -> bool {
+    // On ne regarde que la première ligne (jusqu'au premier LF).
+    let line = match buffer.iter().position(|&b| b == b'\n') {
+        Some(position) => &buffer[..position],
+        None => buffer,
+    };
+    // La ligne peut finir par un CR (CRLF) — on l'ignore.
+    let line = match line.last() {
+        Some(b'\r') => &line[..line.len() - 1],
+        _ => line,
+    };
+    match line.iter().position(|&b| b == b' ') {
+        // Espace trouvé : le jeton de méthode doit être complet et valide.
+        Some(position) => is_valid_token(&String::from_utf8_lossy(&line[..position])),
+        // Pas encore d'espace : jeton partiel — tous les caractères vus
+        // doivent être des `tchar` (un préfixe de méthode valide).
+        None => line.iter().all(|&b| is_tchar(b)),
+    }
 }
 
 /// Formate une charge utile en événement SSE (`data: ...\n\n`) en

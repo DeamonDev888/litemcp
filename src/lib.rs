@@ -51,6 +51,36 @@
 //! pour compteurs, latence et taux d'erreur sans instrumenter votre
 //! client.
 //!
+//! **Gateways** ([`Gateway`](crate::gateway::Gateway)) : le registre
+//! d'outils devient vivant — `edit()` ajoute/retire des outils pendant que
+//! le serveur sert, chaque requête part sur un snapshot immuable complet.
+//! C'est la brique qui permet à un serveur MCP de refléter en direct des
+//! serveurs détectés (outils proxy, catalogues qui apparaissent et
+//! disparaissent) sans redémarrer ; le dispatch embarqué
+//! ([`ServerCore`](crate::server::ServerCore)) se monte alors dans la route
+//! HTTP d'une app hôte qui possède déjà son propre socket durci.
+//!
+//! ```no_run
+//! use litemcp::prelude::*;
+//! use std::sync::Arc;
+//!
+//! # fn main() {
+//! let gw = Gateway::new(
+//!     ServerBuilder::new("gateway", "1.0.0")
+//!         .tool("ping", "Sonner le gateway", |_a| Ok(serde_json::json!({ "pong": true }))),
+//! );
+//!
+//! // Un serveur détecté apparaît : il est visible au prochain `tools/list`.
+//! gw.edit(|b| b.tool("srv__echo", "Echo du serveur détecté", |a| Ok(a.clone())));
+//!
+//! // Il disparaît : l'outil est retiré du catalogue.
+//! gw.edit(|mut b| {
+//!     b.remove_tool("srv__echo");
+//!     b
+//! });
+//! # }
+//! ```
+//!
 //! **Contrôle d'accès**
 //! ([`on_request`](crate::server::ServerBuilder::on_request)) : un verdict
 //! par requête HTTP — auth par token, rate-limit par source ou par clé —
@@ -102,6 +132,10 @@
 //! ```
 
 pub mod error;
+/// Registre **dynamique** — la surface d'outils change pendant le service
+/// ([`Gateway`](crate::gateway::Gateway)) : le socle des gateways qui
+/// reflètent des serveurs détectés.
+pub mod gateway;
 pub mod http;
 pub mod jsonrpc;
 /// Macros `#[tool]`/`#[resource]`/`#[prompt]` (feature `macros`) — voir
@@ -121,6 +155,7 @@ pub mod server;
 pub mod zod;
 
 pub use error::{ErrorCode, ToolError};
+pub use gateway::Gateway;
 pub use http::{RequestContext, RequestRejection};
 pub use server::{CallEvent, CallStatus, ServerBuilder, ServerCore, ToolResult};
 
@@ -131,6 +166,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod prelude {
     pub use crate::VERSION;
     pub use crate::error::{ErrorCode, ToolError};
+    pub use crate::gateway::Gateway;
     pub use crate::http::{RequestContext, RequestRejection, ServerHandle};
     #[cfg(feature = "macros")]
     pub use crate::macros::{prompt, resource, tool};

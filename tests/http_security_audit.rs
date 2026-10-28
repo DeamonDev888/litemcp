@@ -377,7 +377,10 @@ fn unknown_expect_header_returns_417_and_http10_never_emits_100_continue() {
         !raw.contains("100 Continue"),
         "HTTP/1.0 ne doit jamais recevoir 100 Continue : {raw:?}"
     );
-    assert!(raw.starts_with("HTTP/1.1 200 OK"), "{raw:?}");
+    // La ligne de statut reflète la version de la requête (m4, audit
+    // 2026-10-27) : un client HTTP/1.0 strict refuse une réponse annoncée
+    // en `HTTP/1.1`.
+    assert!(raw.starts_with("HTTP/1.0 200 OK"), "{raw:?}");
 }
 
 // ============================================================================
