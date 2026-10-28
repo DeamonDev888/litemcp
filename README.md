@@ -40,16 +40,16 @@ Les principes :
 
 | Jeu de features | Crates (projet consommateur) | Binaire release (LTO fat + strip) |
 |---|---|---|
-| **défaut** (rien d'activé) | **19** | **147 Kio** |
-| `+ macros` | 20 (+1) | 214 Kio (+67 Kio) |
-| `+ schemars` | 70 (+51) | **6,0 Mio** (+5,9 Mio) |
+| **défaut** (rien d'activé) | **12** | **263 Kio** |
+| `+ macros` | 13 (+1) | 320 Kio (+57 Kio) |
+| `+ schemars` | 67 (+55) | 6,1 Mio (+5,8 Mio) |
 
-*Mesuré le 2026-10-24 — Windows 11, rustc 1.99.1, release + `lto = "fat"` + `codegen-units = 1` + `strip`. Méthode : un projet consommateur externe dépendant de LiteMCP (un serveur, un outil), comparé avec et sans chaque feature — **la feature étant réellement utilisée**, sinon le linker élimine tout et le binaire ne change pas.*
+*Mesuré le 2026-10-28 — Windows 11, rustc 1.99.1, release + `lto = "fat"` + `codegen-units = 1` + `strip`. Méthode : un projet consommateur externe dépendant de LiteMCP (un serveur, un outil), comparé avec et sans chaque feature — **la feature étant réellement utilisée**, sinon le linker élimine tout et le binaire ne change pas.*
 
 **Le cœur est minimal par défaut.** Le build par défaut ne tire que deux dépendances : `serde` et `serde_json` — rien d'autre.
 
 - **`macros`** ajoute **une** crate locale (`litemcp-macros`, **zéro dépendance externe** : implémentée uniquement avec `proc_macro` de la bibliothèque standard — ni `syn`, ni `quote`, ni `proc-macro2`) ;
-- **`schemars`** est la feature à surveiller : elle tire `schemars` + `jsonschema` et **+51 crates transitives** (`regex`, `fancy-regex`, `num`, `parking_lot`, `ahash`…). Si vous l'utilisez réellement, le binaire passe de **147 Kio à 6,0 Mio** ; si vous l'activez sans l'utiliser, le linker élimine tout et le binaire reste à 147 Kio ;
+- **`schemars`** est la feature à surveiller : elle tire `schemars` + `jsonschema` et **+55 crates transitives** (`regex`, `fancy-regex`, `num`, `parking_lot`, `ahash`…). Si vous l'utilisez réellement, le binaire passe de **263 Kio à 6,1 Mio** ; si vous l'activez sans l'utiliser, le linker élimine tout et le binaire reste à 263 Kio ;
 - **Si vous voulez rester minimal**, gardez le jeu par défaut et utilisez le module `zod` intégré : il couvre le même terrain — validation, formats, défauts, dictionnaires, énumérations — **sans aucune dépendance de plus**.
 
 > Le cœur du crate reste à **2 dépendances** quoi que vous activiez : `schemars` n'est qu'un adaptateur *optionnel* pour les types `#[derive(JsonSchema)]`.
@@ -74,7 +74,7 @@ Les features sont **additives** : sans aucune feature, le cœur ne compile **que
 
 | | |
 |---|---|
-| ⚡ **Minuscule** | 2 dépendances, binaire minimal **147 Kio** (mesuré, release strippé), démarrage en quelques ms |
+| ⚡ **Minuscule** | 2 dépendances, binaire minimal **263 Kio** (mesuré, release strippé), démarrage en quelques ms |
 | 🚀 **Sans runtime** | threads `std`, un par connexion — pas de tokio au cœur |
 | 🧩 **Schémas à la Zod** | `inputSchema` dérivé du schéma, publié dans `tools/list` ; `outputSchema` **exécuteur** (sortie validée avant envoi) |
 | ✅ **Validation avant exécution** | un appel hors schéma ne touche jamais votre handler |
@@ -462,7 +462,7 @@ Trois passes consécutives, même machine, même session :
 | `tools/call` keep-alive (moyenne) | **0,077–0,086 ms/req** | 2 000 appels, warmup 200 déduit |
 | p50 / p99 keep-alive | 0,062–0,065 / **0,297–0,442 ms** | 2 000 appels |
 | Connexions neuves | **1 576–1 759 conn/s** | 300 connexions |
-| Binaire release strippé — **minimal** (1 outil) | **147 Kio** (150 528 o) | LTO fat + `codegen-units = 1`, mesuré depuis un projet consommateur |
+| Binaire release strippé — **minimal** (1 outil) | **263 Kio** (269 312 o) | LTO fat + `codegen-units = 1`, mesuré depuis un projet consommateur (0.9.0 publiée) |
 | Binaire release strippé — **démo `hello`** (3 registres + annotations) | **596 Kio** (610 816 o) | idem |
 | Démarrage in-process (bind + 1ʳᵉ réponse) | **5,4 ms** | `examples/slo` |
 | Mémoire après 2 300 requêtes | n/a hors Linux | `VmRSS` via `/proc/self/status` |
