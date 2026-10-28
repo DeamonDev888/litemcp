@@ -12,7 +12,7 @@ Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro
 
 📦 **Crate officiel : [crates.io/crates/litemcp](https://crates.io/crates/litemcp)** · 📖 **Docs : [docs.rs/litemcp](https://docs.rs/litemcp)**
 
-[Installation](#installation) · [Intégration](#intégration) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/) · [Stack](#stack-par-défaut-et-options) · [Concepts](#concepts) · [Configuration](#configuration) · [Sécurité](#sécurité) · [Protocole](#protocole) · [FAQ](#faq) · [Client](#client--mcp-control)
+[Installation](#installation) · [Intégration](#intégration) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/) · [Stack](#stack-par-défaut-et-options) · [Concepts](#concepts) · [Configuration](#configuration) · [Sécurité](#sécurité) · [Protocole](#protocole) · [FAQ](#faq) · [MCP Control](#mcp-control--client-gateway-et-gestionnaire)
 
 </div>
 
@@ -27,7 +27,9 @@ La plupart des serveurs MCP sont des **services** : un programme qui s'installe,
 - **Une CLI** qui veut exposer deux ou trois outils, sans embarquer un framework web ;
 - **Un test unitaire** qui a besoin d'un vrai serveur MCP qui écoute sur un port — sans installer tokio ;
 - **Un binaire embarqué** (edge, IoT), où chaque mégaoctet et chaque dépendance compte ;
-- **Un agent** qui lance cinquante serveurs MCP en même temps : chaque mégaoctet de RAM et chaque demi-seconde de démarrage se multiplie par cinquante.
+- **Un agent** qui lance cinquante serveurs MCP en même temps : chaque mégaoctet de RAM et chaque demi-seconde de démarrage se multiplient par cinquante.
+
+Et pour piloter ces serveurs : [**MCP Control**](https://github.com/DeamonDev888/mcp-control), le projet sibling — **client, gateway et gestionnaire** MCP en Rust natif : superviseur multi-machines avec UI, et agrégation de tous vos serveurs (LiteMCP reconnus nativement) derrière **un seul endpoint MCP**. Détails en [fin de README](#mcp-control--client-gateway-et-gestionnaire).
 
 Les principes :
 
@@ -369,7 +371,7 @@ La valeur de retour d'un outil devient `structuredContent` — un objet JSON pas
 | `.tool_timeout(duration)` | illimité | délai maximal d'exécution des handlers (outils, ressources, prompts) — au-delà : résultat `isError` (`ErrorCode::Timeout`, retentable) pour un outil, `-32000` pour une ressource/prompt ; les arguments d'un `tools/call` sont clonés une fois par appel quand il est actif |
 | `.on_call(hook)` | aucun | callback d'observabilité appelé après chaque message JSON-RPC (`CallEvent { method, name, duration, status }`) ; cumulable, paniques du hook contenues |
 | `.on_request(hook)` | aucun | **verrou d'accès par requête** — le hook reçoit un `RequestContext` (méthode, chemin, query, **adresse du pair**, en-têtes via `ctx.header(nom)` insensible à la casse) et rend `Ok(())` ou un `RequestRejection` : `unauthorized` (401), `forbidden` (403), `rate_limited(retry_after)` (429 + `Retry-After`), `new(status, msg)` (hors 4xx/5xx → 400), `.with_header("WWW-Authenticate", …)`. Rejet = statut + corps JSON + **fermeture de connexion**, avant la lecture du corps ; jamais appelé sur `/health` ni sur une route inconnue ; cumulable (premier rejet gagne), paniques contenues (`500`). Voir [Sécurité](#sécurité) |
-| `.announce()` | désactivée | publie une annonce JSON dans le dossier temporaire partagé (`%TEMP%/litemcp-registry/<nom>.json`) au bind réussi — port effectif, PID, exe, args, cwd, ts — retirée à la fin de vie du serveur ; intégration native avec le [MCP Control](#client--mcp-control) (voir ce qui suit) |
+| `.announce()` | désactivée | publie une annonce JSON dans le dossier temporaire partagé (`%TEMP%/litemcp-registry/<nom>.json`) au bind réussi — port effectif, PID, exe, args, cwd, ts — retirée à la fin de vie du serveur ; intégration native avec le [MCP Control](#mcp-control--client-gateway-et-gestionnaire) (voir ce qui suit) |
 | Threads de handlers (`MAX_INFLIGHT_HANDLERS`) | 256 | plafond de threads de handlers simultanés (actifs ou détachés après un timeout de `tool_timeout`) — au-delà : `rate_limited` pour un outil, `-32000` pour une ressource/prompt ; le slot n'est rendu qu'à la terminaison effective du thread |
 | Réponse JSON-RPC (`MAX_RESPONSE_BYTES`) | 16 Mio | une réponse sérialisée qui dépasse ce plafond est remplacée par `-32603` (« response size … exceeds maximum … ») — un handler ne peut pas pousser un corps illimité |
 | `bound.handle()` → `ServerHandle` | — | poignée d'arrêt cloneable : `handle.shutdown()` rend `serve()` → `Ok(())`, les connexions ferment entre deux requêtes (une lecture bloquée en cours ferme au `read_timeout`) |
@@ -615,12 +617,15 @@ Le mode stateless n'a aucun flux ouvert : chaque POST est auto-suffisant (un év
 **Comment sont choisies les versions ?**
 Pacement volontaire : toute modification atterrit d'abord dans la section `[Unreleased]` du [CHANGELOG](CHANGELOG.md) ; une version n'est coupée que pour un lot cohérent (fonction, correctif, doc majeure). Le `0.x` court jusqu'à la conformance officielle MCP verte ; la mention « 1.0 » attend ce jalon.
 
-## Client — MCP Control
+## MCP Control — client, gateway et gestionnaire
 
-Le [**MCP Control**](https://github.com/DeamonDev888/mcp-control) est un **client** : superviseur
-de serveurs MCP en Rust natif (détection multi-machines par scan et SSH, boutique, démarrage auto). Il reconnaît
-les serveurs LiteMCP **par fingerprint** — `initialize` répondu en 2026-07-28 sans négocier la version demandée
-+ sonde `GET /health` « ok » — affiche alors un badge dédié et supervise vos serveurs (état, outils, latence).
+Le [**MCP Control**](https://github.com/DeamonDev888/mcp-control) est le pendant côté exploitation de LiteMCP — un seul outil, trois rôles :
+
+- **Client** : superviseur de serveurs MCP en Rust natif — détection multi-machines par scan et SSH, état, outils, latence ;
+- **Gestionnaire** : une UI qui démarre, arrête, relance et installe (boutique) vos serveurs, avec démarrage automatique ;
+- **Gateway** : grâce au module [`Gateway`](#fonctions-phares) de cette lib, il agrège tous les serveurs détectés derrière **un seul endpoint MCP** — côté client (Claude, Cursor, vos agents), **un seul serveur à déclarer**, et toute la surface exposée dans l'UI.
+
+Il reconnaît les serveurs LiteMCP **par fingerprint** — `initialize` répondu en 2026-07-28 sans négocier la version demandée + sonde `GET /health` « ok » — et affiche alors un badge dédié.
 
 **Intégration native (opt-in)** — `.announce()` sur le builder : au bind réussi, le serveur écrit une annonce JSON dans le dossier temporaire partagé (`%TEMP%/litemcp-registry/<nom>.json`, sinon `$TMPDIR` ou `/tmp`) — `{ name, version, port, pid, exe, args, cwd, ts }` : le **port effectif** du listener (connu même après un bind sur le port 0), le PID et la ligne de commande. MCP Control peut alors démarrer, arrêter et relancer vos serveurs nativement, sans scan de ports ni saisie manuelle. L'annonce est **retirée à la fin de vie du serveur** — arrêt gracieux ou simple `drop` après `bind` sans `serve()` — et seulement si le couple `pid`/`port` du fichier est celui de l'instance appelante : une instance plus récente du même nom ne peut pas être effacée par une ancienne. Durcissements intégrés : nom de fichier sûr (`:`/`/`/`\`/`..` refusés — sous Windows `C:x` remplacerait la base du chemin et `nom:flux` écrirait un flux NTFS alternatif), écriture **atomique** (fichier temporaire créé exclusivement puis `rename` — jamais de JSON partiel lu, jamais d'écrasement à travers un symlink planté dans un dossier partagé), permissions `0600` sous Unix. Toute défaillance est silencieuse : l'annonce est une commodité d'intégration, jamais une condition de fonctionnement du serveur — et zéro coût tant que `.announce()` n'est pas appelé.
 
