@@ -194,7 +194,7 @@ Ne sont **pas** établis par cette campagne :
 
 - une comparaison « toutes implémentations confondues » : les SDK Java, C#, Kotlin, Swift,
   Ruby, ou un serveur écrit à la main sur `hyper`/`axum`, n'ont pas été mesurés ;
-- la **conformance** officielle — c'est un autre chantier (`docs/ROADMAP.md`, phase 6) ;
+- la **conformance** officielle — c'est un autre chantier (phase 6 de la feuille de route) ;
 - le comportement **sous charge concurrente**, derrière TLS ou un proxy, avec des réponses
   volumineuses ou des outils lents : ici tout est séquentiel, petit et local ;
 - la latence **Linux**, qui est la référence serveur (campagnes du 2026-10-24 : 0,031–0,033 ms
