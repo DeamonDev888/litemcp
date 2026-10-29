@@ -17,6 +17,12 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - Tests clients réels (MCP Inspector, Claude, Cursor) et corpus de fuzz dédié au parseur ;
 - Phase 7 « écosystème entreprise » : guide de déploiement (TLS au gateway/mesh, OIDC à la périphérie), recette Prometheus sur `on_call`, story stateless/scaling.
 
+## [0.10.0] - 2026-10-28
+
+### Ajouté
+
+- **Module `antizombie` — anti-zombie : registre sans fantômes, fin de vie drainée et vérifiable** (opt-in via `.anti_zombie()`) : **(1) au bind**, le registre d'annonce partagé (`%TEMP%/litemcp-registry/`) est passé au peigne fin — une annonce dont le port ne répond plus (`TcpStream::connect_timeout` sur `127.0.0.1`, `PROBE_TIMEOUT` 250 ms) est le fantôme d'un process tué brutalement (son `Drop` n'a jamais couru) : elle est retirée ; un `.json` présent mais non parsable ne peut pas être une écriture en cours (l'écriture d'annonce est atomique par rename) : débris retirés ; les `.tmp` orphelins de plus de 60 s idem ; les annonces d'instances vivantes, les fichiers d'un schéma inconnu et l'annonce du process courant sont intouchés — budget total borné (`SWEEP_BUDGET` 2 s), et `sweep_registry()` / `sweep_dir(dir)` utilisables seuls pour un nettoyage périodique ; **(2) à la fin de vie** du serveur lié (arrêt gracieux **ou** `drop` sans `serve()`), le `Drop` **draine** les threads de connexion — attente bornée (`drain_timeout`, défaut 2 s, `0` = bilan immédiat) jusqu'à zéro connexion vivante — puis publie le bilan ; **(3) le bilan** (`ZombieReport` : `drained`, `connections_pending`, `handlers_alive`, `sweep`) est lisible via `ServerHandle::zombie_report()` après la fin de vie — un handler qui dépasse son `tool_timeout` termine en arrière-plan (Rust ne tue pas les threads) : le rapport le compte au lieu de le taire. Les compteurs utilisés existent déjà (`live_connections`, threads de handler bornés) : sans `.anti_zombie()`, zéro code de plus sur les chemins chauds et `zombie_report()` rend `None`. **16 nouveaux tests** (`tests/antizombie.rs` + unitaires du module) : sweep sur dossiers isolés (morts re-apés, vivants respectés, corrompus retirés, schéma inconnu respecté, propre annonce intouchée, `.tmp` récents respectés, idempotence), bind qui nettoie avant de servir, drain borné avec handler accroché signalé, aucun rapport sans le module, port rebinaible après la fin de vie ;
+
 ## [0.9.1] - 2026-10-28
 
 ### Ajouté
@@ -40,7 +46,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - **`ServerBuilder::max_response_bytes(max)`** : le plafond de taille d'une réponse JSON-RPC était en dur — il est désormais configurable (`0` = illimité) ;
 - **`ServerBuilder::remove_tool(name)`** : retrait d'un outil sans reconstruire le serveur — l'outil disparaît de `tools/list` et répond `-32602`. Les annotations et schémas de sortie **en attente** pour ce nom sont purgés (un ré-enregistrement repart propre).
 
-### Corrigé (audit 2026-10-27 — voir [le rapport d'audit](https://github.com/DeamonDev888/litemcp/blob/main/docs/AUDIT-LITEMCP-2026-10-27.md))
+### Corrigé (audit complet du 2026-10-27 — rapport interne)
 
 - **Deadlock `Gateway::edit`** (CRITIQUE) : la closure de mutation s'exécutait sous le `Mutex` du builder — un `std::sync::Mutex` n'étant pas réentrant, un `edit` qui ré-appelle `edit` sur le même gateway **figeait le thread définitivement** (reproductible à 100 %, aucun message, aucun déverrouillage). La réentrance est désormais détectée et refusée par une **panique explicite et actionnable** ; la sérialisation entre threads distincts et la publication du snapshot restent inchangées (aucune perte de mise à jour) ;
 - **Résidu de corps non cadré** (CRITIQUE) : les octets reçus **au-delà** du `Content-Length` annoncé étaient relus comme une ligne de requête au tour suivant — un `400` parasite s'intercalait dans la file de réponses et la vraie réponse du client était perdue. Le résidu est maintenant attribué à la requête qui a mal annoncé sa longueur (`400 request body larger than Content-Length`, connexion fermée) ; le **pipelining légitime** reste servi ;
@@ -251,7 +257,7 @@ Quatre manques signalés à l'usage, tous comblés :
 
 ### Sécurité & conformité — audit du 2026-10-24
 
-Audit complet (statique + sondes dynamiques + vérification du changelog officiel MCP `2026-07-28` en ligne). **Aucune vulnérabilité critique ou haute** ; les correctifs de l'audit du 2026-10-23 sont vérifiés présents et couverts. Rapport : `docs/AUDIT-LITEMCP-2026-10-24.md`. Les 6 nouveaux constats (P3/Info) sont corrigés :
+Audit complet (statique + sondes dynamiques + vérification du changelog officiel MCP `2026-07-28` en ligne). **Aucune vulnérabilité critique ou haute** ; les correctifs de l'audit du 2026-10-23 sont vérifiés présents et couverts (rapport d'audit interne, non publié). Les 6 nouveaux constats (P3/Info) sont corrigés :
 
 - **[P3] `serverInfo` dans chaque résultat** (SEP-2575 : les serveurs *SHOULD* s'identifier dans le `_meta` de chaque résultat) : `tools/list` et `tools/call` — succès **et** `isError` — portent désormais `_meta["io.modelcontextprotocol/serverInfo"]`, comme `server/discover` et `initialize` ;
 - **[P3] `ping` porte `resultType` + `_meta`** : la promesse « `resultType` dans chaque résultat » devient vraie sans exception (méthode legacy, résultat enrichi — additif pour les clients `2025-11-25`) ;

@@ -59,7 +59,17 @@ fn assert_only_complete_responses(bytes: &[u8]) {
     while !rest.is_empty() {
         let text =
             std::str::from_utf8(rest).unwrap_or_else(|_| panic!("réponse non UTF-8 : {rest:?}"));
-        assert!(text.starts_with("HTTP/1.1 "), "status line : {text:?}");
+        // La ligne de statut reflète la version de la requête quand elle
+        // est `HTTP/1.0` ou `HTTP/1.1` (audit 2026-10-27, m4 — un client
+        // HTTP/1.0 strict refuse une réponse annoncée `HTTP/1.1`, test de
+        // régression `m4_ligne_de_statut_reflete_la_version_http`) : les
+        // deux préfixes sont valides. L'invariant testé ici est le
+        // **cadrage** (en-têtes terminés, `Content-Length` exact, aucun
+        // octet orphelin), pas l'épinglage de version.
+        assert!(
+            text.starts_with("HTTP/1.1 ") || text.starts_with("HTTP/1.0 "),
+            "status line : {text:?}"
+        );
         let head_end = text.find("\r\n\r\n").expect("en-têtes terminés") + 4;
         if text.starts_with("HTTP/1.1 100 ") {
             rest = &rest[head_end..];

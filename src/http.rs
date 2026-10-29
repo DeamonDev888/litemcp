@@ -323,6 +323,11 @@ pub struct BoundServer {
     /// été écrit — le retrait ne part que si le `(pid, port)` du fichier
     /// correspond).
     pub(crate) announce_name: Option<(String, u16)>,
+    /// Anti-zombie ([`crate::antizombie`]) — `Some` quand
+    /// [`crate::ServerBuilder::anti_zombie`] est actif : le `Drop` draine
+    /// les connexions (attente bornée) puis publie le bilan de fin de vie,
+    /// lisible via [`ServerHandle::zombie_report`].
+    pub(crate) zombie: Option<Arc<crate::antizombie::ZombieState>>,
 }
 
 impl BoundServer {
@@ -377,6 +382,7 @@ impl BoundServer {
         ServerHandle {
             shutdown: Arc::clone(&self.shutdown),
             addr,
+            zombie: self.zombie.clone(),
         }
     }
 
@@ -572,6 +578,13 @@ impl Drop for BoundServer {
         if let Some((name, port)) = self.announce_name.take() {
             crate::registry::retract(&name, port);
         }
+        if let Some(zombie) = &self.zombie {
+            // Drain borné des threads de connexion puis bilan — le rapport
+            // devient lisible via `ServerHandle::zombie_report`. L'attente
+            // est plafonnée par `drain_timeout` : un `Drop` ne pende jamais
+            // indéfiniment.
+            zombie.finish(&self.live_connections, self.core.live_handler_threads());
+        }
     }
 }
 
@@ -580,6 +593,9 @@ impl Drop for BoundServer {
 pub struct ServerHandle {
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     addr: SocketAddr,
+    /// Anti-zombie — partagé avec le [`BoundServer`] : le bilan publié par
+    /// son `Drop` reste lisible ici, même après la fin du serveur.
+    zombie: Option<Arc<crate::antizombie::ZombieState>>,
 }
 
 impl ServerHandle {
@@ -596,6 +612,20 @@ impl ServerHandle {
             // bloquant pour ne pas pendre si le listener meurt entre-temps).
             let _ = std::net::TcpStream::connect_timeout(&self.addr, Duration::from_millis(250));
         }
+    }
+
+    /// Bilan anti-zombie de fin de vie — `Some` après la fin de vie du
+    /// [`BoundServer`] (arrêt gracieux ou `drop`) quand
+    /// [`crate::ServerBuilder::anti_zombie`] était actif, `None` sinon
+    /// (module désactivé) et tant que la fin de vie n'est pas atteinte.
+    ///
+    /// Le bilan est publié par le `Drop` du serveur lié — dans le thread qui
+    /// le possédait : après un `serve()` dans un thread dédié, lisez-le
+    /// après le `join` (ou constatez simplement que `Some` finit par
+    /// arriver).
+    #[must_use]
+    pub fn zombie_report(&self) -> Option<crate::antizombie::ZombieReport> {
+        self.zombie.as_ref().and_then(|state| state.report())
     }
 }
 

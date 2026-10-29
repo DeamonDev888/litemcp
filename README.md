@@ -6,7 +6,7 @@
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.9.1%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.10.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
 [![crates.io](https://img.shields.io/crates/v/litemcp.svg)](https://crates.io/crates/litemcp) [![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI)](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml) [![Docs](https://img.shields.io/docsrs/litemcp)](https://docs.rs/litemcp)
 
@@ -86,6 +86,7 @@ Les features sont **additives** : sans aucune feature, le cœur ne compile **que
 | 🩺 **Erreurs structurées & observabilité** | `ToolError` (`rate_limited`, `timeout`, `upstream`… avec `retryable`/`retryAfterMs`) + `.on_call(hook)` pour métriques et latences |
 | 🔐 **Verrou de requête** | `.on_request(hook)` : verdict par requête **avant la lecture du corps** — auth par token, rate-limit par source ; rejet `401`/`403`/`429` + `Retry-After`, paniques contenues |
 | 🛑 **Arrêt propre** | `bound.handle()` puis `handle.shutdown()` : `serve()` rend `Ok(())`, les connexions ferment entre deux requêtes |
+| 🧟 **Anti-zombie** | sweep du registre d'annonce au bind (les fantômes de process tués brutalement sont retirés), drain borné des connexions à l'arrêt, bilan vérifiable (`handle.zombie_report()`) — aucune instance morte ne traîne, rien ne reste accroché |
 | 🔀 **Gateways dynamiques** | `Gateway` : la surface d'outils change **pendant que le serveur sert** — un serveur détecté apparaît/disparaît de `tools/list` sans redémarrage, les requêtes en vol finissent sur leur snapshot |
 | 🛡️ **Sûr par défaut** | `#![forbid(unsafe_code)]`, garde DNS-rebinding, corps limité |
 
@@ -93,12 +94,12 @@ Les features sont **additives** : sans aucune feature, le cœur ne compile **que
 
 ```toml
 [dependencies]
-litemcp = "0.9.1"
+litemcp = "0.10.0"
 
 # pour la macro #[tool] (deps de compilation seulement) :
-# litemcp = { version = "0.9.1", features = ["macros"] }
+# litemcp = { version = "0.10.0", features = ["macros"] }
 # pour l'adaptateur schemars (#[derive(JsonSchema)] en schéma exécuteur) :
-# litemcp = { version = "0.9.1", features = ["schemars"] }
+# litemcp = { version = "0.10.0", features = ["schemars"] }
 ```
 
 ## Intégration
@@ -372,6 +373,8 @@ La valeur de retour d'un outil devient `structuredContent` — un objet JSON pas
 | `.on_call(hook)` | aucun | callback d'observabilité appelé après chaque message JSON-RPC (`CallEvent { method, name, duration, status }`) ; cumulable, paniques du hook contenues |
 | `.on_request(hook)` | aucun | **verrou d'accès par requête** — le hook reçoit un `RequestContext` (méthode, chemin, query, **adresse du pair**, en-têtes via `ctx.header(nom)` insensible à la casse) et rend `Ok(())` ou un `RequestRejection` : `unauthorized` (401), `forbidden` (403), `rate_limited(retry_after)` (429 + `Retry-After`), `new(status, msg)` (hors 4xx/5xx → 400), `.with_header("WWW-Authenticate", …)`. Rejet = statut + corps JSON + **fermeture de connexion**, avant la lecture du corps ; jamais appelé sur `/health` ni sur une route inconnue ; cumulable (premier rejet gagne), paniques contenues (`500`). Voir [Sécurité](#sécurité) |
 | `.announce()` | désactivée | publie une annonce JSON dans le dossier temporaire partagé (`%TEMP%/litemcp-registry/<nom>.json`) au bind réussi — port effectif, PID, exe, args, cwd, ts — retirée à la fin de vie du serveur ; intégration native avec le [MCP Control](#mcp-control--client-gateway-et-gestionnaire) (voir ce qui suit) |
+| `.anti_zombie()` | désactivée | **anti-zombie** : au bind, le registre d'annonce partagé est nettoyé (annonces de process morts retirées, débris d'écriture enlevés, instances vivantes respectées) ; à la fin de vie, les connexions sont drainées (attente bornée) et le bilan `ZombieReport` devient lisible via `handle.zombie_report()` — `sweep_registry()`/`sweep_dir()` utilisables seuls |
+| `.drain_timeout(duration)` | 2 s | durée maximale du drain anti-zombie à la fin de vie (les threads ne sont jamais tués — au-delà, le bilan signale `drained: false`) ; `0` : bilan immédiat ; sans effet si `.anti_zombie()` n'est pas actif |
 | Threads de handlers (`MAX_INFLIGHT_HANDLERS`) | 256 | plafond de threads de handlers simultanés (actifs ou détachés après un timeout de `tool_timeout`) — au-delà : `rate_limited` pour un outil, `-32000` pour une ressource/prompt ; le slot n'est rendu qu'à la terminaison effective du thread |
 | Réponse JSON-RPC (`MAX_RESPONSE_BYTES`) | 16 Mio | une réponse sérialisée qui dépasse ce plafond est remplacée par `-32603` (« response size … exceeds maximum … ») — un handler ne peut pas pousser un corps illimité |
 | `bound.handle()` → `ServerHandle` | — | poignée d'arrêt cloneable : `handle.shutdown()` rend `serve()` → `Ok(())`, les connexions ferment entre deux requêtes (une lecture bloquée en cours ferme au `read_timeout`) |
@@ -478,7 +481,7 @@ Trois passes consécutives, même machine, même session :
 > Le p99 de 0,3–0,44 ms reflète les micro-pics du scheduler Windows en
 > environnement bureautique ; les campagnes Linux du 2026-10-24 (0,031–0,033 ms
 > en moyenne, p99 0,048–0,065 ms) restent la référence pour un serveur
-> dédié — voir la [feuille de route](https://github.com/DeamonDev888/litemcp/blob/main/docs/ROADMAP.md) pour le détail des conditions figées.
+> dédié — les conditions figées de chaque campagne sont dans [`docs/BENCH.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/BENCH.md).
 
 ### Décisions prises sur mesures
 
@@ -515,7 +518,7 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 | Mémoire après 2 300 requêtes | < 10 Mo | **2,7 Mio `VmRSS`, +4 Kio pendant la charge** ✅ |
 | Démarrage in-process | < 10 ms | **~0,4 ms** ✅ |
 
-`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **289 tests** (dont fuzz proptest ; 271 sans feature optionnelle) est vérifiée sur les deux OS.
+`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **308 tests** (dont fuzz proptest ; 290 sans feature optionnelle) est vérifiée sur les deux OS.
 
 ## Comparatif — ViteMCP (TypeScript)
 
@@ -589,7 +592,7 @@ L'historique complet et détaillé vit dans [CHANGELOG.md](CHANGELOG.md) — sec
 | 5 | Publication crates.io | ✅ |
 | 6 | Conformance officielle + benchmarks → 1.0 | ⏳ |
 
-Le détail — jalons, SLO, risques, journal : [docs/ROADMAP.md](https://github.com/DeamonDev888/litemcp/blob/main/docs/ROADMAP.md). Pour apprendre la lib pas à pas : le [tutoriel officiel](https://deamondev888.github.io/litemcp-tuto/).
+Pour apprendre la lib pas à pas : le [tutoriel officiel](https://deamondev888.github.io/litemcp-tuto/).
 
 ## FAQ
 

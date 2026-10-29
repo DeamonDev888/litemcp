@@ -81,6 +81,16 @@
 //! # }
 //! ```
 //!
+//! **Anti-zombie**
+//! ([`antizombie`](crate::antizombie), opt-in via
+//! [`anti_zombie`](crate::server::ServerBuilder::anti_zombie)) : au bind, le
+//! registre d'annonce partagé est débarrassé des annonces de process morts
+//! et des débris d'écriture ; à la fin de vie, les connexions sont drainées
+//! (attente bornée) et le bilan
+//! [`ZombieReport`](crate::antizombie::ZombieReport) — connexions restantes,
+//! handlers encore vivants, sweep — est lisible via
+//! [`zombie_report`](crate::http::ServerHandle::zombie_report).
+//!
 //! **Contrôle d'accès**
 //! ([`on_request`](crate::server::ServerBuilder::on_request)) : un verdict
 //! par requête HTTP — auth par token, rate-limit par source ou par clé —
@@ -131,6 +141,9 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+/// Anti-zombie — registre sans fantômes, drain de fin de vie, bilan
+/// vérifiable ([`ZombieReport`](crate::antizombie::ZombieReport)).
+pub mod antizombie;
 pub mod error;
 /// Registre **dynamique** — la surface d'outils change pendant le service
 /// ([`Gateway`](crate::gateway::Gateway)) : le socle des gateways qui
@@ -154,6 +167,7 @@ pub mod schemars;
 pub mod server;
 pub mod zod;
 
+pub use antizombie::{SweepReport, ZombieReport, sweep_dir, sweep_registry};
 pub use error::{ErrorCode, ToolError};
 pub use gateway::Gateway;
 pub use http::{RequestContext, RequestRejection};
@@ -193,6 +207,7 @@ pub const DEFAULT_PORT_RANGE: std::ops::RangeInclusive<u16> = 23080..=23099;
 
 /// Tout ce qu'il faut pour écrire un serveur en quelques lignes.
 pub mod prelude {
+    pub use crate::antizombie::{SweepReport, ZombieReport, sweep_dir, sweep_registry};
     pub use crate::error::{ErrorCode, ToolError};
     pub use crate::gateway::Gateway;
     pub use crate::http::{RequestContext, RequestRejection, ServerHandle};

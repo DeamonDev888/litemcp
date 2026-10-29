@@ -750,6 +750,16 @@ impl ServerCore {
         self.tools.keys().cloned().collect()
     }
 
+    /// Threads de handler encore vivants — mode borné uniquement
+    /// ([`ServerBuilder::tool_timeout`]) : sans timeout, les handlers
+    /// tournent dans le thread de connexion et ce compteur vaut zéro. Le
+    /// module anti-zombie le lit pour son bilan de fin de vie.
+    #[must_use]
+    pub(crate) fn live_handler_threads(&self) -> usize {
+        self.inflight_handlers
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn list_tools(&self) -> ToolsListResult {
         let tools = self
             .tools
@@ -1335,6 +1345,11 @@ pub struct ServerBuilder {
     max_response_bytes: usize,
     /// Annonce au MCP Control (voir [`Self::announce`]).
     announce: bool,
+    /// Module anti-zombie (voir [`Self::anti_zombie`]) : sweep du registre
+    /// au bind, drain borné et bilan de fin de vie.
+    anti_zombie: bool,
+    /// Durée maximale du drain de fin de vie (voir [`Self::drain_timeout`]).
+    drain_timeout: Duration,
 }
 
 impl ServerBuilder {
@@ -1359,6 +1374,8 @@ impl ServerBuilder {
             request_hooks: Vec::new(),
             max_response_bytes: MAX_RESPONSE_BYTES,
             announce: false,
+            anti_zombie: false,
+            drain_timeout: crate::antizombie::DRAIN_TIMEOUT,
         }
     }
 
@@ -1372,6 +1389,38 @@ impl ServerBuilder {
     #[must_use]
     pub fn announce(mut self) -> Self {
         self.announce = true;
+        self
+    }
+
+    /// Active le module **anti-zombie** (voir [`crate::antizombie`]) :
+    ///
+    /// - **au bind**, le registre d'annonce partagé est passé au peigne fin —
+    ///   les annonces de process morts (port sans réponse) et les débris
+    ///   d'écritures interrompues sont retirés, les instances vivantes et
+    ///   les fichiers d'un schéma inconnu sont respectés ;
+    /// - **à la fin de vie** du serveur lié (arrêt gracieux ou `drop`), les
+    ///   threads de connexion sont drainés — attente bornée par
+    ///   [`Self::drain_timeout`] — et le bilan
+    ///   ([`crate::antizombie::ZombieReport`]) devient lisible via
+    ///   [`crate::http::ServerHandle::zombie_report`].
+    ///
+    /// Opt-in strict : sans cet appel, aucun sweep, aucun drain, aucun code
+    /// de plus sur les chemins chauds.
+    #[must_use]
+    pub fn anti_zombie(mut self) -> Self {
+        self.anti_zombie = true;
+        self
+    }
+
+    /// Durée maximale du **drain** anti-zombie à la fin de vie
+    /// (défaut [`crate::antizombie::DRAIN_TIMEOUT`] — 2 s). Les threads ne
+    /// sont jamais tués (Rust ne le permet pas) : au-delà de la durée, le
+    /// bilan signale `drained: false` avec le compte de connexions
+    /// restantes. `0` : bilan immédiat, sans attente. Sans effet si
+    /// [`Self::anti_zombie`] n'est pas actif.
+    #[must_use]
+    pub fn drain_timeout(mut self, timeout: Duration) -> Self {
+        self.drain_timeout = timeout;
         self
     }
 
@@ -2028,6 +2077,16 @@ impl ServerBuilder {
         mut self,
         listener: std::net::TcpListener,
     ) -> std::io::Result<crate::http::BoundServer> {
+        // Anti-zombie : le sweep du registre partagé précède notre propre
+        // annonce — le dossier est propre au moment où nous y publions.
+        let zombie = if self.anti_zombie {
+            Some(Arc::new(crate::antizombie::ZombieState::new(
+                crate::antizombie::sweep_registry(),
+                self.drain_timeout,
+            )))
+        } else {
+            None
+        };
         // Annonce MCP Control : le listener est lié — le port effectif est
         // connu même après un bind sur le port 0. Un échec d'écriture est
         // silencieux (commodité d'intégration, jamais une condition).
@@ -2084,6 +2143,7 @@ impl ServerBuilder {
             refusals_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             announce_name,
+            zombie,
         })
     }
 }
