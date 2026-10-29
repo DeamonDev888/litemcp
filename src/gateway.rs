@@ -509,9 +509,27 @@ mod tests {
         // sert rien et l'assertion `tours > 0` tombe — un flaky observé 6
         // échecs sur 8 runs. Le harnais doit être déterministe.
         let barrier = Arc::new(std::sync::Barrier::new(5)); // 4 lecteurs + main
+        // **Drapeaux de service** (flaky résiduel observé en CI : run
+        // Release v0.10.0, job verify) : la barrière garantit que le lecteur
+        // a DÉMARRÉ, pas qu'il a obtenu une tranche de CPU — un lecteur
+        // préempté pendant toute la salve de 128 edits (microsecondes)
+        // peut finir avec `tours == 0` sur un runner à 2 cœurs. Chaque
+        // lecteur signale son premier dispatch terminé, et le main attend
+        // les quatre signaux (attente bornée) avant de lever `stop` :
+        // `tours > 0` devient déterministe sans affaiblir l'invariant
+        // testé (aucune mutation perdue, catalogue jamais à moitié
+        // reconstruit).
+        let served: Vec<Arc<std::sync::atomic::AtomicBool>> = (0..4)
+            .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .collect();
         let mut readers = Vec::new();
-        for _ in 0..4 {
-            let (gw, stop, barrier) = (Arc::clone(&gw), Arc::clone(&stop), Arc::clone(&barrier));
+        for flag in &served {
+            let (gw, stop, barrier, flag) = (
+                Arc::clone(&gw),
+                Arc::clone(&stop),
+                Arc::clone(&barrier),
+                Arc::clone(flag),
+            );
             readers.push(std::thread::spawn(move || {
                 let mut tours = 0u64;
                 barrier.wait();
@@ -526,6 +544,9 @@ mod tests {
                         "l'outil de base a disparu : {names:?}"
                     );
                     tours += 1;
+                    if tours == 1 {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 tours
             }));
@@ -538,6 +559,17 @@ mod tests {
                 b.remove_tool(&format!("outil-{i}"));
                 b
             });
+        }
+        // Les quatre lecteurs ont servi au moins une requête avant l'arrêt
+        // (attente bornée à 5 s — un dispatch dure des microsecondes ; le
+        // plafond ne sert que sur un runner pathologiquement saturé).
+        let echeance = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for flag in &served {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed)
+                && std::time::Instant::now() < echeance
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for r in readers {
