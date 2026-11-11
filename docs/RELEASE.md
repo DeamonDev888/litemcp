@@ -32,6 +32,9 @@ cargo doc --no-deps --all-features
 #    Cargo.toml (litemcp)      : version = "X.Y.Z"
 #                                et litemcp-macros = { …, version = "X.Y.Z" }
 #    + couper la section [Unreleased] du CHANGELOG en `## [X.Y.Z] - AAAA-MM-JJ`
+#    + README : les extraits d'installation restent en forme de plage (`0.10`,
+#      jamais `0.10.N`) — une version exacte vieillit dès le patch suivant et
+#      contredit le badge de version
 #    + commit (« X.Y.Z - … »)
 
 # 3. Vérification des paquets : compilation, métadonnées, liste des fichiers

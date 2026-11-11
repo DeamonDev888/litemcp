@@ -12,6 +12,12 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-11-10
+
+### Corrigé
+
+- **Extraits d'installation du README en forme de plage (`0.10`)** — la 0.10.2 annonçait encore `0.10.1` : un extrait épinglé à une version exacte vieillit dès le patch suivant et contredit le badge de version. La forme `0.10` (`^0.10`) installe toujours la dernière `0.10.x` compatible. Aucun changement de code ;
+
 ## [0.10.2] - 2026-11-10
 
 ### Corrigé
