@@ -12,6 +12,12 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-11-11
+
+### Corrigé
+
+- **Suite de tests portable (Linux)** — `antizombie::tests::sweep_usurpation_prouvee_retrait_doute_et_vie_conservees` supposait que le dossier de registre global existait déjà (créé en production par `announce`, et sur Windows par un autre test exécuté plus tôt) : sur une machine neuve — donc sur tout runner CI Linux — `with_name_lock` échouait en `NotFound`, le sweep renonçait et le test échouait (0 retrait au lieu de 1). Le test pose désormais son prérequis (`create_private_dir(registry_dir())`, comme les tests de `registry.rs`). Aucun changement de comportement de la bibliothèque : quand le verrou est indisponible, le sweep conserve son verdict « renoncer plutôt que détruire » ;
+
 ## [0.10.3] - 2026-11-10
 
 ### Corrigé

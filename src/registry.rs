@@ -320,7 +320,7 @@ fn lock_is_stale(lock: &Path, stale_after: Duration) -> bool {
 /// : le dossier publie exe, argv et cwd de ses occupants, il ne doit pas
 /// être traversable par les autres utilisateurs.
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
@@ -328,7 +328,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)
 }
 

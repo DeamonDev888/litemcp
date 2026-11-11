@@ -889,6 +889,14 @@ mod tests {
                 .subsec_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
+        // Prérequis du verrou de nom : `with_name_lock` verrouille dans le
+        // dossier de registre global (`registry_dir()`), que `announce` crée
+        // en production. Sans lui, `create_dir` échoue en `NotFound` et le
+        // sweep renonce (« verrou occupé ») : le balayage ne retirerait rien.
+        // Le test ne peut donc pas dépendre de l'ordre d'exécution des autres
+        // tests (sur Windows il passait par chance, un autre test créant le
+        // dossier) — il pose lui-même son prérequis.
+        crate::registry::create_private_dir(&crate::registry::registry_dir()).unwrap();
         let write = |name: &str, addr: &SocketAddr, instance: u64| {
             let doc = serde_json::json!({
                 "name": name, "version": "1.0.0", "addr": addr.to_string(),

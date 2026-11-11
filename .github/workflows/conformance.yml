@@ -77,7 +77,10 @@ jobs:
           node-version: 22
 
       - name: Build de la fixture
-        run: cargo build --release --locked --example conformance_server
+        # Pas de `--locked` : `Cargo.lock` n'est pas versionné (convention lib du
+        # dépôt, cf. ci.yml) — sur un checkout neuf, `--locked` échoue faute de
+        # fichier de verrouillage à respecter.
+        run: cargo build --release --example conformance_server
 
       - name: Démarrage de la fixture (arrière-plan)
         run: |
