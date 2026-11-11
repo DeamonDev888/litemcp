@@ -6,7 +6,7 @@
 
 Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
 
-![Statut](https://img.shields.io/badge/statut-0.10.0%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
+![Statut](https://img.shields.io/badge/statut-0.10.x%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
 [![crates.io](https://img.shields.io/crates/v/litemcp.svg)](https://crates.io/crates/litemcp) [![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI)](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml) [![Docs](https://img.shields.io/docsrs/litemcp)](https://docs.rs/litemcp)
 
@@ -48,7 +48,7 @@ Les principes :
 
 *Mesuré le 2026-10-28 — Windows 11, rustc 1.99.1, release + `lto = "fat"` + `codegen-units = 1` + `strip`. Méthode : un projet consommateur externe dépendant de LiteMCP (un serveur, un outil), comparé avec et sans chaque feature — **la feature étant réellement utilisée**, sinon le linker élimine tout et le binaire ne change pas.*
 
-**Le cœur ne tire que deux dépendances externes.** Le build par défaut compile `serde` + `serde_json` — les deux seules dépendances externes — plus la crate **locale** `litemcp-macros` (**zéro dépendance externe** : pur `proc_macro` standard, ni `syn`, ni `quote`, ni `proc-macro2`), incluse par défaut pour que `#[tool]` marche d'emblée (+57 Kio de binaire, mesuré). Pour le binaire strictement minimal : `litemcp = { version = "0.10.0", default-features = false }` — 263 Kio.
+**Le cœur ne tire que deux dépendances externes.** Le build par défaut compile `serde` + `serde_json` — les deux seules dépendances externes — plus la crate **locale** `litemcp-macros` (**zéro dépendance externe** : pur `proc_macro` standard, ni `syn`, ni `quote`, ni `proc-macro2`), incluse par défaut pour que `#[tool]` marche d'emblée (+57 Kio de binaire, mesuré). Pour le binaire strictement minimal : `litemcp = { version = "0.10.1", default-features = false }` — 263 Kio.
 
 - **`macros`** (défaut) ajoute **une** crate locale (`litemcp-macros`, **zéro dépendance externe**) — désactivable sans rien perdre du noyau ;
 - **`schemars`** est la feature à surveiller : elle tire `schemars` + `jsonschema` et **+54 crates transitives** (`regex`, `fancy-regex`, `num`, `parking_lot`, `ahash`…). Si vous l'utilisez réellement, le binaire passe de **320 Kio à 6,1 Mio** ; si vous l'activez sans l'utiliser, le linker élimine tout et le binaire ne bouge pas ;
@@ -95,12 +95,12 @@ Les features sont **additives** : les dépendances **externes** du cœur sont to
 
 ```toml
 [dependencies]
-litemcp = "0.10.0"   # macros #[tool]/#[resource]/#[prompt] incluses
+litemcp = "0.10.1"   # macros #[tool]/#[resource]/#[prompt] incluses
 
 # binaire strictement minimal (sans les macros) :
-# litemcp = { version = "0.10.0", default-features = false }
+# litemcp = { version = "0.10.1", default-features = false }
 # pour l'adaptateur schemars (#[derive(JsonSchema)] en schéma exécuteur) :
-# litemcp = { version = "0.10.0", features = ["schemars"] }
+# litemcp = { version = "0.10.1", features = ["schemars"] }
 ```
 
 **Le jeu par défaut est complet.** Sans rien configurer, vous obtenez tout le noyau — transport HTTP durci, JSON-RPC, module `zod` (schémas + validation), erreurs structurées, hooks `on_call`/`on_request`, gateway dynamique, anti-zombie, annonces — **plus les macros `#[tool]`** (une crate locale, zéro dépendance externe). Les dépendances externes restent **exactement deux** (`serde`, `serde_json`). La seule autre option est `schemars` — un extra opt-in qui n'ajoute que son propre coût (mesuré dans [Le coût réel des features](#le-coût-réel-des-features)) et rien n'est compilé tant qu'elle est désactivée. Le tableau [Stack par défaut et options](#stack-par-défaut-et-options) fixe le contrat complet.

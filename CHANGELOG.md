@@ -12,6 +12,12 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-11-10
+
+### Corrigé
+
+- **README du crate aligné sur la version publiée** — les extraits d'installation et le badge de statut annonçaient encore `0.10.0` alors que `litemcp 0.10.1` est en ligne ; le badge de statut devient `0.10.x` (la version exacte est déjà portée par le badge crates.io, dynamique). Aucun changement de code : patch documentaire, publié pour que la page crates.io rende le README corrigé (une version publiée est immuable) ;
+
 ## [0.10.1] - 2026-11-10
 
 ### Publication
