@@ -35,8 +35,19 @@
 //! et le serveur s'arrête proprement
 //! ([`handle`](crate::http::BoundServer::handle)/
 //! [`shutdown`](crate::http::ServerHandle::shutdown)).
-//! La feature `macros` ajoute `#[tool]` : le schéma d'entrée est dérivé
-//! des types des paramètres d'une fonction ordinaire.
+//! La feature `macros` (incluse par défaut) ajoute `#[tool]` : le schéma
+//! d'entrée est dérivé des types des paramètres d'une fonction ordinaire.
+//! Les contenus MCP riches sont servis à l'identique : `content[]` d'outil
+//! **multiple et mixte** (texte, image, audio, `resource_link`, ressource
+//! embarquée — [`tool_result`](crate::server::ServerBuilder::tool_result)),
+//! messages de prompt avec image/ressource
+//! ([`PromptMessage::user_content`](crate::protocol::PromptMessage::user_content)),
+//! lectures de ressources **binaires** (`blob` base64,
+//! [`resource_data`](crate::server::ServerBuilder::resource_data)),
+//! `resources/templates/list`
+//! ([`resource_template`](crate::server::ServerBuilder::resource_template))
+//! et `completion/complete`
+//! ([`completions`](crate::server::ServerBuilder::completions)).
 //!
 //! **Erreurs structurées** ([`ToolError`](crate::error)) : un échec d'outil
 //! classé (`rate_limited`, `upstream`, `timeout`…) avec politique de
@@ -51,13 +62,13 @@
 //! pour compteurs, latence et taux d'erreur sans instrumenter votre
 //! client.
 //!
-//! **Gateways** ([`Gateway`](crate::gateway::Gateway)) : le registre
+//! **Gateways** ([`Gateway`]) : le registre
 //! d'outils devient vivant — `edit()` ajoute/retire des outils pendant que
 //! le serveur sert, chaque requête part sur un snapshot immuable complet.
 //! C'est la brique qui permet à un serveur MCP de refléter en direct des
 //! serveurs détectés (outils proxy, catalogues qui apparaissent et
 //! disparaissent) sans redémarrer ; le dispatch embarqué
-//! ([`ServerCore`](crate::server::ServerCore)) se monte alors dans la route
+//! ([`ServerCore`]) se monte alors dans la route
 //! HTTP d'une app hôte qui possède déjà son propre socket durci.
 //!
 //! ```no_run
@@ -82,12 +93,12 @@
 //! ```
 //!
 //! **Anti-zombie**
-//! ([`antizombie`](crate::antizombie), opt-in via
+//! ([`antizombie`], opt-in via
 //! [`anti_zombie`](crate::server::ServerBuilder::anti_zombie)) : au bind, le
 //! registre d'annonce partagé est débarrassé des annonces de process morts
 //! et des débris d'écriture ; à la fin de vie, les connexions sont drainées
 //! (attente bornée) et le bilan
-//! [`ZombieReport`](crate::antizombie::ZombieReport) — connexions restantes,
+//! [`ZombieReport`] — connexions restantes,
 //! handlers encore vivants, sweep — est lisible via
 //! [`zombie_report`](crate::http::ServerHandle::zombie_report).
 //!
@@ -103,14 +114,36 @@
 //! (ou en `text/event-stream` si le client ne demande que du SSE).
 //!
 //! - `server/discover` : implémentée (SEP-2575) — annonce les versions
-//!   supportées, les capacités (tools, resources, prompts — selon les
-//!   registres) et l'identité du serveur ;
+//!   supportées, les capacités (`tools`, `resources`, `prompts` — toujours
+//!   annoncées : les méthodes correspondantes sont servies même à registre
+//!   vide) et l'identité du serveur ;
 //! - `resultType` : présent dans **chaque** résultat (SEP-2322) ;
 //! - `serverInfo` : le serveur s'identifie sous `_meta` de **chaque**
 //!   résultat (SEP-2575) ;
 //! - `ttlMs` / `cacheScope` : présents sur les résultats de liste et de
-//!   lecture — `tools/list`, `resources/list`, `resources/read`,
-//!   `prompts/list` (SEP-2549) ;
+//!   lecture — `tools/list`, `resources/list`, `resources/templates/list`,
+//!   `resources/read`, `prompts/list` (SEP-2549) ;
+//! - contenus riches : `content[]` d'outil **multiple et mixte** (texte,
+//!   image, audio, `resource_link`, ressource embarquée), messages de
+//!   prompt image/ressource, lectures de ressources binaires (`blob` base64) ;
+//! - `resources/templates/list` : catalogue des gabarits (URI templates
+//!   RFC 6570) ;
+//! - `completion/complete` : suggestions d'arguments — la capacité
+//!   `completions` n'est annoncée que si un fournisseur est enregistré ;
+//! - cycle multi round-trip (**MRTR**) : un handler d'outil, de prompt ou
+//!   de ressource peut renvoyer un résultat `input_required`
+//!   ([`InputRequiredSpec`](crate::protocol::InputRequiredSpec) —
+//!   `inputRequests` + état opaque `requestState` **signé** HMAC-SHA256,
+//!   TTL 10 min par défaut, liaison méthode/paramètres saillants) — le
+//!   client réémet la requête sous un **id différent** avec
+//!   `inputResponses` et l'écho exact du jeton ; une requête embarquée
+//!   (`elicitation/create`, `sampling/createMessage`, `roots/list`) exige
+//!   la capacité client correspondante (`-32021` sinon) ; l'état est borné
+//!   (8 Kio) et vérifié à chaque tour (altéré, expiré, mal formé ou lié à
+//!   une autre requête → `-32602`) ; le jeton est porteur et non consommé
+//!   (la consommation unique, si requise, est à imposer dans le handler) ;
+//!   **aucune capacité serveur supplémentaire n'est annoncée** — rien
+//!   n'est servi au-delà des résultats `input_required` ;
 //! - version de protocole : lue dans `_meta`, refusée en `-32022` si
 //!   inconnue ; son absence est tolérée (compatibilité `2025-11-25`) ;
 //! - `Mcp-Method` / `Mcp-Name` : acceptés et vérifiés contre le corps
@@ -142,16 +175,16 @@
 //! ```
 
 /// Anti-zombie — registre sans fantômes, drain de fin de vie, bilan
-/// vérifiable ([`ZombieReport`](crate::antizombie::ZombieReport)).
+/// vérifiable (`ZombieReport`).
 pub mod antizombie;
 pub mod error;
 /// Registre **dynamique** — la surface d'outils change pendant le service
-/// ([`Gateway`](crate::gateway::Gateway)) : le socle des gateways qui
+/// ([`Gateway`]) : le socle des gateways qui
 /// reflètent des serveurs détectés.
 pub mod gateway;
 pub mod http;
 pub mod jsonrpc;
-/// Macros `#[tool]`/`#[resource]`/`#[prompt]` (feature `macros`) — voir
+/// Macros `#[tool]`/`#[resource]`/`#[prompt]` (incluses par défaut) — voir
 /// [`litemcp_macros`].
 #[cfg(feature = "macros")]
 pub mod macros {
@@ -161,6 +194,10 @@ pub mod protocol;
 /// Annonce des serveurs au MCP Control (intégration native) —
 /// opt-in via [`ServerBuilder::announce`].
 pub mod registry;
+/// Jetons `requestState` MRTR — état opaque **signé** (HMAC-SHA256), sans
+/// état serveur : module interne du cycle multi round-trip (voir
+/// [`crate::server::ServerBuilder::tool_mrtr`]).
+mod request_state;
 /// Adaptateur schemars (feature `schemars`) — voir [`crate::schemars`].
 #[cfg(feature = "schemars")]
 pub mod schemars;
@@ -171,7 +208,12 @@ pub use antizombie::{SweepReport, ZombieReport, sweep_dir, sweep_registry};
 pub use error::{ErrorCode, ToolError};
 pub use gateway::Gateway;
 pub use http::{RequestContext, RequestRejection};
-pub use server::{CallEvent, CallStatus, ServerBuilder, ServerCore, ToolResult};
+pub use jsonrpc::ErrorObject;
+pub use server::{
+    CallEvent, CallStatus, DispatchResponse, HttpStatus, InputRound, McpHeaders, PromptOutcome,
+    ProtocolProfile, ResourceOutcome, ServerBuilder, ServerCore, ToolOutcome, ToolResult,
+};
+pub use zod::WithHeader;
 
 /// Version du crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -214,12 +256,18 @@ pub mod prelude {
     #[cfg(feature = "macros")]
     pub use crate::macros::{prompt, resource, tool};
     pub use crate::protocol::{
-        CacheScope, PROTOCOL_VERSION, PromptArgument, PromptMessage, ResultType,
-        SUPPORTED_VERSIONS, ToolAnnotations,
+        AudioContent, BlobResourceContents, CacheScope, CallToolResult, CompleteReference,
+        Completion, CompletionArgument, CompletionRequest, ContentBlock, EmbeddedResourceContent,
+        ImageContent, InputRequiredSpec, META_CLIENT_CAPABILITIES, META_PROTOCOL_VERSION,
+        PROTOCOL_VERSION, PromptArgument, PromptMessage, ResourceData, ResourceLinkContent,
+        ResourceTemplate, ResultType, SUPPORTED_VERSIONS, TextContent, ToolAnnotations,
     };
     #[cfg(feature = "schemars")]
     pub use crate::schemars::{from_json_schema, from_schemars};
-    pub use crate::server::{CallEvent, CallStatus, McpHeaders, ServerBuilder, ToolResult};
-    pub use crate::zod::{self, Schema};
+    pub use crate::server::{
+        CallEvent, CallStatus, DispatchResponse, HttpStatus, InputRound, McpHeaders, PromptOutcome,
+        ProtocolProfile, ResourceOutcome, ServerBuilder, ToolOutcome, ToolResult,
+    };
+    pub use crate::zod::{self, Schema, WithHeader};
     pub use crate::{DEFAULT_ADDRESS, DEFAULT_PORT, DEFAULT_PORT_RANGE, VERSION};
 }

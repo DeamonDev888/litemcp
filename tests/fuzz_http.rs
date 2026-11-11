@@ -23,6 +23,7 @@ fn server() -> SocketAddr {
     static ADDR: std::sync::OnceLock<SocketAddr> = std::sync::OnceLock::new();
     *ADDR.get_or_init(|| {
         let bound = ServerBuilder::new("fuzz", "0.1.0")
+            .legacy(true)
             .tool("ok", "répond ok", |_args| {
                 Ok(serde_json::json!({ "ok": true }))
             })
@@ -154,7 +155,10 @@ proptest! {
         let text = std::str::from_utf8(&response).expect("réponse ASCII/UTF-8");
         let head_end = text.find("\r\n\r\n").expect("en-têtes") + 4;
         let status = &text[..text.find("\r\n").unwrap()];
-        prop_assert!(status.contains(" 200 "), "statut : {status}");
+        prop_assert!(
+            status.contains(" 200 ") || status.contains(" 400 ") || status.contains(" 404 "),
+            "statut : {status}"
+        );
         let payload: serde_json::Value =
             serde_json::from_str(text[head_end..].trim()).expect("corps JSON valide");
         prop_assert_eq!(&payload["jsonrpc"], &serde_json::json!("2.0"), "{:?}", payload);

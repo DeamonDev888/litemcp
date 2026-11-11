@@ -1,0 +1,130 @@
+{
+  "revision": "2026-07-28",
+  "harness": "@modelcontextprotocol/conformance@0.2.0-alpha.12",
+  "updated": "2026-11-09",
+  "policy": "Le gate échoue sur tout échec scoré absent de cette liste (nouvelle régression) ET sur toute entrée devenue verte (baseline périmée — elle doit rester vide ou strictement décroissante). Chaque entrée porte une justification datée ; une entrée sans date ou sans cause vérifiable est interdite.",
+  "scored_scenarios_provenance": "Copie gelée de la section server: de requirements/2026-07-28.yaml du harness épinglé @modelcontextprotocol/conformance@0.2.0-alpha.12 (SHA-256 du YAML : AE2F4F6210FD729E2E318EDD5BBFA31A43CEE0BC608E48052FA26DBF1D939B57, identique octet pour octet à la copie upstream). Mettre à jour uniquement si la version du harness change.",
+  "expected_server_scenario_count": 50,
+  "scored_scenarios": [
+    "server-stateless",
+    "completion-complete",
+    "tools-list",
+    "tools-call-simple-text",
+    "tools-call-image",
+    "tools-call-audio",
+    "tools-call-embedded-resource",
+    "tools-call-mixed-content",
+    "tools-call-error",
+    "tools-call-with-progress",
+    "server-sse-multiple-streams",
+    "resources-list",
+    "resources-read-text",
+    "resources-read-binary",
+    "resources-templates-read",
+    "sep-2164-resource-not-found",
+    "prompts-list",
+    "prompts-get-simple",
+    "prompts-get-with-args",
+    "prompts-get-embedded-resource",
+    "prompts-get-with-image",
+    "dns-rebinding-protection",
+    "caching",
+    "input-required-result-basic-elicitation",
+    "input-required-result-basic-sampling",
+    "input-required-result-basic-list-roots",
+    "input-required-result-request-state",
+    "input-required-result-multiple-input-requests",
+    "input-required-result-multi-round",
+    "input-required-result-missing-input-response",
+    "input-required-result-non-tool-request",
+    "input-required-result-result-type",
+    "input-required-result-unsupported-methods",
+    "input-required-result-tampered-state",
+    "input-required-result-capability-check",
+    "input-required-result-ignore-extra-params",
+    "input-required-result-validate-input"
+  ],
+  "not_scored_scenarios": [
+    "tasks-lifecycle",
+    "tasks-capability-negotiation",
+    "tasks-wire-fields",
+    "tasks-request-state-removal",
+    "tasks-mrtr-input",
+    "tasks-request-headers",
+    "tasks-dispatch-and-envelope",
+    "tasks-status-notifications",
+    "tasks-required-task-error",
+    "tasks-mrtr-composition",
+    "json-schema-2020-12",
+    "http-header-validation",
+    "http-custom-header-server-validation"
+  ],
+  "expected_failures": [
+    {
+      "scenario": "tools-call-with-progress",
+      "date": "2026-11-09",
+      "reason": "Transport stateless sans canal de notifications pendant l'exécution d'un handler (la réponse part en un seul write après calcul) — les 3 notifications/progress exigées ne peuvent pas être livrées. Sujet transport séparé de la feuille de route (annulation/notifications) ; le tool test_tool_with_progress répond correctement.",
+      "evidence": ".zwork/conformance/results-fixture-2026-11-09/server-tools-call-with-progress-*"
+    },
+    {
+      "scenario": "input-required-result-basic-elicitation",
+      "date": "2026-11-09",
+      "reason": "MRTR/SEP-2322 : aucun handler LiteMCP ne peut produire resultType=input_required (inputRequests/requestState) — sujet dédié « Combler ou assumer les surfaces MCP manquantes » de la feuille de route. Fixture : outil non enregistré.",
+      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
+    },
+    {
+      "scenario": "input-required-result-basic-sampling",
+      "date": "2026-11-09",
+      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
+      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
+    },
+    {
+      "scenario": "input-required-result-basic-list-roots",
+      "date": "2026-11-09",
+      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
+      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
+    },
+    {
+      "scenario": "input-required-result-request-state",
+      "date": "2026-11-09",
+      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
+      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
+    },
+    {
+      "scenario": "input-required-result-multiple-input-requests",
+      "date": "2026-11-09",
+      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
+      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
+    },
+    {
+      "scenario": "input-required-result-multi-round",
+      "date": "2026-11-09",
+      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
+      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
+    },
+    {
+      "scenario": "input-required-result-non-tool-request",
+      "date": "2026-11-09",
+      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation (prompts/get doit aussi produire input_required).",
+      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
+    },
+    {
+      "scenario": "input-required-result-result-type",
+      "date": "2026-11-09",
+      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
+      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
+    },
+    {
+      "scenario": "input-required-result-tampered-state",
+      "date": "2026-11-09",
+      "reason": "MRTR/SEP-2322 — l'outil test_input_required_result_tampered_state ne peut pas exister tant que requestState n'existe pas.",
+      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
+    },
+    {
+      "scenario": "input-required-result-capability-check",
+      "date": "2026-11-09",
+      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
+      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
+    }
+  ]
+}

@@ -393,9 +393,11 @@ impl ParamType {
 }
 
 /// Littéral JSON validé pour `default(param = …)`.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 enum DefaultLit {
-    Int(i64),
+    /// Porté par `i128` : couvre exactement i64 **et** u64 — un défaut
+    /// `u64::MAX` ne peut plus être tronqué ni refusé par le parsing.
+    Int(i128),
     Float(f64),
     Str(String),
     Bool(bool),
@@ -406,7 +408,20 @@ impl DefaultLit {
     /// Expression Rust produisant un `serde_json::Value` possédé.
     fn to_json_value_expr(&self) -> String {
         match self {
-            Self::Int(n) => format!("::serde_json::Value::from({n}i64)"),
+            // Suffixe **exact** : i64 quand ça tient (forme historique),
+            // sinon u64 pour un littéral non signé hors i64 — jamais de
+            // passage par un type qui tronquerait la valeur.
+            Self::Int(n) => {
+                if *n >= i64::MIN as i128 && *n <= i64::MAX as i128 {
+                    format!("::serde_json::Value::from({n}i64)")
+                } else if *n >= 0 && *n <= u64::MAX as i128 {
+                    format!("::serde_json::Value::from({n}u64)")
+                } else {
+                    "::core::compile_error!(\"litemcp/macros : littéral par défaut \
+                        hors des plages exactes i64/u64\")"
+                        .to_string()
+                }
+            }
             Self::Float(n) => format!("::serde_json::Value::from({n:?}f64)"),
             Self::Str(s) => {
                 format!("::serde_json::Value::from(::std::string::String::from({s:?}))")
@@ -428,25 +443,34 @@ impl DefaultLit {
     fn is_compatible_with(&self, ty: &ParamType) -> bool {
         match ty {
             ParamType::Primitive("i8") => {
-                matches!(self, Self::Int(n) if *n >= i8::MIN as i64 && *n <= i8::MAX as i64)
+                matches!(self, Self::Int(n) if *n >= i8::MIN as i128 && *n <= i8::MAX as i128)
             }
             ParamType::Primitive("i16") => {
-                matches!(self, Self::Int(n) if *n >= i16::MIN as i64 && *n <= i16::MAX as i64)
+                matches!(self, Self::Int(n) if *n >= i16::MIN as i128 && *n <= i16::MAX as i128)
             }
             ParamType::Primitive("i32") => {
-                matches!(self, Self::Int(n) if *n >= i32::MIN as i64 && *n <= i32::MAX as i64)
+                matches!(self, Self::Int(n) if *n >= i32::MIN as i128 && *n <= i32::MAX as i128)
             }
-            ParamType::Primitive("i64" | "isize") => matches!(self, Self::Int(_)),
+            ParamType::Primitive("i64" | "isize") => {
+                matches!(self, Self::Int(n) if *n >= i64::MIN as i128 && *n <= i64::MAX as i128)
+            }
             ParamType::Primitive("u8") => {
-                matches!(self, Self::Int(n) if *n >= 0 && *n <= u8::MAX as i64)
+                matches!(self, Self::Int(n) if *n >= 0 && *n <= u8::MAX as i128)
             }
             ParamType::Primitive("u16") => {
-                matches!(self, Self::Int(n) if *n >= 0 && *n <= u16::MAX as i64)
+                matches!(self, Self::Int(n) if *n >= 0 && *n <= u16::MAX as i128)
             }
             ParamType::Primitive("u32") => {
-                matches!(self, Self::Int(n) if *n >= 0 && *n <= u32::MAX as i64)
+                matches!(self, Self::Int(n) if *n >= 0 && *n <= u32::MAX as i128)
             }
-            ParamType::Primitive("u64" | "usize") => matches!(self, Self::Int(n) if *n >= 0),
+            // u64/usize : la plage complète non signée est acceptée (u64::MAX
+            // compris). Pour `usize`, la borne dépend de la cible : le
+            // fallback généré utilise `usize::try_from(v).unwrap_or_default()`
+            // — exact sur toute cible 64 bits, ramené au défaut 0 si une
+            // cible plus étroite ne peut pas représenter le littéral.
+            ParamType::Primitive("u64" | "usize") => {
+                matches!(self, Self::Int(n) if *n >= 0 && *n <= u64::MAX as i128)
+            }
             ParamType::Primitive("f32") => match self {
                 Self::Float(f) => *f >= f32::MIN as f64 && *f <= f32::MAX as f64,
                 Self::Int(_) => true,
@@ -684,11 +708,14 @@ fn schema_for(ty: &ParamType) -> Option<String> {
                 .max(::core::primitive::u32::MAX as i64)"
                 .to_string(),
         ),
-        ParamType::Primitive("u64") => Some("::litemcp::zod::integer().min(0)".to_string()),
+        ParamType::Primitive("u64") => Some("::litemcp::zod::uint()".to_string()),
         ParamType::Primitive("usize") => Some(
-            "::litemcp::zod::integer()\
-                .min(0)\
-                .max((::core::primitive::usize::MAX as u128).min(::core::primitive::i64::MAX as u128) as i64)"
+            // Borne exacte **de la cible** : l'expression est évaluée à
+            // l'enregistrement, compilée pour la cible — pas de littéral
+            // figé 64 bits pour un type dont la largeur dépend de la
+            // plateforme.
+            "::litemcp::zod::uint()\
+                .max(::core::primitive::usize::MAX as u64)"
                 .to_string(),
         ),
         ParamType::Primitive("f32") => Some(
@@ -727,10 +754,29 @@ fn extract_from(
 
 fn extract_required(ty: &ParamType, value_expr: &str, default: Option<&DefaultLit>) -> String {
     match ty {
-        ParamType::Primitive(
-            int_ty @ ("i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64"
-            | "usize"),
-        ) => match default {
+        // Chemin **non signé** : extraction exacte u64, conversion bornée
+        // vers le type cible (`try_from` — jamais de troncature `as`). Un
+        // négatif (`as_u64() == None`) tombe sur le défaut 0 — il ne peut
+        // jamais devenir un grand entier ; la validation `uint()` (min 0
+        // publié) le refuse avant de toute façon.
+        ParamType::Primitive(unsigned @ ("u8" | "u16" | "u32" | "u64" | "usize")) => {
+            match default {
+                Some(lit) => {
+                    let fb = lit.to_json_value_expr();
+                    format!(
+                        "{value_expr}.as_u64().or_else(|| {fb}.as_u64())\
+                     .and_then(|__litemcp_v| ::core::primitive::{unsigned}::try_from(__litemcp_v).ok())\
+                     .unwrap_or_default()"
+                    )
+                }
+                None => format!(
+                    "{value_expr}.as_u64()\
+                 .and_then(|__litemcp_v| ::core::primitive::{unsigned}::try_from(__litemcp_v).ok())\
+                 .unwrap_or_default()"
+                ),
+            }
+        }
+        ParamType::Primitive(int_ty @ ("i8" | "i16" | "i32" | "i64" | "isize")) => match default {
             Some(lit) => {
                 let fb = lit.to_json_value_expr();
                 format!(
@@ -857,7 +903,7 @@ fn parse_numeric_lit(raw: &str, negative: bool) -> Option<DefaultLit> {
                 } else {
                     digits.to_string()
                 };
-                if let Ok(n) = signed.parse::<i64>() {
+                if let Ok(n) = signed.parse::<i128>() {
                     return Some(DefaultLit::Int(n));
                 }
             }
@@ -990,4 +1036,111 @@ fn parse_str_literal(raw: &str) -> Option<String> {
 
 fn err(message: &str) -> TokenStream {
     TokenStream::from_str(&format!("compile_error!({message:?});")).expect("compile_error valide")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DefaultLit, ParamType, parse_numeric_lit};
+
+    fn int(n: i128) -> DefaultLit {
+        DefaultLit::Int(n)
+    }
+
+    /// Les littéraux par défaut sont portés par `i128` : u64::MAX et
+    /// i64::MAX + 1 sont parsés EXACTS — jamais tronqués par le parsing.
+    #[test]
+    fn litteraux_entiers_portes_par_i128() {
+        for raw in [
+            "18446744073709551615",
+            "18446744073709551615u64",
+            "18_446_744_073_709_551_615",
+        ] {
+            match parse_numeric_lit(raw, false) {
+                Some(DefaultLit::Int(n)) => assert_eq!(n, u64::MAX as i128, "{raw}"),
+                other => panic!("{raw} doit être un entier exact, obtenu {other:?}"),
+            }
+        }
+        match parse_numeric_lit("9223372036854775808", false) {
+            Some(DefaultLit::Int(n)) => assert_eq!(n, i64::MAX as i128 + 1),
+            other => panic!("i64::MAX + 1 doit être porté exact, obtenu {other:?}"),
+        }
+        assert_eq!(parse_numeric_lit("1", true), Some(DefaultLit::Int(-1)));
+        assert_eq!(
+            parse_numeric_lit("9223372036854775808", true),
+            Some(DefaultLit::Int(i64::MIN as i128))
+        );
+        // Hors i128 (u128::MAX) : refusé net — jamais de repli flottant.
+        assert_eq!(
+            parse_numeric_lit("340282366920938463463374607431768211455", false),
+            None
+        );
+    }
+
+    /// La compatibilité compile d'un défaut est bornée PAR TYPE exact —
+    /// un négatif n'est jamais un u64/usize, et au-delà de chaque plage
+    /// c'est un diagnostic, jamais une troncature.
+    #[test]
+    fn compatibilite_compile_des_defauts_par_type() {
+        let u64_ty = ParamType::Primitive("u64");
+        assert!(
+            !int(-1).is_compatible_with(&u64_ty),
+            "-1 n'est jamais un u64"
+        );
+        assert!(int(u64::MAX as i128).is_compatible_with(&u64_ty));
+        assert!(int(i64::MAX as i128 + 1).is_compatible_with(&u64_ty));
+        assert!(!int(u64::MAX as i128 + 1).is_compatible_with(&u64_ty));
+
+        let usize_ty = ParamType::Primitive("usize");
+        assert!(int(usize::MAX as i128).is_compatible_with(&usize_ty));
+        assert!(!int(-1).is_compatible_with(&usize_ty));
+
+        let i64_ty = ParamType::Primitive("i64");
+        assert!(int(i64::MIN as i128).is_compatible_with(&i64_ty));
+        assert!(int(i64::MAX as i128).is_compatible_with(&i64_ty));
+        assert!(!int(i64::MAX as i128 + 1).is_compatible_with(&i64_ty));
+        assert!(!int(i64::MIN as i128 - 1).is_compatible_with(&i64_ty));
+
+        // isize suit la plage signée 64 bits (la borne exacte de la cible
+        // est appliquée par le schéma généré à l'enregistrement).
+        assert!(int(i64::MIN as i128).is_compatible_with(&ParamType::Primitive("isize")));
+        assert!(!int(i64::MAX as i128 + 1).is_compatible_with(&ParamType::Primitive("isize")));
+
+        assert!(int(u8::MAX as i128).is_compatible_with(&ParamType::Primitive("u8")));
+        assert!(!int(u8::MAX as i128 + 1).is_compatible_with(&ParamType::Primitive("u8")));
+    }
+
+    /// L'émission des défauts : i64 (forme historique) quand ça tient,
+    /// u64 exact au-delà — et un diagnostic de compilation explicite pour
+    /// tout ce qui dépasse les deux plages exactes.
+    #[test]
+    fn emission_des_litteraux_defaut_sans_troncature() {
+        assert_eq!(
+            int(-1).to_json_value_expr(),
+            "::serde_json::Value::from(-1i64)"
+        );
+        assert_eq!(
+            int(i64::MIN as i128).to_json_value_expr(),
+            "::serde_json::Value::from(-9223372036854775808i64)"
+        );
+        assert_eq!(
+            int(i64::MAX as i128 + 1).to_json_value_expr(),
+            "::serde_json::Value::from(9223372036854775808u64)"
+        );
+        assert_eq!(
+            int(u64::MAX as i128).to_json_value_expr(),
+            format!("::serde_json::Value::from({}u64)", u64::MAX)
+        );
+        assert!(
+            int(u64::MAX as i128 + 1)
+                .to_json_value_expr()
+                .contains("compile_error!"),
+            "u64::MAX + 1 doit produire un diagnostic, jamais une troncature"
+        );
+        assert!(
+            int(i64::MIN as i128 - 1)
+                .to_json_value_expr()
+                .contains("compile_error!"),
+            "i64::MIN - 1 doit produire un diagnostic, jamais une troncature"
+        );
+    }
 }

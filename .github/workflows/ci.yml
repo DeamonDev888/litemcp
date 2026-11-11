@@ -1,12 +1,17 @@
 name: CI
 
-# Les trois jobs se déclenchent automatiquement sur tout push vers main et
+# Les quatre jobs se déclenchent automatiquement sur tout push vers main et
 # sur TOUTE pull request (quelle que soit la branche source). La protection
 # de branche les rend requis avant merge + 1 approbation.
 on:
   push:
     branches: [main]
   pull_request:
+
+# Lecture seule : la CI ne fait que lire le dépôt (aucune écriture, aucun
+# secret de publication).
+permissions:
+  contents: read
 
 # Un seul run actif par ref : un nouveau push sur la même branche/PR annule
 # le run supplanté (économise les runners, résultats plus rapides).
@@ -18,16 +23,25 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Actions épinglées par SHA de commit (même politique que les workflows
+      # de publication) : un tag peut être déplacé, un SHA non.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --workspace --all-features
+      # Les garde-fous du pipeline de publication (scripts/release-tests.ps1 :
+      # tag incohérent, tests rouges, version déjà publiée, réseau
+      # indisponible, contenu des paquets) tournent aussi sur chaque PR —
+      # aucune publication, aucun secret. `tests/release_pipeline.rs` couvre
+      # la structure des workflows via `cargo test` ci-dessus.
+      - name: Simulations du pipeline de publication
+        run: pwsh -NoProfile -File scripts/release-tests.ps1
       - name: Doc
         run: cargo doc --no-deps --all-features
 
@@ -36,8 +50,8 @@ jobs:
     # pour ne pas bloquer le job principal sur la toolchain stable.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@ccc8c1f930153b792217f06c65a38f23a882993a # 1.85
       - name: Check MSRV
         run: cargo check --workspace --all-targets --all-features
 
@@ -48,7 +62,9 @@ jobs:
     # compatibles les plus récentes, ce qui est le but ici.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@cargo-deny
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: taiki-e/install-action@98b24ef8830c90613ec3b57343df3abde2b66e56 # cargo-deny
+        with:
+          tool: cargo-deny
       - name: Advisories
         run: cargo deny check advisories

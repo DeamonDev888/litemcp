@@ -573,6 +573,7 @@ fn mcp_routing_headers_are_enforced_on_notifications_and_missing_body_name() {
     let headers = litemcp::server::McpHeaders {
         method: Some("tools/call".to_string()),
         name: Some("ok".to_string()),
+        ..Default::default()
     };
     let reply = core
         .dispatch_with_headers(
@@ -590,6 +591,7 @@ fn mcp_routing_headers_are_enforced_on_notifications_and_missing_body_name() {
     let bad_method = litemcp::server::McpHeaders {
         method: Some("ping".to_string()),
         name: None,
+        ..Default::default()
     };
     let reply = core.dispatch_with_headers(
         br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
@@ -621,6 +623,7 @@ fn notification_incoherent_emits_one_hook_event_and_no_reply() {
     let bad_method = litemcp::server::McpHeaders {
         method: Some("ping".to_string()),
         name: None,
+        ..Default::default()
     };
     let reply = core.dispatch_with_headers(
         br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,

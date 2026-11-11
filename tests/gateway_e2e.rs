@@ -431,3 +431,121 @@ fn retrait_de_ressource_et_de_prompt() {
         "le prompt doit avoir disparu : {prompts}"
     );
 }
+
+// ------------------------------------------------- 10. plafond inflight global
+
+/// Régression : chaque noyau recréait son compteur d'inflight — des handlers
+/// détachés d'un ANCIEN snapshot (timeout) ne comptaient plus dans le noyau
+/// neuf publié par `edit` : `Gateway::edit` contournait
+/// `MAX_INFLIGHT_HANDLERS`. Tous les snapshots d'un gateway partagent
+/// désormais UN compteur : le plafond global tient après plusieurs edits,
+/// les slots reviennent à la terminaison des détachés, et le repli conserve
+/// le bon type d'erreur (`rate_limited`).
+#[test]
+fn edit_ne_contourne_pas_le_plafond_inflight_global() {
+    // Les handlers « bloque » patientent sur cette variable jusqu'à la
+    // libération explicite — chaque slot reste retenu jusque-là.
+    let release = Arc::new(std::sync::Mutex::new(false));
+    let cvar = Arc::new(std::sync::Condvar::new());
+    let bloque_release = Arc::clone(&release);
+    let bloque_cvar = Arc::clone(&cvar);
+    let gw = Gateway::new(
+        ServerBuilder::new("gw-plafond", "1.0.0")
+            .tool_timeout(std::time::Duration::from_millis(60))
+            .tool(
+                "bloque",
+                "retient son slot jusqu'à la libération",
+                move |_a| {
+                    let mut engage = bloque_release.lock().unwrap();
+                    while !*engage {
+                        engage = bloque_cvar.wait(engage).unwrap();
+                    }
+                    Ok(json!({}))
+                },
+            )
+            .tool("ok", "répond vite", |_a| Ok(json!({ "vite": true }))),
+    );
+
+    let req_ok = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "ok", "arguments": {} }
+    })
+    .to_string();
+
+    // Témoin : à compteur vide, l'outil passe — le plafond n'est pas la faute
+    // de l'outil, c'est bien la saturation globale qui refuse.
+    let temoin = dispatch(&gw, &req_ok).unwrap();
+    assert_eq!(
+        temoin["result"]["structuredContent"]["vite"], true,
+        "l'outil doit passer à compteur vide : {temoin}"
+    );
+
+    // `MAX_INFLIGHT_HANDLERS` appels sur l'ancien snapshot : chaque handler
+    // prend son slot puis est détaché par le timeout (60 ms) — il retient
+    // son slot jusqu'à sa terminaison effective, ici bloqué sur la variable
+    // de libération.
+    let ancien = gw.snapshot();
+    let req_bloque = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "bloque", "arguments": {} }
+    })
+    .to_string();
+    let appels: Vec<_> = (0..litemcp::server::MAX_INFLIGHT_HANDLERS)
+        .map(|_| {
+            let ancien = Arc::clone(&ancien);
+            let req = req_bloque.clone();
+            std::thread::spawn(move || {
+                let reply = ancien.dispatch(req.as_bytes()).unwrap();
+                serde_json::from_slice::<Value>(&reply).unwrap()
+            })
+        })
+        .collect();
+    for (i, appel) in appels.into_iter().enumerate() {
+        let v = appel.join().unwrap();
+        assert_eq!(
+            v["result"]["structuredContent"]["error"]["code"], "timeout",
+            "appel {i} : le handler doit être détaché par le timeout : {v}"
+        );
+    }
+
+    // Deux edits successifs : avant le correctif, chaque nouveau noyau
+    // repartait de zéro — les nouveaux appels passaient alors que les 256
+    // handlers détachés vivaient encore. Le plafond global doit les refuser
+    // tous, avec le bon type d'erreur.
+    gw.edit(|b| b);
+    for i in 0..8 {
+        let v = dispatch(&gw, &req_ok).unwrap();
+        assert_eq!(
+            v["result"]["structuredContent"]["error"]["code"], "rate_limited",
+            "appel {i} : le plafond global doit refuser (256 détachés + 1) : {v}"
+        );
+        assert_eq!(
+            v["result"]["isError"], true,
+            "le refus doit être un échec d'exécution, pas une erreur protocole : {v}"
+        );
+    }
+    gw.edit(|b| b.tool("marqueur", "publié après saturation", |_a| Ok(json!({}))));
+    let v = dispatch(&gw, &req_ok).unwrap();
+    assert_eq!(
+        v["result"]["structuredContent"]["error"]["code"], "rate_limited",
+        "après un second edit, le plafond global tient toujours : {v}"
+    );
+
+    // Libération : les 256 handlers détachés terminent et rendent leurs
+    // slots — le plafond redevient disponible.
+    *release.lock().unwrap() = true;
+    cvar.notify_all();
+    let mut rendu = false;
+    for _ in 0..200 {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let v = dispatch(&gw, &req_ok).unwrap();
+        if v["result"]["structuredContent"]["vite"] == true {
+            rendu = true;
+            break;
+        }
+    }
+    assert!(
+        rendu,
+        "les slots doivent revenir à la terminaison des handlers détachés"
+    );
+}

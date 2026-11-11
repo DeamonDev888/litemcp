@@ -39,6 +39,7 @@ fn handler_panic_becomes_internal_error_not_connection_drop() {
     use std::io::Write;
     // Le catch_unwind vit dans le transport HTTP : test via une vraie socket.
     let bound = litemcp::ServerBuilder::new("t", "0.2.0")
+        .legacy(true)
         .tool("boom", "Panique exprès", |_args| {
             panic!("boom volontaire");
         })
@@ -83,7 +84,7 @@ fn zod_string_counts_characters_not_bytes() {
 }
 
 #[test]
-fn zod_integer_is_strict_json_integers() {
+fn zod_integer_accepts_integral_floats_and_normalizes_them() {
     use litemcp::zod::{Issues, Schema};
     let schema = litemcp::zod::object().field("n", litemcp::zod::integer().max(200));
 
@@ -101,28 +102,45 @@ fn zod_integer_is_strict_json_integers() {
     schema.validate(&mut path, &serde_json::json!({ "n": -3 }), &mut issues);
     assert!(issues.is_empty(), "-3 doit passer : {:?}", issues.render());
 
-    // Les flottants sont REFUSÉS, même à fractule nulle : le schéma est
-    // exécuteur — une valeur acceptée doit toujours être lisible par
-    // `Value::as_i64()` (le motif `as_i64().unwrap()` documenté par la
-    // crate ne doit jamais paniquer sur une valeur que le schéma a validée).
+    // Sémantiques JSON Schema (draft 2020-12) : un nombre mathématiquement
+    // intégral (`3.0`, `1e2`) est un `integer` — accepté, puis **normalisé
+    // en entier exact** avant le handler (`Schema::normalize_integers`) :
+    // la garantie `as_i64()` reste inconditionnelle, sans casser la
+    // conformité du type publié.
     let mut issues = Issues::new();
     let mut path = litemcp::zod::Path::root("arguments");
     schema.validate(&mut path, &serde_json::json!({ "n": 1e2 }), &mut issues);
     assert!(
-        !issues.is_empty(),
-        "1e2 doit etre refuse (as_i64() renvoie None) : {:?}",
+        issues.is_empty(),
+        "1e2 (100 intégral) doit passer : {:?}",
         issues.render()
     );
     let mut issues = Issues::new();
     let mut path = litemcp::zod::Path::root("arguments");
     schema.validate(&mut path, &serde_json::json!({ "n": 3.0 }), &mut issues);
     assert!(
-        !issues.is_empty(),
-        "3.0 doit etre refuse (as_i64() renvoie None) : {:?}",
+        issues.is_empty(),
+        "3.0 (intégral) doit passer : {:?}",
         issues.render()
     );
     let mut issues = Issues::new();
     let mut path = litemcp::zod::Path::root("arguments");
     schema.validate(&mut path, &serde_json::json!({ "n": 1.5 }), &mut issues);
     assert!(!issues.is_empty(), "1.5 n'est pas entier");
+    // Un intégral hors de la plage **publiée** (maximum : 200) est refusé
+    // comme violation de borne — jamais converti ni saturé.
+    let mut issues = Issues::new();
+    let mut path = litemcp::zod::Path::root("arguments");
+    schema.validate(&mut path, &serde_json::json!({ "n": 1e3 }), &mut issues);
+    assert!(
+        !issues.is_empty(),
+        "1e3 (1000) dépasse le maximum publié (200) : {:?}",
+        issues.render()
+    );
+
+    // La normalisation donne au handler un entier exact : `as_i64()`
+    // réussit sur une valeur `3.0` validée.
+    let mut value = serde_json::json!({ "n": 3.0 });
+    schema.normalize_integers(&mut value);
+    assert_eq!(value["n"].as_i64(), Some(3));
 }

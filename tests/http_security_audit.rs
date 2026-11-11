@@ -13,6 +13,7 @@ fn spawn_audit_server() -> (SocketAddr, Arc<AtomicUsize>) {
     let executed = Arc::new(AtomicUsize::new(0));
     let exec_clone = Arc::clone(&executed);
     let bound = ServerBuilder::new("sec-audit", "1.0.0")
+        .legacy(true)
         .tool("admin_action", "Action sensible", move |_args| {
             exec_clone.fetch_add(1, Ordering::SeqCst);
             Ok(json!({ "executed": true }))
@@ -217,7 +218,7 @@ fn mcp_routing_headers_enforce_exact_case_and_reject_unexpected_or_empty_names()
         body.len()
     );
     let (status, _, resp) = raw_exchange(addr, req.as_bytes());
-    assert_eq!(status, 200);
+    assert_eq!(status, 400);
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(
         v["error"]["code"], -32020,
@@ -231,7 +232,7 @@ fn mcp_routing_headers_enforce_exact_case_and_reject_unexpected_or_empty_names()
         body.len()
     );
     let (status, _, resp) = raw_exchange(addr, req.as_bytes());
-    assert_eq!(status, 200);
+    assert_eq!(status, 400);
     let v: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(
         v["error"]["code"], -32020,
@@ -250,7 +251,7 @@ fn mcp_routing_headers_enforce_exact_case_and_reject_unexpected_or_empty_names()
             body_no_name.len()
         );
         let (status, _, resp) = raw_exchange(addr, req.as_bytes());
-        assert_eq!(status, 200);
+        assert_eq!(status, 400);
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(
             v["error"]["code"], -32020,
@@ -328,7 +329,7 @@ fn notification_with_incoherent_mcp_headers_is_silently_dropped() {
     );
     let (status, _, resp) = raw_exchange(addr, req.as_bytes());
     assert_eq!(
-        status, 200,
+        status, 400,
         "`id: null` explicite = requête : réponse attendue"
     );
     let v: Value = serde_json::from_str(&resp).unwrap();
@@ -517,6 +518,7 @@ fn origin_null_and_cross_site_fetch_metadata_are_blocked() {
     // Même si un utilisateur mettait `"null"` par erreur dans `allow_origins`,
     // `Origin: null` (iframe sandboxée) ne doit JAMAIS être autorisé.
     let bound = ServerBuilder::new("origins", "1.0.0")
+        .legacy(true)
         .tool("ok", "ok", |_| Ok(json!({ "ok": true })))
         .allow_origins(&["https://trusted.example", "null"])
         .bind("127.0.0.1:0")

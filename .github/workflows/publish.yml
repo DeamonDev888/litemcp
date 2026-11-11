@@ -1,142 +1,141 @@
-# Publication de litemcp sur crates.io + notification du tuto.
+# Publication — chemin de secours MANUEL (break-glass) vers crates.io +
+# notification du tuto.
 #
-# Deux jobs :
-#   1. `publish` — publie la version du `Cargo.toml` si elle n'existe pas
-#      encore sur crates.io (idempotent : relancer est sans effet) ;
-#   2. `notifier` — envoie l'evenement `litemcp-version` au repo du
-#      tuto, qui met alors sa doc a jour automatiquement.
+# AUCUN déclencheur tag : la publication canonique sur tag `v*` est
+# `release.yml` (coherence + verify → publish → release GitHub → notification).
+# Ce workflow ne part que sur dispatch manuel (input `version`) et impose le
+# MÊME gate `verify` que le pipeline canonique — jamais de publication sans
+# gate, même en secours. Trois jobs :
+#   1. `verify` — cohérence des versions (cargo metadata : input = racine,
+#      macros = exigence exacte de la dépendance, section CHANGELOG présente)
+#      PUIS gate qualité (fmt workspace, clippy -D warnings, tests, doc,
+#      contenu des deux paquets — scripts/release.ps1) ;
+#   2. `publish` — publication crates.io IDEMPOTENTE via scripts/release.ps1
+#      (macros d'abord, 200/404/autre distingués : une erreur réseau n'est
+#      JAMAIS une preuve d'absence). Le job REVALIDE les versions juste avant
+#      le premier `cargo publish` : la garantie ne dépend ni de l'ordre des
+#      jobs ni d'un output recopié. Jeton : secret `CARGO_REGISTRY_TOKEN` s'il
+#      existe, sinon OIDC (trusted publishing crates.io) ;
+#   3. `notifier` — envoie l'evenement `litemcp-version` au repo du tuto, qui
+#      met alors sa doc a jour automatiquement.
 #
-# Le `notifier` ne part qu'APRES une publication reussie : le tuto ne
-# peut donc jamais suivre une version qui n'est pas publiee. Si le
-# token de notification est absent, le tuto suivra quand même — via le
-# filet de securite hebdomadaire (cron) du workflow maj-version.
+# Le `notifier` ne part qu'APRES une publication confirmée : le tuto ne peut
+# donc jamais suivre une version qui n'est pas publiee. Si le token de
+# notification est absent, le tuto suivra quand même — via le filet de
+# securite hebdomadaire (cron) du workflow maj-version.
 
 name: Publication
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version a publier (ex. 0.6.0)'
+        description: 'Version a publier (ex. 0.10.10) — doit egaler le manifeste racine et la section CHANGELOG'
         required: true
         type: string
 
 permissions:
   contents: read
 
+# Même groupe que `release.yml` (canonique) : les runs de publication sont
+# sérialisés — combiné à l'idempotence, cela écarte toute publication en
+# double d'une même version.
 concurrency:
   group: publication
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Publier sur crates.io
+  verify:
+    name: Verifier (coherence des versions + simulations + fmt, clippy, tests, doc)
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.ver.outputs.version }}
-      published: ${{ steps.verif.outputs.publiee }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - name: Installer Rust (toolchain stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Determiner la version
-        id: ver
+      # Cohérence AVANT le gate lourd : une version incohérente échoue en
+      # secondes. L'input est obligatoire — il doit égaler le manifeste.
+      - name: Coherence des versions (input ↔ cargo metadata ↔ CHANGELOG)
         env:
           VERSION_INPUT: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          V="$VERSION_INPUT"
+          # Aucun argument vide n'est transmis — `pwsh -File script.ps1 -Param ""`
+          # n'est pas portable (Windows PowerShell 5.1 supprime l'argument vide
+          # et la liaison échoue en « argument manquant »).
+          ARGS=(check)
+          if [ -n "$VERSION_INPUT" ]; then ARGS+=(-InputVersion "$VERSION_INPUT"); fi
+          V=$(pwsh -NoProfile -File scripts/release.ps1 "${ARGS[@]}" \
+            | sed -n 's/^version=//p' | tail -1)
           if [ -z "$V" ]; then
-            V=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+            echo "coherence non resolue — abandon avant tout test et toute publication"
+            exit 1
           fi
-          # Garde anti-injection : semver strict uniquement.
-          case "$V" in
-            [0-9].[0-9].[0-9]|[0-9].[0-9].[0-9][0-9]|[0-9].[0-9][0-9].[0-9]|[0-9][0-9].[0-9].[0-9]) ;;
-            *) echo "version non semver stricte : '$V' — abandon"; exit 1;;
-          esac
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "version a publier : $V"
 
-      - name: Verifier que la version n'existe pas deja sur crates.io
-        id: existe
-        run: |
-          set -euo pipefail
-          V="${{ steps.ver.outputs.version }}"
-          if curl -sf -A "litemcp-publish (https://github.com/DeamonDev888/litemcp)" \
-             "https://crates.io/api/v1/crates/litemcp/$V" >/dev/null 2>&1; then
-            echo "deja=true" >> "$GITHUB_OUTPUT"
-            echo "litemcp $V est deja publiee — rien a faire"
-          else
-            echo "deja=false" >> "$GITHUB_OUTPUT"
-            echo "litemcp $V n'est pas encore publiee"
-          fi
+      - name: Gate qualite (fmt, clippy, tests, doc, paquets)
+        run: pwsh -NoProfile -File scripts/release.ps1 verify
 
-      - name: Publier litemcp-macros (si necessaire)
-        if: steps.existe.outputs.deja == 'false'
+  publish:
+    name: Publier sur crates.io (macros puis racine)
+    needs: verify
+    runs-on: ubuntu-latest
+    # `id-token: write` sert uniquement à l'échange OIDC crates.io (jeton
+    # éphémère, révoqué en fin de job) et reste confiné à CE job.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Voie 1 (compatibilité) : le secret `CARGO_REGISTRY_TOKEN` s'il existe.
+      # Voie 2 : trusted publishing crates.io (OIDC) quand il est absent.
+      HAS_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    outputs:
+      version: ${{ steps.recheck.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      # Revalidation locale du gate, juste avant le premier `cargo publish` :
+      # le break-glass ne publie rien qu'il n'ait lui-même confronté à
+      # `cargo metadata` (racine ↔ input, macros ↔ exigence de la dépendance)
+      # et au CHANGELOG, même si le job `verify` était ignoré ou rejoué à part.
+      - name: Coherence des versions avant publication
+        id: recheck
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION_INPUT: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          MV=$(sed -n 's/^version = "\(.*\)"$/\1/p' litemcp-macros/Cargo.toml | head -1)
-          if curl -sf -A "litemcp-publish (https://github.com/DeamonDev888/litemcp)" \
-             "https://crates.io/api/v1/crates/litemcp-macros/$MV" >/dev/null 2>&1; then
-            echo "litemcp-macros $MV est deja publiee sur crates.io"
-          else
-            cargo publish -p litemcp-macros
-            for i in $(seq 1 18); do
-              if curl -sf -A "litemcp-publish (https://github.com/DeamonDev888/litemcp)" \
-                 "https://crates.io/api/v1/crates/litemcp-macros/$MV" >/dev/null 2>&1; then
-                echo "litemcp-macros $MV est en ligne sur crates.io"
-                break
-              fi
-              echo "crates.io n'a pas encore indexe litemcp-macros $MV — tentative $i/18…"
-              sleep 10
-            done
+          ARGS=(check)
+          if [ -n "$VERSION_INPUT" ]; then ARGS+=(-InputVersion "$VERSION_INPUT"); fi
+          V=$(pwsh -NoProfile -File scripts/release.ps1 "${ARGS[@]}" \
+            | sed -n 's/^version=//p' | tail -1)
+          if [ -z "$V" ]; then
+            echo "coherence non resolue — abandon avant toute publication"
+            exit 1
           fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "version a publier : $V"
 
-      - name: Publier (si necessaire)
-        if: steps.existe.outputs.deja == 'false'
+      # Trusted publishing : jeton éphémère échangé contre le JWT OIDC du
+      # workflow, révoqué en post-step. Ignoré si un secret est configuré.
+      - name: Jeton crates.io par OIDC (aucun secret configure)
+        id: auth
+        if: env.HAS_REGISTRY_TOKEN != 'true'
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - name: Publier sur crates.io (idempotent, erreurs reseau non masquees)
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          set -euo pipefail
-          cargo publish -p litemcp
-          echo "litemcp ${{ steps.ver.outputs.version }} publiee sur crates.io"
-
-      - name: Verifier la publication
-        id: verif
-        run: |
-          set -euo pipefail
-          V="${{ steps.ver.outputs.version }}"
-          for i in $(seq 1 18); do
-            if curl -sf -A "litemcp-publish (https://github.com/DeamonDev888/litemcp)" \
-               "https://crates.io/api/v1/crates/litemcp/$V" >/dev/null 2>&1; then
-              echo "publiee=true" >> "$GITHUB_OUTPUT"
-              echo "litemcp $V est en ligne sur crates.io"
-              exit 0
-            fi
-            echo "crates.io n'a pas encore indexe $V — tentative $i/18…"
-            sleep 10
-          done
-          # Version deja en ligne avant ce run ? Succes quand même.
-          if [ "${{ steps.existe.outputs.deja }}" = "true" ]; then
-            echo "publiee=true" >> "$GITHUB_OUTPUT"
-            echo "litemcp $V etait deja en ligne"
-            exit 0
-          fi
-          echo "publiee=false" >> "$GITHUB_OUTPUT"
-          echo "crates.io n'a pas indexe $V dans le temps imparti"
-          exit 1
+          CARGO_REGISTRY_TOKEN: ${{ env.HAS_REGISTRY_TOKEN == 'true' && secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
+        run: pwsh -NoProfile -File scripts/release.ps1 publish -Version ${{ steps.recheck.outputs.version }}
 
   notifier:
     name: Notifier le tuto
     needs: publish
-    if: needs.publish.outputs.published == 'true'
+    # Déclenché par une publication RÉUSSIE (y compris « déjà en ligne » :
+    # c'est le cas d'usage du break-glass — rejouer la notification sans
+    # recréer de tag). Le tuto ne peut jamais suivre une version qui n'est
+    # pas en ligne.
+    if: needs.publish.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Envoyer l'evenement au repo du tuto

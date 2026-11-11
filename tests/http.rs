@@ -7,6 +7,7 @@ use std::net::{SocketAddr, TcpStream};
 
 fn spawn_server() -> SocketAddr {
     let bound = ServerBuilder::new("calc", "0.1.0")
+        .legacy(true)
         .tool("add", "Additionne deux nombres", |args| {
             let a = args.get("a").and_then(Value::as_i64).ok_or("a manquant")?;
             let b = args.get("b").and_then(Value::as_i64).ok_or("b manquant")?;
@@ -132,7 +133,7 @@ fn unknown_method_is_method_not_found() {
         "application/json",
         None,
     );
-    assert_eq!(status, 200);
+    assert_eq!(status, 404);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["error"]["code"], -32601);
 }
@@ -162,7 +163,7 @@ fn ping_result_is_identified_and_typed() {
 fn malformed_json_gets_parse_error_with_null_id() {
     let addr = spawn_server();
     let (status, body) = post(addr, "not json", "application/json", None);
-    assert_eq!(status, 200);
+    assert_eq!(status, 400);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["error"]["code"], -32700);
     assert_eq!(v["id"], Value::Null);
@@ -303,6 +304,7 @@ fn spawn_typed_server() -> SocketAddr {
     }
 
     let bound = ServerBuilder::new("recherche", "0.2.0")
+        .legacy(true)
         .tool_parse(
             "search",
             "Recherche indexée",
@@ -428,6 +430,7 @@ fn typed_tool_rejects_invalid_arguments_without_running_handler() {
 
 fn spawn_hardened() -> SocketAddr {
     let bound = ServerBuilder::new("durci", "0.2.0")
+        .legacy(true)
         .tool("ok", "Répond ok", |_args| {
             Ok(serde_json::json!({ "ok": true }))
         })
@@ -713,6 +716,10 @@ fn over_capacity_connections_get_503() {
     second.read_to_string(&mut raw).unwrap();
     assert!(raw.contains("HTTP/1.1 503"), "{raw:?}");
     assert!(raw.contains("too many connections"), "{raw:?}");
+    // MCP 2026-07-28 : plus de nouveaux codes en -32000 — la saturation
+    // transport est une défaillance interne (-32603) avec data structuré.
+    assert!(raw.contains("\"code\":-32603"), "{raw:?}");
+    assert!(raw.contains("\"reason\":\"overloaded\""), "{raw:?}");
     drop(first);
 }
 
@@ -827,7 +834,7 @@ fn wrong_jsonrpc_version_gets_32600() {
         "application/json",
         None,
     );
-    assert_eq!(status, 200);
+    assert_eq!(status, 400);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["error"]["code"], -32600);
 }
@@ -841,7 +848,7 @@ fn batch_gets_32600_not_32700() {
         "application/json",
         None,
     );
-    assert_eq!(status, 200);
+    assert_eq!(status, 400);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
         v["error"]["code"], -32600,
@@ -981,7 +988,7 @@ fn params_array_is_32600_not_silently_empty() {
         "application/json",
         None,
     );
-    assert_eq!(status, 200);
+    assert_eq!(status, 400);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["error"]["code"], -32600);
 }
@@ -1131,7 +1138,7 @@ fn invalid_requests_keep_their_id_in_the_error_response() {
         ),
     ] {
         let (status, body) = post(addr, request, "application/json", None);
-        assert_eq!(status, 200);
+        assert_eq!(status, 400);
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["id"], expected_id, "id non préservé pour {request}");
         assert_eq!(v["error"]["code"], -32600);
@@ -1222,7 +1229,7 @@ fn unsupported_protocol_version_is_rejected_with_32022() {
         "application/json",
         None,
     );
-    assert_eq!(status, 200);
+    assert_eq!(status, 400);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["error"]["code"], -32022);
     assert_eq!(v["error"]["data"]["supported"][0], "2026-07-28");
@@ -1241,19 +1248,16 @@ fn tab_in_the_request_line_is_rejected() {
 #[test]
 fn bare_lf_line_endings_are_rejected() {
     // RFC 9112 §2.2 : la fin de ligne est CRLF (le LF seul est le vecteur
-    // « httpoxy »).
+    // « httpoxy »). Le verdict est celui du README : `400` — la ligne est
+    // lisible, le client doit savoir pourquoi il est refusé — et la
+    // connexion ferme.
     let addr = spawn_hardened();
     let request = "GET /health HTTP/1.1\nHost: t\n\n";
-    let mut stream = TcpStream::connect(addr).unwrap();
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_millis(800)))
-        .unwrap();
-    stream.write_all(request.as_bytes()).unwrap();
-    let mut raw = String::new();
-    let _ = stream.read_to_string(&mut raw);
+    let (status, body) = raw_exchange(addr, request, std::time::Duration::from_secs(2));
+    assert_eq!(status, 400, "un LF seul doit être répondue en 400");
     assert!(
-        !raw.contains("HTTP/1.1 200"),
-        "un LF seul ne doit pas composer une requête valide : {raw:?}"
+        body.contains("invalid line ending"),
+        "le message doit nommer la cause : {body:?}"
     );
 }
 
@@ -1346,6 +1350,212 @@ fn saturated_server_delivers_the_503_to_a_client_that_wrote_first() {
         raw.contains("too many connections"),
         "le corps du 503 doit être complet : {raw:?}"
     );
+    // MCP 2026-07-28 : plus de nouveaux codes en -32000 — la saturation
+    // transport est une défaillance interne (-32603) avec data structuré.
+    assert!(
+        raw.contains("\"code\":-32603"),
+        "le code doit être -32603 : {raw:?}"
+    );
+    assert!(
+        raw.contains("\"reason\":\"overloaded\""),
+        "la data structurée doit porter la raison : {raw:?}"
+    );
+}
+
+#[test]
+fn dribbled_drain_ends_at_the_deadline_and_releases_the_connection_slot() {
+    // Régression : `shutdown_gracefully` réarmait son timeout de lecture de
+    // 50 ms À CHAQUE lecture — un client qui goutte un octet toutes les
+    // 25 ms retenait le thread de connexion (et son slot `live_connections`)
+    // quasi indéfiniment. L'échéance est désormais absolue : calculée une
+    // seule fois, chaque lecture repart sur le temps RÉSIDUEL.
+    //
+    // Observable choisi : le chemin 431 (`respond_error` → drain) tourne
+    // DANS le thread `litemcp-conn` qui détient un slot — avec
+    // `max_connections(1)`, une sonde reçoit 503 tant que le drain vit,
+    // puis 200 dès que le thread est mort. Le slot est donc la trace
+    // directe de la fin du thread.
+    let bound = ServerBuilder::new("dribble", "0.2.0")
+        .legacy(true)
+        .tool("ok", "Répond ok", |_args| Ok(serde_json::json!({})))
+        .max_connections(1)
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+
+    let probe = || -> u16 {
+        post(
+            addr,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            "application/json",
+            None,
+        )
+        .0
+    };
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dribble_stop = std::sync::Arc::clone(&stop);
+    let (t0_tx, t0_rx) = std::sync::mpsc::channel();
+
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let Ok(mut stream) = TcpStream::connect(addr) else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            // 90 en-têtes (> MAX_HEADERS = 64) + un corps annoncé de 64 o
+            // jamais envoyé en entier : le serveur répond 431 dès la
+            // lecture des en-têtes, puis draine le corps goutte à goutte.
+            let mut request = String::from("POST /mcp HTTP/1.1\r\nHost: t\r\n");
+            for i in 0..90 {
+                request.push_str(&format!("X-Extra-{i}: {}\r\n", "v".repeat(64)));
+            }
+            request.push_str("Content-Length: 64\r\n\r\n");
+            if stream.write_all(request.as_bytes()).is_err() {
+                return;
+            }
+            // T0 : le 431 est lu (avec le FIN du `shutdown(Write)` qui ouvre
+            // le drain) — l'échéance absolue du drain est déjà armée.
+            let mut head = String::new();
+            if stream.read_to_string(&mut head).is_err() || !head.starts_with("HTTP/1.1 431") {
+                let _ = t0_tx.send(Err(head));
+                return;
+            }
+            let _ = t0_tx.send(Ok(std::time::Instant::now()));
+            // Goutte-à-goutte : 1 octet toutes les 25 ms (< 50 ms, marge qui
+            // absorbe la gigue) — chaque goutte réarmait le timeout complet
+            // avant le correctif. La fermeture serveur se manifeste par une
+            // erreur d'écriture (RST).
+            let start = std::time::Instant::now();
+            while !dribble_stop.load(std::sync::atomic::Ordering::Relaxed)
+                && start.elapsed() < std::time::Duration::from_millis(2500)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+            }
+        });
+
+        let t0 = match t0_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("le dribbleur doit lire le 431")
+        {
+            Ok(t0) => t0,
+            Err(head) => panic!("le dribbleur attendait un 431, a lu : {head:?}"),
+        };
+
+        // Juste après le 431, le drain (échéance ≈ t0 + 50 ms) détient
+        // encore l'unique slot : la sonde doit voir le 503.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(
+            probe(),
+            503,
+            "le drain doit encore détenir le slot juste après le 431"
+        );
+
+        // Le slot doit être libéré près de l'échéance, PENDANT le
+        // goutte-à-goutte. L'ancien code le retenait aussi longtemps que le
+        // dribble (≥ 2,5 s ici) : la borne de 1 s (≈ ×20 de marge sur les
+        // 50 ms pour l'ordonnanceur CI) échoue donc sur l'ancien comportement.
+        let poll_start = std::time::Instant::now();
+        let mut released_at = None;
+        while poll_start.elapsed() < std::time::Duration::from_secs(1) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if probe() == 200 {
+                released_at = Some(std::time::Instant::now());
+                break;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let released_at = released_at.expect(
+            "slot jamais libéré pendant le goutte-à-goutte : le timeout était réarmé à chaque lecture",
+        );
+        let elapsed = released_at.duration_since(t0);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "slot libéré {elapsed:?} après le 431 : l'échéance de 50 ms n'est pas tenue"
+        );
+    });
+}
+
+#[test]
+fn refused_503_drain_also_ends_at_the_deadline_under_a_dribble() {
+    // Même régression sur le chemin 503 (refus de saturation) : le thread de
+    // refus draine puis ferme — avec un client qui goutte, l'ancien code ne
+    // fermait jamais. Ici le thread de refus ne détient pas de slot de
+    // connexion (rendu à l'accept) : l'observable est la démolition TCP —
+    // la fermeture serveur avec des octets non lus émet un RST, visible
+    // chez le dribbleur comme une erreur d'écriture, près de l'échéance.
+    let bound = ServerBuilder::new("dribble503", "0.2.0")
+        .legacy(true)
+        .tool("ok", "Répond ok", |_args| Ok(serde_json::json!({})))
+        .max_connections(1)
+        .read_timeout(std::time::Duration::from_millis(400))
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+
+    // L'unique slot est occupé par une connexion silencieuse.
+    let holder = TcpStream::connect(addr).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let Ok(mut stream) = TcpStream::connect(addr) else {
+                return;
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            // T0 : le 503 est lu (FIN du drain inclus) — le refus ne lit
+            // aucune requête, il part dès l'accept.
+            let mut head = String::new();
+            if stream.read_to_string(&mut head).is_err() || !head.starts_with("HTTP/1.1 503") {
+                let _ = err_tx.send(Err(head));
+                return;
+            }
+            let _ = err_tx.send(Ok(std::time::Instant::now()));
+            // Goutte 1 octet toutes les 25 ms (moitié de la fenêtre de 50 ms,
+            // marge qui absorbe la gigue d'ordonnancement) : chaque goutte
+            // réarmait le timeout complet avant le correctif. La fermeture
+            // serveur se manifeste par une erreur d'écriture (RST).
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(2500) {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                if stream.write_all(b"x").is_err() {
+                    let _ = err_tx.send(Ok(std::time::Instant::now()));
+                    return;
+                }
+            }
+        });
+
+        let t0 = match err_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("le dribbleur doit lire le 503")
+        {
+            Ok(t0) => t0,
+            Err(head) => panic!("le dribbleur attendait un 503, a lu : {head:?}"),
+        };
+        // Première erreur d'écriture = fermeture serveur observée. Sous
+        // l'ancien code, le dribble (≥ 2,5 s) la maintenait ouverte : aucune
+        // erreur ne survenait dans la borne de 1 s.
+        let torn_down_at = err_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("la connexion doit être démolie pendant le goutte-à-goutte : le timeout était réarmé à chaque lecture")
+            .expect("le dribbleur rapporte l'instant de fermeture (Ok), pas une réponse lue (Err)");
+        let elapsed = torn_down_at.duration_since(t0);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "démolition {elapsed:?} après le 503 : l'échéance de 50 ms n'est pas tenue"
+        );
+    });
+    drop(holder);
 }
 
 #[test]
@@ -1661,6 +1871,7 @@ fn tool_results_identify_the_server_in_meta() {
     // Un échec d'exécution (`isError: true`) reste un `result` : identifié
     // lui aussi.
     let bound = ServerBuilder::new("durci", "0.2.0")
+        .legacy(true)
         .tool("echoue", "échoue exprès", |_args| Err("échec".into()))
         .bind("127.0.0.1:0")
         .unwrap();
@@ -1818,6 +2029,7 @@ fn shutdown_is_idempotent_and_refuses_new_connections() {
 #[test]
 fn resources_and_prompts_are_served_over_http() {
     let bound = ServerBuilder::new("full", "0.1.0")
+        .legacy(true)
         .tool("ok", "ok", |_args| Ok(serde_json::json!({})))
         .resource("mem://doc", "Doc", "La doc", || {
             Ok(litemcp::protocol::ResourceContents {
@@ -1877,6 +2089,7 @@ fn resources_and_prompts_are_served_over_http() {
 #[test]
 fn response_larger_than_16_mib_is_replaced_by_internal_error() {
     let bound = ServerBuilder::new("gros", "0.1.0")
+        .legacy(true)
         .tool("blob", "Rend une chaîne énorme", |_args| {
             Ok(Value::String("x".repeat(17 * 1024 * 1024)))
         })
@@ -1898,5 +2111,148 @@ fn response_larger_than_16_mib_is_replaced_by_internal_error() {
     assert!(
         message.contains("exceeds maximum"),
         "message inattendu : {message}"
+    );
+}
+
+// --- P3 2026-11-10 : version HTTP/1.0 propagée aux erreurs/rejets, Durées
+// --- extrêmes sans panic ----------------------------------------------------
+
+/// Envoie une requête brute et renvoie la réponse complète brute (la ligne
+/// de statut y est lisible, version comprise).
+fn raw_http_exchange(addr: SocketAddr, request: &str) -> String {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+    raw
+}
+
+#[test]
+fn http10_errors_and_rejections_answer_in_http10() {
+    // Un client HTTP/1.0 strict peut refuser une réponse annoncée HTTP/1.1
+    // (RFC 9112 §2.3) : les erreurs et rejets répondent dans la version de
+    // la requête, comme les réponses normales le font déjà.
+    let addr = spawn_hardened();
+
+    // 404 (route inconnue).
+    let raw = raw_http_exchange(
+        addr,
+        "POST /autre HTTP/1.0\r\nHost: t\r\nContent-Length: 6\r\n\r\nbuffer",
+    );
+    assert!(raw.starts_with("HTTP/1.0 404 Not Found"), "{raw:?}");
+
+    // 400 (Content-Length malformé).
+    let raw = raw_http_exchange(
+        addr,
+        "POST /mcp HTTP/1.0\r\nHost: t\r\nContent-Length: abc\r\n\r\n{}",
+    );
+    assert!(raw.starts_with("HTTP/1.0 400 Bad Request"), "{raw:?}");
+
+    // 405 (GET sur la route POST).
+    let raw = raw_http_exchange(addr, "GET /mcp HTTP/1.0\r\nHost: t\r\n\r\n");
+    assert!(raw.starts_with("HTTP/1.0 405"), "{raw:?}");
+
+    // 415 (Content-Type non JSON).
+    let raw = raw_http_exchange(
+        addr,
+        "POST /mcp HTTP/1.0\r\nHost: t\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{}",
+    );
+    assert!(raw.starts_with("HTTP/1.0 415"), "{raw:?}");
+
+    // Rejet de hook : 401 en HTTP/1.0.
+    let gated = ServerBuilder::new("gate10", "0.1.0")
+        .legacy(true)
+        .on_request(|_ctx| Err(litemcp::RequestRejection::unauthorized("verrouillé")))
+        .tool("ok", "Répond ok", |_args| {
+            Ok(serde_json::json!({ "ok": true }))
+        })
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let gate_addr = gated.local_addr().unwrap();
+    std::thread::spawn(move || gated.serve().unwrap());
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let raw = raw_http_exchange(
+        gate_addr,
+        &format!(
+            "POST /mcp HTTP/1.0\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(raw.starts_with("HTTP/1.0 401"), "{raw:?}");
+}
+
+#[test]
+fn duration_max_user_deadlines_never_panic() {
+    // read_timeout et connection_ttl au maximum : les échéances absolues
+    // (`Instant + Duration`) débordent — `checked_add` les rend « sans
+    // limite » au lieu de paniquer dans le thread de connexion.
+    let bound = ServerBuilder::new("extreme", "0.1.0")
+        .legacy(true)
+        .read_timeout(std::time::Duration::MAX)
+        .connection_ttl(std::time::Duration::MAX)
+        .tool("ok", "Répond ok", |_args| {
+            Ok(serde_json::json!({ "ok": true }))
+        })
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    let handle = bound.handle();
+    let server = std::thread::spawn(move || bound.serve());
+
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let raw = raw_http_exchange(
+        addr,
+        &format!(
+            "POST /mcp HTTP/1.0\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(
+        raw.contains("HTTP/1.0 200 OK"),
+        "requête servie sous Duration::MAX : {raw:?}"
+    );
+
+    handle.shutdown();
+    server.join().unwrap().ok();
+}
+
+#[test]
+fn duration_max_drain_timeout_finishes_without_panic() {
+    // drain_timeout au maximum : la fin de vie (Drop) ne doit ni paniquer
+    // (Instant + Duration) ni pendre indéfiniment quand rien ne vit.
+    let bound = ServerBuilder::new("drainmax", "0.1.0")
+        .legacy(true)
+        .anti_zombie()
+        .drain_timeout(std::time::Duration::MAX)
+        .tool("ok", "Répond ok", |_args| {
+            Ok(serde_json::json!({ "ok": true }))
+        })
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    let handle = bound.handle();
+    let worker = std::thread::spawn(move || bound.serve());
+
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let raw = raw_http_exchange(
+        addr,
+        &format!(
+            "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(raw.contains("HTTP/1.1 200 OK"), "{raw:?}");
+
+    handle.shutdown();
+    worker.join().unwrap().ok();
+    let report = handle
+        .zombie_report()
+        .expect("le bilan anti-zombie est disponible après la fin de vie");
+    assert!(
+        report.drained,
+        "aucune connexion ne reste au terme du drain"
     );
 }

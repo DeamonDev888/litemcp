@@ -4,7 +4,11 @@
 //! POST, la réponse arrive en `application/json` ou en `text/event-stream`
 //! (SSE request-scoped, un seul événement de réponse) selon l'en-tête
 //! `Accept`. Pas de session, pas de listener `GET` (405), garde
-//! DNS-rebinding sur `Origin`.
+//! DNS-rebinding sur `Origin`. **Pas d'annulation MCP** : le flux n'est
+//! ouvert qu'après calcul complet du handler — une déconnexion client
+//! pendant l'exécution n'est détectée qu'à l'écriture finale (une seule
+//! écriture, jamais de réécriture) et aucun jeton d'annulation n'est exposé
+//! aux handlers (voir le commentaire au point d'écriture SSE).
 //!
 //! Durcissement :
 //! - timeout de **lecture** par opération (30 s par défaut, `.read_timeout()`)
@@ -320,9 +324,16 @@ pub struct BoundServer {
     /// [`crate::ServerBuilder::announce`] a été appelé, `None` sinon. Présent
     /// ⇒ l'écriture de l'annonce a été **tentée** au bind ; le `Drop` de
     /// [`BoundServer`] tente le retrait correspondant (no-op si rien n'avait
-    /// été écrit — le retrait ne part que si le `(pid, port)` du fichier
-    /// correspond).
+    /// été écrit — le retrait ne part que si `(pid, port)` **et** l'identité
+    /// d'instance (`instance_id`) du fichier correspondent).
     pub(crate) announce_name: Option<(String, u16)>,
+    /// Identité d'instance de ce serveur lié — générée à chaque bind, publiée
+    /// dans l'annonce (registry) quand `.announce()` est actif et exposée par
+    /// la sonde `/health` (en-tête `X-Instance-Id`) : une sonde de registre
+    /// peut alors prouver QUELLE instance occupe le port — un refus TCP n'y
+    /// suffit pas et un port réutilisé non plus. Toujours non nulle ; le
+    /// coût se limite au chemin froid de la sonde.
+    pub(crate) instance_id: u64,
     /// Anti-zombie ([`crate::antizombie`]) — `Some` quand
     /// [`crate::ServerBuilder::anti_zombie`] est actif : le `Drop` draine
     /// les connexions (attente bornée) puis publie le bilan de fin de vie,
@@ -404,6 +415,15 @@ impl BoundServer {
     /// Boucle d'accept — corps de [`Self::serve`], qui ne fait plus que la
     /// déléguer (le retrait d'annonce vit dans le `Drop`).
     fn serve_loop(self) -> std::io::Result<()> {
+        let is_loopback_listener = self
+            .listener
+            .local_addr()
+            .ok()
+            .is_some_and(|a| a.ip().is_loopback());
+        // Identité d'instance exposée par la sonde `/health` (chemin froid,
+        // formatée une seule fois) : une sonde de registre lit cet en-tête
+        // pour prouver quelle instance occupe le port.
+        let instance_headers = format!("X-Instance-Id: {:016x}\r\n", self.instance_id);
         for stream in self.listener.incoming() {
             // Arrêt demandé : la socket de réveil (ou une connexion en
             // attente) est abandonnée ici — le listener se ferme au retour,
@@ -451,12 +471,15 @@ impl BoundServer {
                                 .name("litemcp-refus".into())
                                 .spawn(move || {
                                     let _guard = RefusalGuard(pending);
-                                    let _ = respond(
+                                    let _ = respond_version(
                                         &mut worker,
-                                        "503 Service Unavailable",
+                                        &ResponseHead {
+                                            version: "HTTP/1.1",
+                                            status: "503 Service Unavailable",
+                                            content_type: "application/json",
+                                        },
                                         "",
-                                        "application/json",
-                                        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"too many connections"}}"#,
+                                        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"too many connections","data":{"reason":"overloaded"}}}"#,
                                         false,
                                         false,
                                     );
@@ -491,12 +514,15 @@ impl BoundServer {
                 }
                 // Repli (spawn impossible uniquement) : écriture inline
                 // bloquante, bornée par `shutdown_gracefully`.
-                let _ = respond(
+                let _ = respond_version(
                     &mut stream,
-                    "503 Service Unavailable",
+                    &ResponseHead {
+                        version: "HTTP/1.1",
+                        status: "503 Service Unavailable",
+                        content_type: "application/json",
+                    },
                     "",
-                    "application/json",
-                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"server saturated"}}"#,
+                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"server saturated","data":{"reason":"overloaded"}}}"#,
                     false,
                     false,
                 );
@@ -519,6 +545,10 @@ impl BoundServer {
             };
             let read_timeout = self.read_timeout;
             let connection_ttl = self.connection_ttl;
+            // Possédé par la closure (comme les Arc ci-dessus) : l'en-tête
+            // d'identité est pré-formaté une fois par serveur, cloné par
+            // connexion (petite chaîne, chemin d'accept seulement).
+            let instance_headers = instance_headers.clone();
             let spawned = std::thread::Builder::new()
                 .name("litemcp-conn".into())
                 .spawn(move || {
@@ -536,9 +566,11 @@ impl BoundServer {
                             route: &route,
                             allow_origins: &allow_origins,
                             request_hooks: &request_hooks,
+                            instance_headers: &instance_headers,
                             read_timeout,
                             connection_ttl,
                             shutdown: &shutdown,
+                            is_loopback_listener,
                         },
                     );
                 });
@@ -547,12 +579,15 @@ impl BoundServer {
                 // ponctuelle, jamais une raison de tuer le serveur entier. Le
                 // garde de la closure n'a jamais vécu : on libère le plafond ici.
                 self.live_connections.fetch_sub(1, Ordering::Relaxed);
-                let _ = respond(
+                let _ = respond_version(
                     &mut stream,
-                    "503 Service Unavailable",
+                    &ResponseHead {
+                        version: "HTTP/1.1",
+                        status: "503 Service Unavailable",
+                        content_type: "application/json",
+                    },
                     "",
-                    "application/json",
-                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"server saturated"}}"#,
+                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"server saturated","data":{"reason":"overloaded"}}}"#,
                     false,
                     false,
                 );
@@ -576,14 +611,19 @@ impl BoundServer {
 impl Drop for BoundServer {
     fn drop(&mut self) {
         if let Some((name, port)) = self.announce_name.take() {
-            crate::registry::retract(&name, port);
+            // Identité comprise : un redémarrage dans le même process sur le
+            // même port a publié une autre instance — son annonce survit au
+            // retrait de celle-ci (un port réutilisé ne prouve pas
+            // l'identité de l'annonceur).
+            crate::registry::retract_instance(&name, port, self.instance_id);
         }
         if let Some(zombie) = &self.zombie {
             // Drain borné des threads de connexion puis bilan — le rapport
             // devient lisible via `ServerHandle::zombie_report`. L'attente
             // est plafonnée par `drain_timeout` : un `Drop` ne pende jamais
-            // indéfiniment.
-            zombie.finish(&self.live_connections, self.core.live_handler_threads());
+            // indéfiniment. `handlers_alive` est lu APRÈS l'attente (closure) :
+            // un handler qui a terminé pendant le drain n'est plus compté.
+            zombie.finish(&self.live_connections, || self.core.live_handler_threads());
         }
     }
 }
@@ -638,6 +678,15 @@ impl Drop for RefusalGuard {
     }
 }
 
+/// Durée totale maximale du drain de [`shutdown_gracefully`] — échéance
+/// **absolue**, calculée une seule fois à l’entrée de la fonction et jamais
+/// réarmée par les lectures.
+const DRAIN_DEADLINE: Duration = Duration::from_millis(50);
+
+/// Plafond d’octets vidés par [`shutdown_gracefully`] — borne mémoire
+/// indépendante de l’échéance temporelle.
+const DRAIN_CAP_BYTES: usize = 64 * 1024;
+
 /// Ferme une socket **sans perdre la réponse déjà écrite**.
 ///
 /// Le mécanisme : un `close()` alors que des octets reçus n'ont pas été lus
@@ -649,22 +698,33 @@ impl Drop for RefusalGuard {
 /// propre, puis **vider le tampon de réception** avant de laisser le
 /// `close()` se faire.
 ///
-/// Le vidage est **borné à 50 ms** : assez pour laisser arriver les octets
-/// déjà en vol (sans quoi le `close()` émet un RST et le client perd la
-/// réponse — mesuré : 9/15 sans attente, 15/15 avec). Comme les refus sont
-/// écrits hors de la boucle d'`accept`, cette attente ne retarde pas les
-/// accepts suivants.
+/// Le vidage est **borné par une échéance absolue** de [`DRAIN_DEADLINE`]
+/// (50 ms) — assez pour laisser arriver les octets déjà en vol (sans quoi
+/// le `close()` émet un RST et le client perd la réponse — mesuré : 9/15
+/// sans attente, 15/15 avec). Le timeout de lecture est réajusté à chaque
+/// tour sur le temps **résiduel** (via [`tighten_read_timeout`]) : un client
+/// qui dribble un octet toutes les 49 ms ne peut plus réarmer le délai —
+/// chaque lecture repartait autrefois avec 50 ms pleins et retenait le
+/// thread quasi indéfiniment. Le plafond [`DRAIN_CAP_BYTES`] (64 Kio) borne
+/// la mémoire indépendamment du temps. Comme les refus sont écrits hors de
+/// la boucle d'`accept`, cette attente ne retarde pas les accepts suivants.
 fn shutdown_gracefully(stream: &mut TcpStream) {
     let _ = stream.shutdown(std::net::Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    // Échéance absolue, calculée une seule fois : les tours suivants ne
+    // font que consommer le résiduel — jamais le réarmer.
+    let deadline = Some(Instant::now() + DRAIN_DEADLINE);
     let mut sink = [0u8; 8192];
     let mut drained = 0usize;
     loop {
+        // Timeout réajusté sur le résiduel ; `None` = échéance atteinte.
+        if tighten_read_timeout(stream, DRAIN_DEADLINE, deadline).is_none() {
+            break;
+        }
         match stream.read(&mut sink) {
             Ok(0) => break,
             Ok(n) => {
                 drained += n;
-                if drained >= 64 * 1024 {
+                if drained >= DRAIN_CAP_BYTES {
                     break;
                 }
             }
@@ -673,10 +733,15 @@ fn shutdown_gracefully(stream: &mut TcpStream) {
     }
 }
 
-/// Échec de lecture d'une ligne : trop longue, client trop lent, ou
-/// connexion fermée.
+/// Échec de lecture d'une ligne : trop longue, client trop lent, ligne
+/// lisible mais sans terminaison CRLF (LF seul), ou connexion fermée.
 enum LineFail {
     TooLong,
+    /// Ligne UTF-8 valide mais terminée par un LF seul (RFC 9112 §2.2) —
+    /// lisible, donc répondue en `400` (contrairement à `Slow`/`Closed`,
+    /// qui ferment sans réponse : un client lent ou parti n'a pas à être
+    /// nourri).
+    MalformedEnding,
     Slow,
     Closed,
 }
@@ -691,15 +756,20 @@ enum LineFail {
 fn tighten_read_timeout(
     stream: &TcpStream,
     read_timeout: Duration,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Option<()> {
     let now = Instant::now();
-    if now >= deadline {
-        return None;
-    }
-    let remaining = deadline.saturating_duration_since(now);
-    if remaining < read_timeout {
-        let _ = stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))));
+    // `None` = aucune échéance absolue (`Duration::MAX` utilisateur : la
+    // source ne borne rien) — le timeout par opération suffit, aucun
+    // resserrage n'est nécessaire.
+    if let Some(deadline) = deadline {
+        if now >= deadline {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining < read_timeout {
+            let _ = stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))));
+        }
     }
     Some(())
 }
@@ -720,7 +790,7 @@ fn read_line_capped(
     scratch: &mut Vec<u8>,
     cap: usize,
     read_timeout: Duration,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<(), LineFail> {
     out.clear();
     scratch.clear();
@@ -753,9 +823,12 @@ fn read_line_capped(
             return match std::str::from_utf8(scratch) {
                 Ok(text) => {
                     // **CRLF strict** (RFC 9112 §2.2 : la fin de ligne est
-                    // CRLF). Un LF seul (« httpoxy ») est coupé immédiatement.
+                    // CRLF). Un LF seul (« httpoxy ») est une ligne lisible
+                    // mais malformée : répondue en `400` par l'appelant
+                    // ([`LineFail::MalformedEnding`]) — un client qui
+                    // parle du HTTP doit savoir pourquoi il est refusé.
                     if !text.ends_with("\r\n") {
-                        return Err(LineFail::Closed);
+                        return Err(LineFail::MalformedEnding);
                     }
                     out.push_str(text);
                     Ok(())
@@ -780,9 +853,13 @@ struct ConnectionEnv<'a> {
     route: &'a str,
     allow_origins: &'a [String],
     request_hooks: &'a [Arc<RequestHook>],
+    /// En-tête d'identité d'instance (`X-Instance-Id: …`) émis par la sonde
+    /// `/health` — pré-formaté une fois par serveur lié (chemin froid).
+    instance_headers: &'a str,
     read_timeout: Duration,
     connection_ttl: Duration,
     shutdown: &'a std::sync::atomic::AtomicBool,
+    is_loopback_listener: bool,
 }
 
 fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Result<()> {
@@ -793,9 +870,11 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
         route,
         allow_origins,
         request_hooks,
+        instance_headers,
         read_timeout,
         connection_ttl,
         shutdown,
+        is_loopback_listener,
     } = env;
     // Un hook de requête est enregistré ? Sans lui, la rétention des en-têtes
     // bruts n'existe pas : le chemin chaud ne réserve rien, ne copie rien.
@@ -822,7 +901,10 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
     let connection_deadline = if connection_ttl.is_zero() {
         None
     } else {
-        Some(connection_started + connection_ttl)
+        // TTL au maximum (ou proche) : l'addition déborde d'Instant —
+        // `checked_add` renvoie None, la connexion n'a alors **aucune**
+        // échéance de durée de vie (jamais de panic).
+        connection_started.checked_add(connection_ttl)
     };
     // Budget total d'une requête : proportionnel à `read_timeout` (×2, borné
     // à `REQUEST_DEADLINE` = 60 s). Un serveur configuré avec un
@@ -852,10 +934,14 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 break;
             }
         }
-        let mut deadline = now + request_budget;
+        // Échéance absolue de la requête : budget courant OU TTL de
+        // connexion, le premier qui arrive. Un `Duration::MAX` utilisateur
+        // déborde d'Instant : `checked_add` renvoie None — cette source
+        // n'impose alors aucune échéance (jamais de panic).
+        let mut deadline = now.checked_add(request_budget);
         if let Some(conn_end) = connection_deadline {
-            if conn_end < deadline {
-                deadline = conn_end;
+            if deadline.is_none_or(|budget_end| conn_end < budget_end) {
+                deadline = Some(conn_end);
             }
         }
         // **Restauration du timeout de lecture** : `tighten_read_timeout`
@@ -885,6 +971,20 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                     "line too long",
                     "",
                     false,
+                    false,
+                )?;
+                return Ok(());
+            }
+            // LF seul : ligne lisible mais malformée → `400` (le verdict
+            // du README : « fin de ligne LF seul | 400 »).
+            Err(LineFail::MalformedEnding) => {
+                respond_error(
+                    &mut stream,
+                    "400 Bad Request",
+                    "invalid line ending in the request line",
+                    "",
+                    false,
+                    false,
                 )?;
                 return Ok(());
             }
@@ -907,6 +1007,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "invalid line ending in the request line",
                 "",
                 false,
+                false,
             )?;
             return Ok(());
         }
@@ -917,6 +1018,12 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
         let verb = parts.next().unwrap_or("");
         let full_path = parts.next().unwrap_or("");
         let version = parts.next().unwrap_or("");
+        // Version du client, connue dès l'extraction : les rejets 400/505 qui
+        // suivent répondent dans la version annoncée — un client HTTP/1.0
+        // strict refuse une réponse `HTTP/1.1` (RFC 9112 §2.3). Une version
+        // absente ou malformée reste servie en HTTP/1.1.
+        let http10 = version == "HTTP/1.0";
+        let response_version = if http10 { "HTTP/1.0" } else { "HTTP/1.1" };
         // Ligne de requête stricte : exactement trois jetons (méthode, cible,
         // version). RFC 9112 §3.
         if verb.is_empty() || full_path.is_empty() || version.is_empty() || parts.next().is_some() {
@@ -926,6 +1033,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "malformed request line",
                 "",
                 verb == "HEAD",
+                http10,
             )?;
             return Ok(());
         }
@@ -944,6 +1052,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "control character in the request line",
                 "",
                 verb == "HEAD",
+                http10,
             )?;
             return Ok(());
         }
@@ -957,16 +1066,12 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "malformed request line",
                 "",
                 verb == "HEAD",
+                http10,
             )?;
             return Ok(());
         }
         // Version sensible à la casse (RFC 9112 §2.3 : le protocole est un
         // jeton exact) — `http/1.1` n'est pas une version, c'est du garbage.
-        let http10 = version == "HTTP/1.0";
-        // Version annoncée dans la ligne de statut : on répond dans la
-        // version de la requête (un client HTTP/1.0 strict refuse une
-        // réponse `HTTP/1.1`).
-        let response_version = if http10 { "HTTP/1.0" } else { "HTTP/1.1" };
         if !http10 && version != "HTTP/1.1" {
             respond_error(
                 &mut stream,
@@ -974,6 +1079,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "unsupported HTTP version",
                 "",
                 verb == "HEAD",
+                http10,
             )?;
             return Ok(());
         }
@@ -1011,12 +1117,14 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
         let mut origin_duplicate = false;
         let mut origin_malformed = false;
         let mut origin_allowed = false;
+        let mut origin_header_value: Option<String> = None;
         let mut sec_fetch_site_seen = false;
         let mut sec_fetch_site_duplicate = false;
         let mut sec_fetch_site_cross = false;
         let mut host_seen = false;
         let mut host_duplicate = false;
         let mut host_invalid = false;
+        let mut host_header_value: Option<String> = None;
         let mut accept_json = false;
         let mut accept_sse = false;
         let mut expect_continue = false;
@@ -1030,10 +1138,14 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
         let mut content_encoding_duplicate = false;
         // En-têtes de routage MCP 2026-07-28 (SEP-2243) — optionnels chez
         // nous (compatibilité), mais vérifiés s'ils sont présents.
+        let mut mcp_protocol_version: Option<String> = None;
+        let mut mcp_protocol_version_duplicate = false;
         let mut mcp_method: Option<String> = None;
         let mut mcp_name: Option<String> = None;
+        let mut mcp_params: Vec<(String, String)> = Vec::new();
         let mut mcp_method_duplicate = false;
         let mut mcp_name_duplicate = false;
+        let mut mcp_param_duplicate = false;
         // En-têtes d'identité (auth / cookies / proxy) : un doublon rend le
         // verdict d'authentification dépendant de l'ordre de lecture (la
         // première occurrence ici, une combinaison ou la dernière occurrence
@@ -1075,6 +1187,20 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                         "line too long",
                         "",
                         is_head,
+                        http10,
+                    )?;
+                    return Ok(());
+                }
+                // LF seul dans une ligne d'en-tête : idem ligne de requête,
+                // `400` (le client saura pourquoi la connexion est fermée).
+                Err(LineFail::MalformedEnding) => {
+                    respond_error(
+                        &mut stream,
+                        "400 Bad Request",
+                        "invalid line ending in header",
+                        "",
+                        is_head,
+                        http10,
                     )?;
                     return Ok(());
                 }
@@ -1101,6 +1227,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                     "invalid line ending in header",
                     "",
                     is_head,
+                    http10,
                 )?;
                 return Ok(());
             }
@@ -1114,6 +1241,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                     "obsolete header line folding (obs-fold)",
                     "",
                     is_head,
+                    http10,
                 )?;
                 return Ok(());
             }
@@ -1125,6 +1253,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                     "too many headers",
                     "",
                     is_head,
+                    http10,
                 )?;
                 return Ok(());
             }
@@ -1139,6 +1268,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                         "whitespace before colon",
                         "",
                         is_head,
+                        http10,
                     )?;
                     return Ok(());
                 }
@@ -1149,6 +1279,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                         "empty header name",
                         "",
                         is_head,
+                        http10,
                     )?;
                     return Ok(());
                 }
@@ -1162,6 +1293,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                         "invalid header name",
                         "",
                         is_head,
+                        http10,
                     )?;
                     return Ok(());
                 }
@@ -1177,6 +1309,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                         "control character in header value",
                         "",
                         is_head,
+                        http10,
                     )?;
                     return Ok(());
                 }
@@ -1220,6 +1353,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                         origin_duplicate = true;
                     } else {
                         origin_seen = true;
+                        origin_header_value = Some(value.to_string());
                         if !is_valid_origin_syntax(value) {
                             origin_malformed = true;
                         } else {
@@ -1243,6 +1377,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                         host_duplicate = true;
                     } else {
                         host_seen = true;
+                        host_header_value = Some(value.to_string());
                         if !is_valid_host(value) {
                             host_invalid = true;
                         }
@@ -1267,6 +1402,12 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                     } else {
                         content_encoding_seen = true;
                     }
+                } else if name.eq_ignore_ascii_case("mcp-protocol-version") {
+                    if mcp_protocol_version.is_some() {
+                        mcp_protocol_version_duplicate = true;
+                    } else {
+                        mcp_protocol_version = Some(value.to_string());
+                    }
                 } else if name.eq_ignore_ascii_case("mcp-method") {
                     if mcp_method.is_some() {
                         mcp_method_duplicate = true;
@@ -1278,6 +1419,13 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                         mcp_name_duplicate = true;
                     } else {
                         mcp_name = Some(value.to_string());
+                    }
+                } else if name.len() > 10 && name[..10].eq_ignore_ascii_case("mcp-param-") {
+                    let suffix = name[10..].to_ascii_lowercase();
+                    if mcp_params.iter().any(|(k, _)| k == &suffix) {
+                        mcp_param_duplicate = true;
+                    } else {
+                        mcp_params.push((suffix, value.to_string()));
                     }
                 } else if name.eq_ignore_ascii_case("authorization") {
                     if authorization_seen {
@@ -1346,6 +1494,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                     "malformed header",
                     "",
                     is_head,
+                    http10,
                 )?;
                 return Ok(());
             }
@@ -1359,6 +1508,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "duplicated Origin header",
                 "",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1369,6 +1519,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "malformed Origin header",
                 "",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1379,8 +1530,10 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
         if content_type_duplicate
             || content_encoding_duplicate
             || sec_fetch_site_duplicate
+            || mcp_protocol_version_duplicate
             || mcp_method_duplicate
             || mcp_name_duplicate
+            || mcp_param_duplicate
             || authorization_duplicate
             || cookie_duplicate
             || x_forwarded_for_duplicate
@@ -1391,8 +1544,47 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "duplicated single-value header",
                 "",
                 is_head,
+                http10,
             )?;
             return Ok(());
+        }
+
+        // Exception loopback stricte (garde DNS-rebinding) : autorise par défaut une origine
+        // loopback strictement cohérente avec le `Host` et le listener local,
+        // à condition que la requête ne soit pas cross-site et que le schéma soit http://.
+        let local_addr = stream.local_addr().ok();
+        if is_loopback_listener
+            && !origin_allowed
+            && origin_seen
+            && !origin_malformed
+            && !sec_fetch_site_cross
+        {
+            if let (Some(origin_str), Some(host_str), Some(laddr)) = (
+                origin_header_value.as_deref(),
+                host_header_value.as_deref(),
+                local_addr,
+            ) {
+                if !origin_str.eq_ignore_ascii_case("null") {
+                    let scheme_auth = if origin_str.len() >= 7
+                        && origin_str[..7].eq_ignore_ascii_case("http://")
+                    {
+                        Some(&origin_str[7..])
+                    } else {
+                        None
+                    };
+                    if let Some(auth) = scheme_auth {
+                        if auth.eq_ignore_ascii_case(host_str) {
+                            let expected_auth = match laddr {
+                                SocketAddr::V4(v4) => format!("{}:{}", v4.ip(), v4.port()),
+                                SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
+                            };
+                            if auth.eq_ignore_ascii_case(&expected_auth) {
+                                origin_allowed = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Garde DNS-rebinding & Fetch Metadata :
@@ -1408,6 +1600,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "origin not allowed",
                 "",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1422,6 +1615,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "Host header required",
                 "",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1432,6 +1626,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "duplicated Host header",
                 "",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1442,6 +1637,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "invalid Host header",
                 "",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1461,6 +1657,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "ambiguous request framing",
                 "",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1474,6 +1671,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "unsupported Expect header",
                 "",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1492,6 +1690,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                     "invalid Content-Length",
                     "",
                     is_head,
+                    http10,
                 )?;
                 return Ok(());
             }
@@ -1507,6 +1706,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                         "Content-Length required",
                         "",
                         is_head,
+                        http10,
                     )?;
                     return Ok(());
                 }
@@ -1530,6 +1730,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "413 Payload Too Large",
                 "body too large",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1555,6 +1756,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                         "body not allowed on the health probe",
                         "",
                         is_head,
+                        http10,
                     )?;
                     return Ok(());
                 }
@@ -1565,7 +1767,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                         status: "200 OK",
                         content_type: "text/plain",
                     },
-                    "",
+                    instance_headers,
                     b"ok",
                     !close,
                     is_head,
@@ -1581,12 +1783,20 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "GET or HEAD only",
                 "Allow: GET, HEAD\r\n",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
 
         if !route_matched {
-            respond_error(&mut stream, "404 Not Found", "unknown route", "", is_head)?;
+            respond_error(
+                &mut stream,
+                "404 Not Found",
+                "unknown route",
+                "",
+                is_head,
+                http10,
+            )?;
             return Ok(());
         }
 
@@ -1622,13 +1832,13 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 match verdict {
                     Ok(Ok(())) => {}
                     Ok(Err(rejection)) => {
-                        respond_rejection(&mut stream, &rejection, is_head)?;
+                        respond_rejection(&mut stream, &rejection, is_head, http10)?;
                         return Ok(());
                     }
                     Err(_) => {
                         let rejection =
                             RequestRejection::new(500, "internal error (request hook panicked)");
-                        respond_rejection(&mut stream, &rejection, is_head)?;
+                        respond_rejection(&mut stream, &rejection, is_head, http10)?;
                         return Ok(());
                     }
                 }
@@ -1646,6 +1856,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "POST only",
                 "Allow: POST\r\n",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1661,6 +1872,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "Content-Encoding is not supported",
                 "",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1676,6 +1888,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "expected Content-Type: application/json",
                 "",
                 is_head,
+                http10,
             )?;
             return Ok(());
         }
@@ -1704,6 +1917,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "truncated or slow request body",
                 "",
                 false,
+                http10,
             );
             return Ok(());
         }
@@ -1726,26 +1940,23 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
                 "request body larger than Content-Length",
                 "",
                 is_head,
+                http10,
             );
             return Ok(());
         }
 
         let dispatch_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            // En-têtes de routage MCP (SEP-2243) — optionnels, mais
-            // vérifiés s'ils sont présents.
-            if mcp_method.is_none() && mcp_name.is_none() {
-                core.dispatch_with_headers(&body, None)
-            } else {
-                let headers = crate::server::McpHeaders {
-                    method: mcp_method,
-                    name: mcp_name,
-                };
-                core.dispatch_with_headers(&body, Some(&headers))
-            }
+            let headers = crate::server::McpHeaders {
+                protocol_version: mcp_protocol_version,
+                method: mcp_method,
+                name: mcp_name,
+                params: mcp_params,
+            };
+            core.dispatch_request(&body, Some(&headers))
         }));
 
-        let reply = match dispatch_result {
-            Ok(Some(reply)) => reply,
+        let (reply, http_status) = match dispatch_result {
+            Ok(Some(resp)) => (resp.body, resp.status.as_str()),
             Ok(None) => {
                 // Notification : aucune réponse JSON-RPC attendue.
                 respond_version(
@@ -1810,13 +2021,24 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
         // Contrat de transport pour tout futur écrivain SSE : flusher après
         // CHAQUE événement (`respond` fait `write_all` + `flush`) et porter
         // [`SSE_ANTI_BUFFERING`].
+        //
+        // **Annulation non supportée (documentée, sciemment)** : le flux n'est
+        // ouvert qu'APRÈS calcul complet du handler — une déconnexion client
+        // pendant l'exécution n'est détectée qu'ici, à l'écriture (échec →
+        // connexion fermée, et il n'y a qu'une écriture : aucune écriture
+        // ultérieure n'existe). Aucun jeton d'annulation n'est exposé aux
+        // handlers : un handler bloquant termine toujours (Rust n'a pas
+        // d'annulation de thread) et `notifications/cancelled` n'est pas
+        // implémentée. Le transport ne prétend donc pas à la conformité
+        // d'annulation MCP — l'évolution (jeton coopératif + watcher borné)
+        // est chiffrée dans le CHANGELOG « Prévu ».
         if accept_sse && !accept_json {
             let event = format_sse_event(&reply);
             respond_version(
                 &mut stream,
                 &ResponseHead {
                     version: response_version,
-                    status: "200 OK",
+                    status: http_status,
                     content_type: "text/event-stream",
                 },
                 SSE_ANTI_BUFFERING,
@@ -1832,7 +2054,7 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
             &mut stream,
             &ResponseHead {
                 version: response_version,
-                status: "200 OK",
+                status: http_status,
                 content_type: "application/json",
             },
             "",
@@ -1860,13 +2082,21 @@ fn respond_error(
     message: &str,
     extra_headers: &str,
     head: bool,
+    http10: bool,
 ) -> std::io::Result<()> {
     let payload: &[u8] = &error_payload(message);
-    respond(
+    // La ligne de statut reflète la version de la requête, comme les
+    // réponses normales : un client HTTP/1.0 strict refuse une réponse
+    // annoncée `HTTP/1.1` (RFC 9112 §2.3).
+    let version = if http10 { "HTTP/1.0" } else { "HTTP/1.1" };
+    respond_version(
         stream,
-        status,
+        &ResponseHead {
+            version,
+            status,
+            content_type: "application/json",
+        },
         extra_headers,
-        "application/json",
         payload,
         false,
         head,
@@ -1894,9 +2124,22 @@ fn respond_413_without_drain(
     status: &str,
     message: &str,
     head: bool,
+    http10: bool,
 ) -> std::io::Result<()> {
     let payload: &[u8] = &error_payload(message);
-    respond(stream, status, "", "application/json", payload, false, head)?;
+    let version = if http10 { "HTTP/1.0" } else { "HTTP/1.1" };
+    respond_version(
+        stream,
+        &ResponseHead {
+            version,
+            status,
+            content_type: "application/json",
+        },
+        "",
+        payload,
+        false,
+        head,
+    )?;
     let _ = stream.shutdown(std::net::Shutdown::Write);
     Ok(())
 }
@@ -1923,6 +2166,7 @@ fn respond_rejection(
     stream: &mut TcpStream,
     rejection: &RequestRejection,
     head: bool,
+    http10: bool,
 ) -> std::io::Result<()> {
     let mut extra_headers = String::new();
     for (name, value) in rejection.headers() {
@@ -1939,11 +2183,15 @@ fn respond_rejection(
         reason_phrase(rejection.status())
     );
     let payload = error_payload(&rejection.message);
-    respond(
+    let version = if http10 { "HTTP/1.0" } else { "HTTP/1.1" };
+    respond_version(
         stream,
-        &status_line,
+        &ResponseHead {
+            version,
+            status: &status_line,
+            content_type: "application/json",
+        },
         &extra_headers,
-        "application/json",
         &payload,
         false,
         head,
@@ -1989,7 +2237,7 @@ fn read_body(
     body: &mut Vec<u8>,
     len: usize,
     read_timeout: Duration,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> std::io::Result<()> {
     body.clear();
     if body.capacity() > BODY_CHUNK && len <= BODY_CHUNK {
@@ -2025,29 +2273,6 @@ fn read_body(
     Ok(())
 }
 
-fn respond(
-    stream: &mut impl Write,
-    status: &str,
-    extra_headers: &str,
-    content_type: &str,
-    body: &[u8],
-    keep_alive: bool,
-    head: bool,
-) -> std::io::Result<()> {
-    respond_version(
-        stream,
-        &ResponseHead {
-            version: "HTTP/1.1",
-            status,
-            content_type,
-        },
-        extra_headers,
-        body,
-        keep_alive,
-        head,
-    )
-}
-
 /// En-tête de réponse — version HTTP, statut et type de contenu regroupés
 /// pour éviter une signature à huit arguments.
 struct ResponseHead<'a> {
@@ -2059,10 +2284,11 @@ struct ResponseHead<'a> {
     content_type: &'a str,
 }
 
-/// Idem [`respond`] — la **ligne de statut** reflète la version HTTP de la
-/// requête (`HTTP/1.0` → `HTTP/1.0 200 OK`). Un client HTTP/1.0 strict peut
-/// refuser une réponse annoncée en `HTTP/1.1` ; la RFC 9112 §2.3 impose au
-/// récepteur HTTP/1.1 d'accepter `HTTP/1.0`, mais l'inverse n'est pas vrai.
+/// Écrit la réponse complète : la **ligne de statut** reflète la version
+/// HTTP de la requête (`HTTP/1.0` → `HTTP/1.0 200 OK`). Un client HTTP/1.0
+/// strict peut refuser une réponse annoncée en `HTTP/1.1` ; la RFC 9112
+/// §2.3 impose au récepteur HTTP/1.1 d'accepter `HTTP/1.0`, mais l'inverse
+/// n'est pas vrai.
 fn respond_version(
     stream: &mut impl Write,
     head_meta: &ResponseHead<'_>,
@@ -2662,23 +2888,24 @@ mod tests {
     #[test]
     fn respond_writes_exact_framing_for_get_and_head() {
         let mut get_buf = Vec::new();
-        respond(&mut get_buf, "200 OK", "", "text/plain", b"ok", true, false).unwrap();
+        let get_head = ResponseHead {
+            version: "HTTP/1.1",
+            status: "200 OK",
+            content_type: "text/plain",
+        };
+        respond_version(&mut get_buf, &get_head, "", b"ok", true, false).unwrap();
         assert_eq!(
             get_buf,
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok"
         );
 
         let mut head_buf = Vec::new();
-        respond(
-            &mut head_buf,
-            "200 OK",
-            "",
-            "text/plain",
-            b"ok",
-            false,
-            true,
-        )
-        .unwrap();
+        let head_head = ResponseHead {
+            version: "HTTP/1.1",
+            status: "200 OK",
+            content_type: "text/plain",
+        };
+        respond_version(&mut head_buf, &head_head, "", b"ok", false, true).unwrap();
         assert_eq!(
             head_buf,
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\n"
@@ -2713,7 +2940,7 @@ mod tests {
             &mut scratch,
             64,
             Duration::from_millis(300),
-            Instant::now() + Duration::from_secs(2),
+            Some(Instant::now() + Duration::from_secs(2)),
         );
         assert!(res.is_ok());
         assert_eq!(out, "POST /mcp HTTP/1.1\r\n");
@@ -2726,11 +2953,11 @@ mod tests {
             &mut scratch,
             10,
             Duration::from_millis(300),
-            Instant::now() + Duration::from_secs(2),
+            Some(Instant::now() + Duration::from_secs(2)),
         );
         assert!(matches!(res, Err(LineFail::TooLong)));
 
-        // 3. LF nu sans CR -> Closed.
+        // 3. LF nu sans CR -> MalformedEnding (lisible, donc répondue 400).
         let (mut client, server) = connected_pair();
         client.write_all(b"GET /health HTTP/1.1\n").unwrap();
         let mut reader = BufReader::new(server);
@@ -2740,9 +2967,9 @@ mod tests {
             &mut scratch,
             64,
             Duration::from_millis(300),
-            Instant::now() + Duration::from_secs(2),
+            Some(Instant::now() + Duration::from_secs(2)),
         );
-        assert!(matches!(res, Err(LineFail::Closed)));
+        assert!(matches!(res, Err(LineFail::MalformedEnding)));
 
         // 4. UTF-8 invalide -> Closed.
         let (mut client, server) = connected_pair();
@@ -2754,7 +2981,7 @@ mod tests {
             &mut scratch,
             64,
             Duration::from_millis(300),
-            Instant::now() + Duration::from_secs(2),
+            Some(Instant::now() + Duration::from_secs(2)),
         );
         assert!(matches!(res, Err(LineFail::Closed)));
 
@@ -2767,7 +2994,7 @@ mod tests {
             &mut scratch,
             64,
             Duration::from_secs(10),
-            Instant::now() + Duration::from_millis(40),
+            Some(Instant::now() + Duration::from_millis(40)),
         );
         assert!(matches!(res, Err(LineFail::Slow)));
     }
@@ -2790,7 +3017,7 @@ mod tests {
             &mut body,
             BODY_CHUNK + 1024,
             Duration::from_millis(300),
-            Instant::now() + Duration::from_secs(2),
+            Some(Instant::now() + Duration::from_secs(2)),
         )
         .unwrap();
         assert_eq!(body.len(), BODY_CHUNK + 1024);
@@ -2802,7 +3029,7 @@ mod tests {
             &mut body,
             5,
             Duration::from_millis(300),
-            Instant::now() + Duration::from_secs(2),
+            Some(Instant::now() + Duration::from_secs(2)),
         )
         .unwrap();
         assert_eq!(&body, b"short");
@@ -2814,7 +3041,7 @@ mod tests {
             &mut body,
             50,
             Duration::from_millis(300),
-            Instant::now() + Duration::from_secs(2),
+            Some(Instant::now() + Duration::from_secs(2)),
         )
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);

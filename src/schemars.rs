@@ -144,6 +144,36 @@ impl Schema for FromJsonSchema {
         self.document.clone()
     }
 
+    // **Le défaut publié est APPLIÉ** — exactement la même politique que
+    // [`FromSchemars`] : les deux adaptateurs délèguent au même moteur
+    // ([`schema_has_default`] pour la détection, [`apply_node_defaults`]
+    // pour l'injection). Un `default` publié dans un document écrit à la
+    // main est annoncé dans `tools/list` **et** injecté dans les arguments
+    // absents, récursivement (objets imbriqués, tableaux, branches
+    // `allOf`/`anyOf`/`oneOf`), avec les `$ref` locaux chaînés résolus
+    // (détection de cycles + borne [`MAX_REF_DEPTH`]). Avant cette
+    // mutualisation, le défaut brut était publié mais jamais appliqué —
+    // la promesse « publié = appliqué » était rompue sur cette voie.
+    fn default_value(&self) -> Option<&Value> {
+        effective_root(&self.document).get("default")
+    }
+
+    fn apply_defaults(&self, value: &mut Value) {
+        apply_node_defaults(&self.document, &self.document, value, 0);
+    }
+
+    fn has_defaults(&self) -> bool {
+        schema_has_default(&self.document, &self.document, 0, &mut Vec::new())
+    }
+
+    fn has_integers(&self) -> bool {
+        schema_has_integer(&self.document, &self.document, 0, &mut Vec::new())
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        normalize_node_integers(&self.document, &self.document, value, 0, &mut Vec::new());
+    }
+
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
         match self.validator() {
             Validator::Broken(message) => issues.push(format!(
@@ -224,7 +254,10 @@ impl<T: ::schemars::JsonSchema + 'static> FromSchemars<T> {
     ///
     /// `should_validate_formats(true)` rend le validateur conforme au
     /// mot-clé : `email`, `uuid`, `date-time`, `uri`… sont alors vérifiés
-    /// comme ils le sont dans [`crate::zod`].
+    /// par les validateurs de format **de la référence** (`jsonschema`).
+    /// Le profil exact appliqué par le DSL [`crate::zod`] — parfois plus
+    /// strict que la référence — est documenté sur [`crate::zod::Format`]
+    /// et vérifié en différentiel (`tests/zod_diff_jsonschema.rs`).
     ///
     /// Les `format` **inconnus** restent ignorés (`should_ignore_unknown_formats`
     /// par défaut à `true`) : un format exotique ne rend pas un schéma
@@ -258,34 +291,29 @@ impl<T: ::schemars::JsonSchema + 'static> Schema for FromSchemars<T> {
     // `schemars` publie `"default"` pour un champ `#[serde(default)]` et le
     // retire de `required` — sans injection, le handler recevrait un objet
     // privé du champ que le schéma annonce couvrir. La valeur vit dans
-    // `properties.<nom>.default` du document ; l'injection est récursive
-    // (objets imbriqués, tableaux d'objets), guidée par le même document que
-    // celui publié dans `tools/list`.
+    // `properties.<nom>.default` du document ; détection et injection
+    // délèguent au **même moteur** que [`FromJsonSchema`] (même parcours,
+    // même résolution des `$ref` locaux chaînés, même borne) — la détection
+    // ne peut donc jamais désactiver une injection que l'injection aurait
+    // faite.
     fn default_value(&self) -> Option<&Value> {
-        self.document().get("default")
+        effective_root(self.document()).get("default")
     }
 
     fn apply_defaults(&self, value: &mut Value) {
-        let document = self.document();
-        let Some(properties) = document.get("properties").and_then(Value::as_object) else {
-            return;
-        };
-        apply_defaults_into(document, properties, value, 0);
+        apply_node_defaults(self.document(), self.document(), value, 0);
     }
 
     fn has_defaults(&self) -> bool {
-        // Échappatoire zéro-allocation : parcourir le document publié (une
-        // fois caché par `document()`), sans toucher aux arguments. Les
-        // `$ref` locaux sont résolus (un sous-objet peut porter ses propres
-        // défauts derrière un `#/$defs/…`).
-        let document = self.document();
-        let Some(properties) = document.get("properties").and_then(Value::as_object) else {
-            return document_has_default(document);
-        };
-        properties.values().any(|property| {
-            let resolved = resolve_local_ref(document, property);
-            document_has_default(resolved)
-        }) || document_has_default(document)
+        schema_has_default(self.document(), self.document(), 0, &mut Vec::new())
+    }
+
+    fn has_integers(&self) -> bool {
+        schema_has_integer(self.document(), self.document(), 0, &mut Vec::new())
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        normalize_node_integers(self.document(), self.document(), value, 0, &mut Vec::new());
     }
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
@@ -320,160 +348,416 @@ impl<T: ::schemars::JsonSchema + 'static> Schema for FromSchemars<T> {
     }
 }
 
-/// Profondeur maximale de résolution des `$ref` locaux — borne la
-/// récursion (un schéma auto-référent ne doit pas boucler).
+/// Profondeur maximale des parcours de schéma — borne la récursion de
+/// détection/injection (un schéma auto-référent ne doit ni boucler ni
+/// déborder) et, via le budget interne du résolveur, le nombre de `$ref`
+/// suivis **par chaîne de résolution** (comportement défini au-delà : la
+/// résolution s'arrête, le nœud courant est rendu tel quel — jamais une
+/// panique ni un hang ; le travail total reste borné par les caps de
+/// profondeur et la détection de cycles des parcours).
 const MAX_REF_DEPTH: usize = 16;
 
-/// Résout un `$ref` **local** (`#/$defs/…`, `#/definitions/…`) vers le
-/// sous-document qu'il désigne.
-///
-/// Seules les références internes au document publié sont résolues : aucune
-/// résolution réseau, aucune référence externe (SEP-2106 — un `$ref` distant
-/// ne doit jamais déclencher de requête).
-fn resolve_local_ref<'a>(document: &'a Value, node: &'a Value) -> &'a Value {
-    let Some(reference) = node.get("$ref").and_then(Value::as_str) else {
-        return node;
-    };
-    let Some(pointer) = reference.strip_prefix('#') else {
-        // Référence externe : laissée telle quelle (jamais résolue).
-        return node;
-    };
-    // Pointeur JSON : `#/$defs/Nested` → `$defs` → `Nested`.
-    let mut current = document;
-    for segment in pointer.split('/').filter(|s| !s.is_empty()) {
-        let segment = segment.replace("~1", "/").replace("~0", "~");
-        match current.get(&segment) {
-            Some(next) => current = next,
-            None => return node,
-        }
-    }
-    current
+/// Adresse mémoire d'un nœud — identité structurelle pour la détection de
+/// cycles (le même sous-document revisité sur un chemin est un cycle).
+fn node_address(node: &Value) -> usize {
+    node as *const Value as usize
 }
 
-/// Injecte les défauts publiés dans `value` (objet racine d'arguments),
-/// d'après les `properties` du document.
-fn apply_defaults_into(
-    document: &Value,
-    properties: &serde_json::Map<String, Value>,
-    value: &mut Value,
-    depth: usize,
-) {
-    if depth > MAX_REF_DEPTH {
-        return;
-    }
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    for (name, raw_property) in properties {
-        let property = resolve_local_ref(document, raw_property);
-        match object.get_mut(name) {
-            // Champ présent : descendre (l'objet imbriqué porte ses propres
-            // défauts).
-            Some(child) => apply_defaults_document(document, property, child, depth + 1),
-            // Champ absent : injecter le défaut publié, puis le valider
-            // contre sa sous-structure (un défaut objet peut porter ses
-            // propres défauts imbriqués).
-            None => {
-                if let Some(default) = property.get("default") {
-                    let mut injected = default.clone();
-                    apply_defaults_document(document, property, &mut injected, depth + 1);
-                    object.insert(name.clone(), injected);
+/// Résout une **chaîne** de `$ref` locaux (`#/$defs/…`, `#/definitions/…`)
+/// vers le sous-document final : chaque cible atteinte qui porte elle-même
+/// un `$ref` est résolue à son tour, jusqu'au premier nœud sans référence.
+///
+/// Le budget de sauts est **interne** : chaque chaîne résolue suit au plus
+/// [`MAX_REF_DEPTH`] références, puis rend le nœud courant tel quel — ses
+/// autres mots-clés (s'il en porte à côté du `$ref`) restent visibles aux
+/// parcours. Le travail total d'un parcours reste borné par les caps de
+/// profondeur et la détection de cycles des marcheurs appelants.
+///
+/// Garanties :
+/// - **cycle** : un nœud déjà visité sur la chaîne courante (comparaison
+///   d'adresses) arrête la résolution — `A → B → A` rend `A` sans boucler ;
+/// - **borne** : budget épuisé, la résolution s'arrête (comportement défini
+///   et testé, jamais une panique ni un hang) ;
+/// - **localité** : seules les références internes au document publié sont
+///   résolues — aucune résolution réseau, aucune référence externe
+///   (SEP-2106 : un `$ref` distant ne doit jamais déclencher de requête) ;
+///   une référence inconnue ou mal formée laisse le nœud tel quel.
+fn resolve_local_ref<'a>(document: &'a Value, node: &'a Value) -> &'a Value {
+    // Budget **interne** : chaque chaîne de résolution suit au plus
+    // [`MAX_REF_DEPTH`] références (le nœud courant est rendu tel quel
+    // au-delà — comportement défini, jamais un hang).
+    let mut budget = MAX_REF_DEPTH;
+    let mut current = node;
+    let mut seen: Vec<usize> = Vec::new();
+    loop {
+        let Some(reference) = current.get("$ref").and_then(Value::as_str) else {
+            return current; // nœud final : plus aucun `$ref` sur la chaîne
+        };
+        let address = node_address(current);
+        if seen.contains(&address) || budget == 0 {
+            // Cycle dans la chaîne ou budget épuisé : s'arrêter ici. Le
+            // nœud courant reste tel quel — ses autres mots-clés (s'il en
+            // porte à côté du `$ref`) restent visibles aux parcours.
+            return current;
+        }
+        seen.push(address);
+        budget -= 1;
+        let Some(pointer) = reference.strip_prefix('#') else {
+            // Référence externe : laissée telle quelle (jamais résolue).
+            return current;
+        };
+        // Pointeur JSON : `#/$defs/Nested` → `$defs` → `Nested`, avec
+        // l'échappement `~1` (/) et `~0` (~).
+        let mut target = document;
+        let mut resolved = true;
+        for segment in pointer.split('/').filter(|s| !s.is_empty()) {
+            let segment = segment.replace("~1", "/").replace("~0", "~");
+            match target.get(&segment) {
+                Some(next) => target = next,
+                None => {
+                    resolved = false;
+                    break;
                 }
             }
         }
+        if !resolved {
+            return current;
+        }
+        current = target;
     }
 }
 
-/// Injecte récursivement les défauts d'un **sous-document** dans une valeur
-/// déjà présente ou fraîchement injectée — objets (`properties`) et tableaux
-/// (`items`). Guidée par le même document que celui publié.
-fn apply_defaults_document(document: &Value, property: &Value, value: &mut Value, depth: usize) {
+/// Racine **effective** d'un document : la racine elle-même si elle ne porte
+/// pas de `$ref`, sinon le sous-document qu'elle désigne (schemars publie
+/// une racine `$ref` pour les types récursifs — détection, injection et
+/// défaut racine doivent la résoudre).
+fn effective_root(document: &Value) -> &Value {
+    resolve_local_ref(document, document)
+}
+
+/// Applique les défauts publiés de `node` (résolu) dans `value` — objet
+/// racine d'arguments, valeur déjà présente ou fraîchement injectée.
+///
+/// **Même parcours que [`schema_has_default`]** — mêmes mots-clés visités,
+/// même résolveur (budget frais par résolution : la portée d'une chaîne est
+/// déterministe, indépendante de l'ordre de visite) — et la détection
+/// explore **tous** les nœuds atteignables : toute injection possible est
+/// donc détectée, jamais désactivée :
+/// - `properties` : chaque propriété absente portant un `default` est
+///   injectée, chaque propriété présente est descendue ;
+/// - `items` (forme objet) : le schéma s'applique à chaque élément ;
+/// - `allOf`/`anyOf`/`oneOf` : les branches partagent la même valeur — un
+///   défaut publié dans une branche est un défaut publié du schéma.
+///
+/// Une chaîne de `$ref` **coupée** (cycle ou budget de sauts épuisé) est
+/// reprise avec un budget frais **puis** les mots-clés **frères** du nœud
+/// courant sont explorés — exactement comme la détection : un nœud encore
+/// référent peut porter des frères publiant un défaut (`{"$ref": …,
+/// "properties": {…}}`), et court-circuiter ces frères rendrait l'injection
+/// aveugle à un sous-schéma que la détection annonce.
+///
+/// **Pas de contrôle de cycle de schéma ici** (contrairement à la
+/// détection) : un schéma récursif se ré-entend légitimement à chaque
+/// niveau de l'**instance** — des sous-arbres d'instance différents — et
+/// les sauter priverait les niveaux profonds de leurs défauts. La
+/// terminaison vient de la finitude de l'instance (chaque appel descend
+/// dans un sous-arbre strictement plus petit ou dans une valeur fraîchement
+/// clonée, elle-même finie) et de la borne [`MAX_REF_DEPTH`].
+///
+/// Sont volontairement **exclus des deux parcours** : `patternProperties`,
+/// `additionalProperties` et `not` (leurs défauts s'adressent à des clés
+/// inconnues du schéma — rien n'y est injectable, donc rien n'y est annoncé).
+/// Un `default` porté par le nœud lui-même relève de
+/// [`Schema::default_value`], pas de l'injection dans les champs.
+fn apply_node_defaults(document: &Value, node: &Value, value: &mut Value, depth: usize) {
     if depth > MAX_REF_DEPTH {
         return;
     }
-    // Objet : chaque propriété absente portant un `default` est injectée.
-    if let Some(object) = value.as_object_mut() {
-        let resolved = resolve_local_ref(document, property);
-        if let Some(properties) = resolved.get("properties").and_then(Value::as_object) {
-            for (name, raw_sub) in properties {
-                let sub = resolve_local_ref(document, raw_sub);
-                match object.get_mut(name) {
-                    Some(child) => apply_defaults_document(document, sub, child, depth + 1),
+    let node = resolve_local_ref(document, node);
+    // La résolution peut être coupée en pleine chaîne (budget par appel) :
+    // re-prendre la suite avec un budget frais — la profondeur borne le
+    // nombre de reprises. **Sans court-circuiter les frères** du nœud
+    // courant (le `return` historique sautait `properties`/`items`/
+    // combinateurs portés À CÔTÉ du `$ref`) : la détection les explore
+    // toujours après sa propre reprise — un défaut publié dans ces frères
+    // doit être injecté aussi (mêmes sous-schémas vus des deux côtés).
+    if node.get("$ref").is_some() {
+        apply_node_defaults(document, node, value, depth + 1);
+    }
+    let Some(object) = node.as_object() else {
+        return; // schéma booléen / scalaire : rien à visiter
+    };
+
+    // Objet : champ présent → descente (il porte ses propres défauts) ;
+    // champ absent + défaut publié → injection, puis re-descente sur la
+    // valeur injectée (un défaut objet peut porter ses propres défauts).
+    // Les enfants sont passés **bruts** (exactement comme la détection) : la
+    // résolution se fait à l'entrée du parcours — pré-résoudre ici avancerait
+    // la chaîne une première fois hors parcours (budget consommé avant
+    // examen) et ferait perdre les frères du point de coupe, que la
+    // détection, elle, voit.
+    if let Some(map) = object.get("properties").and_then(Value::as_object) {
+        if let Some(instance) = value.as_object_mut() {
+            for (name, raw_child) in map {
+                match instance.get_mut(name) {
+                    Some(present) => {
+                        apply_node_defaults(document, raw_child, present, depth + 1);
+                    }
                     None => {
-                        if let Some(default) = sub.get("default") {
+                        if let Some(default) = effective_default(document, raw_child, depth + 1) {
                             let mut injected = default.clone();
-                            apply_defaults_document(document, sub, &mut injected, depth + 1);
-                            object.insert(name.clone(), injected);
+                            apply_node_defaults(document, raw_child, &mut injected, depth + 1);
+                            instance.insert(name.clone(), injected);
                         }
                     }
                 }
             }
         }
-        return;
     }
+
     // Tableau : le schéma `items` s'applique à chaque élément.
     if let Some(array) = value.as_array_mut() {
-        let resolved = resolve_local_ref(document, property);
-        if let Some(items) = resolved.get("items") {
+        if let Some(items) = object.get("items").filter(|items| items.is_object()) {
             for element in array {
-                apply_defaults_document(document, items, element, depth + 1);
+                apply_node_defaults(document, items, element, depth + 1);
+            }
+        }
+    }
+
+    // Combinateurs : mêmes sous-schémas vus par la détection.
+    for key in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = object.get(key).and_then(Value::as_array) {
+            for branch in branches {
+                apply_node_defaults(document, branch, value, depth + 1);
             }
         }
     }
 }
 
-/// Le document (ou l'un de ses sous-schémas) porte-t-il un mot-clé `default` ?
-/// Recherche récursive bornée aux mots-clés de structure (`properties`,
-/// `items`, `additionalProperties`, les combinateurs), jamais sur les valeurs
-/// utilisateur : un `default: {"properties": ...}` littéral n'est pas suivi.
-fn document_has_default(document: &Value) -> bool {
-    document.as_object().is_some_and(object_has_default)
+/// Le défaut **effectif** d'un nœud : son propre `default`, ou — si la
+/// résolution a été coupée en pleine chaîne de `$ref` — celui du premier
+/// nœud atteint en reprenant la chaîne avec un budget frais (borné par la
+/// profondeur : un cycle rend `None` de façon déterministe).
+fn effective_default<'a>(document: &'a Value, node: &'a Value, depth: usize) -> Option<&'a Value> {
+    if depth > MAX_REF_DEPTH {
+        return None;
+    }
+    let node = resolve_local_ref(document, node);
+    if let Some(default) = node.get("default") {
+        return Some(default);
+    }
+    if node.get("$ref").is_some() {
+        return effective_default(document, node, depth + 1);
+    }
+    None
 }
 
-/// Variante sur la carte (évite tout clone dans la récursion).
+/// Le schéma `node` (ou l'un de ses sous-schémas **visitables par
+/// l'injection**) porte-t-il un mot-clé `default` ?
 ///
-/// Les mots-clés de structure n'ont pas tous la même forme :
-/// - `properties` et `patternProperties` sont des **cartes nom → schéma**
-///   (chaque VALEUR est un schéma) ;
-/// - `items` et `additionalProperties` sont un schéma (ou un tableau de
-///   schémas pour `items`) ;
-/// - `allOf`/`anyOf`/`oneOf` sont des **tableaux de schémas** ;
-/// - `not` est un schéma.
-fn object_has_default(object: &serde_json::Map<String, Value>) -> bool {
+/// **Même parcours que [`apply_node_defaults`]** — mêmes mots-clés
+/// (`properties`, `items` objet, `allOf`/`anyOf`/`oneOf`), même résolveur
+/// chaîné, même borne, même détection de cycles : une injection possible est
+/// toujours détectée (jamais de `has_defaults() == false` là où l'injection
+/// agirait), et rien d'ininjectable n'est annoncé. Jamais sur les valeurs
+/// utilisateur : un `default: {"properties": …}` littéral n'est pas suivi
+/// (le mot-clé est testé par présence, jamais traversé).
+fn schema_has_default(document: &Value, node: &Value, depth: usize, path: &mut Vec<usize>) -> bool {
+    if depth > MAX_REF_DEPTH {
+        return false;
+    }
+    let node = resolve_local_ref(document, node);
+    if path.contains(&node_address(node)) {
+        return false; // cycle du schéma : déjà en cours d'inspection
+    }
+    let Some(object) = node.as_object() else {
+        return false;
+    };
     if object.contains_key("default") {
         return true;
     }
-    // `properties` / `patternProperties` : chaque valeur est un schéma.
-    for key in ["properties", "patternProperties"] {
-        if let Some(map) = object.get(key).and_then(Value::as_object) {
-            if map.values().any(document_has_default) {
-                return true;
+    // La résolution peut être coupée en pleine chaîne (budget par appel) :
+    // le nœud courant porte encore un `$ref` — le revisiter avec un budget
+    // frais (la profondeur borne le nombre de reprises ; un cycle rend
+    // `false` de façon déterministe).
+    if object.contains_key("$ref") && schema_has_default(document, node, depth + 1, path) {
+        return true;
+    }
+    path.push(node_address(node));
+    let mut found = false;
+
+    // `properties` : chaque valeur est un schéma.
+    if let Some(map) = object.get("properties").and_then(Value::as_object) {
+        for child in map.values() {
+            if schema_has_default(document, child, depth + 1, path) {
+                found = true;
+                break;
             }
         }
     }
-    // `items` (schéma ou tableau de schémas) et `additionalProperties`.
-    for key in ["items", "additionalProperties"] {
-        if let Some(sub) = object.get(key) {
-            if document_has_default(sub) {
-                return true;
+    // `items` (forme objet — même filtre que l'injection).
+    if !found {
+        if let Some(items) = object.get("items").filter(|items| items.is_object()) {
+            found = schema_has_default(document, items, depth + 1, path);
+        }
+    }
+    // Combinateurs : tableaux de schémas (mêmes branches que l'injection).
+    if !found {
+        for key in ["allOf", "anyOf", "oneOf"] {
+            if let Some(branches) = object.get(key).and_then(Value::as_array) {
+                for branch in branches {
+                    if schema_has_default(document, branch, depth + 1, path) {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
             }
         }
     }
-    // Combinateurs : tableaux de schémas.
+
+    path.pop();
+    found
+}
+
+/// Le nœud de schéma (ou l'un de ses sous-schémas) déclare-t-il un type
+/// **entier** ? **Même parcours que [`schema_has_default`]** — mêmes
+/// mots-clés, même résolveur, même borne, même détection de cycles — de
+/// sorte que la détection ne puisse jamais désactiver une normalisation
+/// que [`normalize_node_integers`] aurait faite. Les `$ref` sont suivis.
+fn schema_has_integer(document: &Value, node: &Value, depth: usize, path: &mut Vec<usize>) -> bool {
+    if depth > MAX_REF_DEPTH {
+        return false;
+    }
+    let node = resolve_local_ref(document, node);
+    if path.contains(&node_address(node)) {
+        return false; // cycle du schéma : déjà en cours d'inspection
+    }
+    let Some(object) = node.as_object() else {
+        return false;
+    };
+    if node_declares_integer(object) {
+        return true;
+    }
+    path.push(node_address(node));
+    let mut found = false;
+
+    // `properties` : chaque valeur est un schéma.
+    if let Some(map) = object.get("properties").and_then(Value::as_object) {
+        for child in map.values() {
+            if schema_has_integer(document, child, depth + 1, path) {
+                found = true;
+                break;
+            }
+        }
+    }
+    // `items` (forme objet — même filtre que la normalisation).
+    if !found {
+        if let Some(items) = object.get("items").filter(|items| items.is_object()) {
+            found = schema_has_integer(document, items, depth + 1, path);
+        }
+    }
+    // Combinateurs : tableaux de schémas (mêmes branches que la normalisation).
+    if !found {
+        for key in ["allOf", "anyOf", "oneOf"] {
+            if let Some(branches) = object.get(key).and_then(Value::as_array) {
+                for branch in branches {
+                    if schema_has_integer(document, branch, depth + 1, path) {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+        }
+    }
+
+    path.pop();
+    found
+}
+
+/// Le nœud déclare-t-il `"type": "integer"` (chaîne ou membre d'un tableau) ?
+fn node_declares_integer(object: &serde_json::Map<String, Value>) -> bool {
+    match object.get("type") {
+        Some(Value::String(kind)) => kind == "integer",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some("integer")),
+        _ => false,
+    }
+}
+
+/// Normalise les entiers intégraux aux positions entières déclarées par
+/// `node` — **même parcours que [`apply_node_defaults`]** : `properties`
+/// (valeurs présentes seulement), `items` (chaque élément), combinateurs ;
+/// `$ref` locaux résolus, cycles détectés, profondeur bornée. Un nœud qui
+/// déclare `"type": "integer"` convertit la valeur (validée au préalable :
+/// tout intégral présent est donc dans la plage exacte) et ne descend pas
+/// davantage.
+fn normalize_node_integers(
+    document: &Value,
+    node: &Value,
+    value: &mut Value,
+    depth: usize,
+    path: &mut Vec<usize>,
+) {
+    if depth > MAX_REF_DEPTH {
+        return;
+    }
+    let node = resolve_local_ref(document, node);
+    if path.contains(&node_address(node)) {
+        return; // cycle du schéma : ce sous-document est déjà en cours
+    }
+    let Some(object) = node.as_object() else {
+        return; // schéma booléen / scalaire : rien à visiter
+    };
+    // Type entier déclaré : conversion en entier exact, sans descente.
+    if node_declares_integer(object) {
+        if let Some(number) = value.as_number() {
+            if number.as_i64().is_none() {
+                if let Some(n) = crate::zod::integral_i64(number) {
+                    *value = Value::Number(serde_json::Number::from(n));
+                }
+            }
+        }
+        return;
+    }
+    path.push(node_address(node));
+
+    // Objet : chaque champ présent est descendu (les champs absents ne
+    // portent pas de valeur à normaliser).
+    if let Some(map) = object.get("properties").and_then(Value::as_object) {
+        if let Some(instance) = value.as_object_mut() {
+            for (name, raw_child) in map {
+                let child = resolve_local_ref(document, raw_child);
+                if let Some(present) = instance.get_mut(name) {
+                    normalize_node_integers(document, child, present, depth + 1, path);
+                }
+            }
+        }
+    }
+
+    // Tableau : le schéma `items` s'applique à chaque élément.
+    if let Some(array) = value.as_array_mut() {
+        if let Some(items) = object.get("items").filter(|items| items.is_object()) {
+            for element in array {
+                normalize_node_integers(document, items, element, depth + 1, path);
+            }
+        }
+    }
+
+    // Combinateurs : mêmes branches visitées que la détection.
     for key in ["allOf", "anyOf", "oneOf"] {
-        if let Some(items) = object.get(key).and_then(Value::as_array) {
-            if items.iter().any(document_has_default) {
-                return true;
+        if let Some(branches) = object.get(key).and_then(Value::as_array) {
+            for branch in branches {
+                normalize_node_integers(document, branch, value, depth + 1, path);
             }
         }
     }
-    // `not` : un schéma.
-    if let Some(sub) = object.get("not") {
-        if document_has_default(sub) {
-            return true;
-        }
-    }
-    false
+
+    path.pop();
 }
 
 /// `/a/0/b` → `.a[0].b` (segments numériques en index).

@@ -1,8 +1,11 @@
 //! Module anti-zombie — chaque test rejoue une promesse du module :
-//! sweep du registre d'annonce (morts retirés, vivants respectés, débris
-//! nettoyés, notre propre annonce intouchée), drain borné à la fin de vie,
-//! bilan lisible via `ServerHandle::zombie_report`, port rebinaible après
-//! l'arrêt. Les serveurs tournent sur de vraies sockets (`127.0.0.1:0`).
+//! sweep du registre d'annonce (usurpations prouvées retirées, doute
+//! conservé, vivantes vérifiées respectées, débris nettoyés, notre propre
+//! annonce intouchée), drain borné à la fin de vie, bilan lisible via
+//! `ServerHandle::zombie_report`, port rebinaible après l'arrêt. Les
+//! serveurs tournent sur de vraies sockets (`127.0.0.1:0`). Les verdicts de
+//! sonde d'identité (adresse publiée, usurpation, doute) sont couverts dans
+//! les tests unitaires du module et `tests/registre_vie.rs`.
 
 use litemcp::prelude::*;
 use std::fs;
@@ -24,9 +27,9 @@ fn unique_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Écrit une annonce au format du registre (contrat
-/// `{ name, version, port, pid, exe, args, cwd, ts }`) — `pid` étranger
-/// sauf mention contraire.
+/// Écrit une annonce au **format historique** du registre (contrat
+/// `{ name, version, port, pid, exe, args, cwd, ts }` — sans adresse ni
+/// identité publiées) — `pid` étranger sauf mention contraire.
 fn write_announcement(dir: &Path, name: &str, port: u16, pid: u64) -> PathBuf {
     let doc = serde_json::json!({
         "name": name, "version": "1.0.0", "port": port, "pid": pid,
@@ -42,11 +45,42 @@ fn foreign_pid() -> u64 {
     u64::from(u32::MAX - 1)
 }
 
-/// Un port **libre** — bind éphémère, port noté, listener lâché : toute
-/// annonce qui le porte est prouvablement morte.
+/// Un port **libre et non réattribuable** — bind, port noté, listener lâché :
+/// toute annonce qui le porte est prouvablement morte.
+///
+/// La tranche est prise **sous toutes les plages éphémères** (même logique
+/// que la tranche LiteMCP `23080..=23099`) : l'OS ne la donnera jamais
+/// spontanément à un `bind("127.0.0.1:0")` parallèle. Avec un port éphémère,
+/// la course était réelle en CI (Windows réattribue en LIFO) : le port du
+/// marqueur repartait à un listener voisin entre le `drop` et la sonde du
+/// sweep → `alive: 1` → flaky.
 fn dead_port() -> u16 {
+    for port in 23100..=23119 {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            let free = listener.local_addr().unwrap().port();
+            drop(listener);
+            return free;
+        }
+    }
+    // Tranche entière occupée (improbable) : repli sur un port éphémère —
+    // course possible, mais la fenêtre est microscopique.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
+}
+
+/// Un port **écouteur** de la même tranche non-éphémère — pour les tests qui
+/// veulent une instance vivante (le listener reste lié) sans course avec un
+/// bind parallèle.
+fn live_listener() -> (TcpListener, u16) {
+    for port in 23100..=23119 {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            let bound = listener.local_addr().unwrap().port();
+            return (listener, bound);
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bound = listener.local_addr().unwrap().port();
+    (listener, bound)
 }
 
 /// Un `POST /mcp` réel, réponse lue jusqu'à la fermeture (`Connection: close`).
@@ -64,32 +98,55 @@ fn post(addr: SocketAddr, body: &str) -> String {
 }
 
 #[test]
-fn sweep_reape_les_annonces_de_port_mort() {
-    let dir = unique_dir("reap");
+fn sweep_conserve_en_doute_une_annonce_sans_reponse() {
+    let dir = unique_dir("doute");
     let path = write_announcement(&dir, "morte", dead_port(), foreign_pid());
     let report = sweep_dir(&dir);
-    assert_eq!(report.reaped, 1, "l'annonce d'un port mort est un fantôme");
-    assert!(!path.exists(), "le fantôme est retiré");
-    // Idempotent : un second sweep ne trouve plus rien.
-    assert!(sweep_dir(&dir).is_empty());
+    assert_eq!(
+        report.undecided, 1,
+        "un port sans réponse n'est pas une preuve de mort : l'annonce est conservée : {report:?}"
+    );
+    assert_eq!(
+        report.reaped, 0,
+        "aucun retrait sans preuve positive : {report:?}"
+    );
+    assert!(
+        path.exists(),
+        "l'annonce est conservée (doute) : {report:?}"
+    );
+    // Idempotent : le sweep suivant conserve aussi — jamais de retrait sans
+    // preuve.
+    let again = sweep_dir(&dir);
+    assert_eq!(again.undecided, 1, "{again:?}");
+    assert!(path.exists(), "{again:?}");
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn sweep_laisse_les_instances_vivantes() {
+fn sweep_conserve_les_annonces_sans_identite_verifiable() {
     let dir = unique_dir("vivant");
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let (listener, port) = live_listener();
     let path = write_announcement(&dir, "vivante", port, foreign_pid());
+    // Annonce au format historique (aucune identité publiée) : RIEN n'est
+    // prouvable — ni vivante (le port répond, mais qui ?) ni morte : doute,
+    // conservée, sans sonde.
     let report = sweep_dir(&dir);
-    assert_eq!(report.alive, 1, "une instance qui répond est respectée");
-    assert!(path.exists(), "aucune annonce vivante n'est touchée");
+    assert_eq!(
+        report.undecided, 1,
+        "sans identité publiée, aucun verdict n'est prouvable : {report:?}"
+    );
+    assert!(path.exists(), "{report:?}");
     drop(listener);
-    // Le port est mort maintenant : le sweep suivant la retire — le module
-    // suit la réalité, il ne devine pas.
+    // Port mort ensuite : TOUJOURS conservée — un refus n'est pas une
+    // preuve de mort ; le retrait appartient au propriétaire ou à la preuve
+    // d'usurpation (identité différente qui répond), impossible ici.
     let report = sweep_dir(&dir);
-    assert_eq!(report.reaped, 1);
-    assert!(!path.exists());
+    assert_eq!(report.undecided, 1, "{report:?}");
+    assert_eq!(report.reaped, 0, "{report:?}");
+    assert!(
+        path.exists(),
+        "conservée : jamais de suppression sur un doute : {report:?}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -181,9 +238,11 @@ fn bind_avec_anti_zombie_reape_au_bind_et_rend_un_rapport() {
             .unwrap()
             .subsec_nanos()
     );
-    let marker = write_announcement(&registry, &marker_name, dead_port(), foreign_pid());
+    let dead = dead_port();
+    let marker = write_announcement(&registry, &marker_name, dead, foreign_pid());
 
     let bound = ServerBuilder::new("ztest-az-bind", "1.0.0")
+        .legacy(true)
         .tool("ping", "Sonner le serveur", |_args| {
             Ok(serde_json::json!({ "pong": true }))
         })
@@ -192,9 +251,15 @@ fn bind_avec_anti_zombie_reape_au_bind_et_rend_un_rapport() {
         .unwrap();
     let addr = bound.local_addr().unwrap();
     let handle = bound.handle();
+    // NB Windows : `Path::exists()` répond `false` sur une erreur de
+    // metadata (verrou antivirus sur le fichier fraîchement écrit) — on
+    // relaie l'existence réelle dans le diagnostic du bilan, plus fiable.
+    // Le marqueur (port sans réponse, annonce historique sans identité) est
+    // conservé en doute : le sweep ne détruit qu'en preuve positive.
     assert!(
-        !marker.exists(),
-        "l'annonce morte doit être retirée dès le bind, avant même de servir"
+        marker.exists(),
+        "une annonce sur port sans réponse est conservée (doute — un refus TCP \
+         n'est pas une preuve de mort) (marker = {marker:?})"
     );
 
     let worker = std::thread::spawn(move || bound.serve());
@@ -219,16 +284,27 @@ fn bind_avec_anti_zombie_reape_au_bind_et_rend_un_rapport() {
     );
     assert_eq!(report.connections_pending, 0);
     assert_eq!(report.handlers_alive, 0, "aucun handler en vol ici");
+    let registry_now: Vec<String> = fs::read_dir(&registry)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
     assert!(
-        report.sweep.reaped >= 1,
-        "le sweep du bind a retiré au moins notre marqueur : {:?}",
-        report.sweep
+        report.sweep.undecided >= 1,
+        "le sweep du bind a conservé en doute notre marqueur (port sans réponse) : \
+         {:?} — port du marqueur {dead}, marker.exists() = {:?}, registre = {registry_now:?}",
+        report.sweep,
+        marker.exists(),
     );
 }
 
 #[test]
 fn le_rapport_compte_les_handlers_encore_vivants() {
     let bound = ServerBuilder::new("ztest-az-hang", "1.0.0")
+        .legacy(true)
         .tool("hang", "Ne finit jamais dans le délai", |_args| {
             std::thread::sleep(Duration::from_millis(1000));
             Ok(serde_json::json!({}))
@@ -268,6 +344,7 @@ fn le_rapport_compte_les_handlers_encore_vivants() {
 #[test]
 fn sans_anti_zombie_aucun_rapport_ni_sweep() {
     let bound = ServerBuilder::new("ztest-az-off", "1.0.0")
+        .legacy(true)
         .tool("ping", "Sonner le serveur", |_args| {
             Ok(serde_json::json!({ "pong": true }))
         })

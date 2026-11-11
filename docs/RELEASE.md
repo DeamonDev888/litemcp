@@ -4,10 +4,13 @@ Ce document décrit le pipeline de publication d'une version de LiteMCP (crates 
 
 ## Prérequis
 
-- **Droits crates.io** : être *owner* (ou *maintainer* avec droit de publication) des deux crates — [`litemcp`](https://crates.io/crates/litemcp) et [`litemcp-macros`](https://crates.io/crates/litemcp-macros). La publication utilise un token d'API ([crates.io/settings/tokens](https://crates.io/settings/tokens)) : stocké comme secret GitHub `CARGO_REGISTRY_TOKEN` pour les workflows, ou enregistré localement (`cargo login`) pour une publication manuelle ;
-- **Droits Git/GitHub** : pousser sur `main`, créer et pousser des tags `v*` (le push d'un tag déclenche les workflows de publication) ;
+- **Droits crates.io** : être *owner* (ou *maintainer* avec droit de publication) des deux crates — [`litemcp`](https://crates.io/crates/litemcp) et [`litemcp-macros`](https://crates.io/crates/litemcp-macros). Deux modes d'authentification, dans cet ordre :
+  - **secret** `CARGO_REGISTRY_TOKEN` (token d'API [crates.io/settings/tokens](https://crates.io/settings/tokens)) — mode historique, prioritaire s'il est configuré ;
+  - **trusted publishing (OIDC)** — si le secret est absent, le workflow échange le JWT OIDC de GitHub contre un **jeton crates.io éphémère** (`rust-lang/crates-io-auth-action`, révoqué en fin de job). À configurer une fois par crate sur crates.io (dépôt, fichier de workflow, environnement), puis `id-token: write` sur le seul job `publish` suffit ; aucun secret de longue durée à stocker ;
+  - en local, `cargo login` reste la voie normale ;
+- **Droits Git/GitHub** : pousser sur `main`, créer et pousser des tags `v*` (le push d'un tag déclenche `release.yml`, seul chemin de publication sur tag — `publish.yml` reste un chemin manuel) ;
 - **Toolchain** : stable récente et MSRV 1.85 respecté (`rust-version = "1.85"`, edition 2024) ;
-- **CHANGELOG à jour** : la section `## [X.Y.Z] - AAAA-MM-JJ` de la version à publier doit exister dans `CHANGELOG.md` — le corps de la release GitHub en est extrait automatiquement (une section absente produit un corps de repli générique).
+- **CHANGELOG à jour** : la section `## [X.Y.Z] - AAAA-MM-JJ` de la version à publier doit exister dans `CHANGELOG.md` — le corps de la release GitHub en est extrait automatiquement, et la cohérence **refuse toute publication sans elle** (gate `check`, voir ci-dessous) ;
 
 ## Pourquoi `litemcp-macros` est publiée en premier
 
@@ -41,10 +44,10 @@ cargo publish -p litemcp
 
 # 5. Tag sur le commit EXACT de la version publiée, puis push du tag
 git tag vX.Y.Z
-git push origin vX.Y.Z   # déclenche les workflows Release et Publication
+git push origin vX.Y.Z   # déclenche UNIQUEMENT release.yml (canonique)
 ```
 
-Deux chemins sont autorisés et aboutissent au même état : publier localement puis taguer (le workflow Release constate la version déjà en ligne et se contente de créer la release GitHub), ou taguer directement sans publier (le workflow Release fait la publication depuis la CI après son `verify` — c'est le chemin qui garantit le **gate** : aucun `cargo publish` ne part tant que fmt/clippy/tests/doc ne sont pas verts).
+Deux chemins sont autorisés et aboutissent au même état : publier localement puis taguer (le workflow Release constate la version déjà en ligne et se contente de créer la release GitHub et de notifier), ou taguer directement sans publier (le workflow Release fait la publication depuis la CI après son gate — c'est le chemin canonique qui garantit le **gate** : aucun `cargo publish` ne part tant que la cohérence des versions, fmt/clippy/tests/doc et le contenu des paquets ne sont pas verts). En dernier recours — raté crates.io transitoire, republication d'une version déjà en ligne, notification à rejouer sans re-créer de tag — le **break-glass** : dispatch manuel de `publish.yml` (input `version`), qui impose le même gate `verify` que le canonique avant de publier.
 
 ## `.cargo_vcs_info.json` et traçabilité
 
@@ -60,18 +63,26 @@ Deux chemins sont autorisés et aboutissent au même état : publier localement 
 
 ## Automatisation — quel workflow fait quoi
 
+Tous les contrôles de publication vivent dans **`scripts/release.ps1`** (source unique, exécuté par les deux workflows sous `pwsh`) : `semver` (regex SemVer complète — toutes les combinaisons numériques, `0.10.10` inclus), `check` (cohérence dérivée de `cargo metadata` : racine = tag/input, `litemcp-macros` = exigence exacte de la dépendance racine, section `## [X.Y.Z]` du CHANGELOG ; le tag est lu dans `GITHUB_REF`, donc aucun argument optionnel vide ne peut faire disparaître le contrôle), `verify` (gate qualité : **simulations du pipeline** via `scripts/release-tests.ps1`, puis fmt workspace, clippy `-D warnings`, tests, doc, contenu des deux paquets — licences MIT/Apache, README) et `publish` (crates.io avec distinction stricte `200`/`404`/autre : une erreur réseau n'est **jamais** interprétée comme une preuve d'absence, un « already uploaded » est traité comme déjà-publié).
+
 | Workflow | Déclencheurs | Rôle |
 |---|---|---|
-| [`ci.yml`](../.github/workflows/ci.yml) — **CI** | push `main`, toute pull request | fmt, clippy strict, tests, doc, MSRV 1.85, advisories RustSec |
-| [`release.yml`](../.github/workflows/release.yml) — **Release** | push de tag `v*`, dispatch manuel | **`verify`** (fmt + clippy + tests + doc, toutes features) → **`publish`** (crates.io, idempotent, macros d'abord) → **release GitHub** (corps extrait du CHANGELOG) |
-| [`publish.yml`](../.github/workflows/publish.yml) — **Publication** | push de tag `v*`, dispatch manuel (input `version`) | publication crates.io **idempotente** (vérifie crates.io avant chaque `cargo publish`, attend l'indexation) puis notification du dépôt du tutoriel |
+| [`ci.yml`](../.github/workflows/ci.yml) — **CI** | push `main`, toute pull request | fmt, clippy strict, tests, **simulations du pipeline de publication**, doc, MSRV 1.85, advisories RustSec |
+| [`release.yml`](../.github/workflows/release.yml) — **Release (canonique)** | push de tag `v*`, dispatch manuel | **`verify`** (cohérence des versions PUIS simulations + fmt + clippy + tests + doc + paquets) → **`publish`** (revalidation `check` **puis** crates.io, idempotent, macros d'abord, jeton secret ou OIDC) → **release GitHub** (SEUL job avec `contents: write` ; corps extrait du CHANGELOG) → **notification du tuto** (après la release GitHub) |
+| [`publish.yml`](../.github/workflows/publish.yml) — **Publication (break-glass)** | dispatch manuel UNIQUEMENT (input `version` obligatoire) — **aucun déclencheur tag** | même gate `verify` que le canonique, même publication idempotente, notification du tuto — pour republier/notifier sans tag (ex. raté crates.io transitoire) |
 
-**Chevauchement assumé entre `release.yml` et `publish.yml`** : les deux partagent le déclencheur `tags: v*` et le groupe de concurrence `publication` (`cancel-in-progress: false`) — leurs runs sont **sérialisés** sur ce groupe, et chaque étape de publication vérifie l'API crates.io avant d'agir : le premier arrivé publie, le second constate la version déjà en ligne et saute. Une version n'est donc jamais publiée deux fois. La différence de fond : seul `release.yml` applique le **gate `verify`** avant publication et crée la **release GitHub** ; seul `publish.yml` notifie le **tutoriel**. Pour supprimer la redondance un jour, retirer le déclencheur `tags: v*` de `publish.yml` (en conservant `workflow_dispatch`, qui sert de chemin de secours manuel et de notification du tuto).
+**Séparation stricte des deux chemins** : le push d'un tag ne déclenche **que** `release.yml` — aucun workflow ne peut plus publier sur tag avant son gate `verify` (l'ancien déclencheur `tags: v*` de `publish.yml` est supprimé ; le groupe de concurrence `publication` reste partagé pour sérialiser un break-glass manuel contre un run canonique en cours, et l'idempotence de `scripts/release.ps1 publish` écarte toute publication en double). Les actions GitHub sont épinglées par SHA de commit dans ces deux workflows. La cohérence (`cargo metadata`) est vérifiée **avant** tout `cargo publish` : un tag `vX.Y.Z` différent du manifeste racine, une `litemcp-macros` désalignée de sa dépendance ou une section CHANGELOG manquante stoppent le pipeline en secondes.
+
+Deux garanties structurelles complètent ce gate : le job `publish` **rejoue lui-même `check`** juste avant le premier `cargo publish` (la garantie ne dépend donc ni de l'ordre des jobs ni d'un output recopié — un job `publish` rejoué seul repasse le contrôle), et la **notification ne part qu'après la release GitHub** (`needs: [publish, github-release]`) et ne se déclenche que sur un **résultat de publication réussi** (`needs.publish.result`), jamais sur un indicateur fabriqué — une republication idempotente re-notifie volontairement (cas d'usage du break-glass). Les workflows ne transmettent **jamais d'argument de version vide** (`pwsh -File script.ps1 -Param ""` n'est pas portable : Windows PowerShell 5.1 supprime l'argument vide et la liaison échoue) — le tag est dérivé de `GITHUB_REF` par le script, l'éventuel input manuel n'est ajouté que s'il est renseigné. Le jeton crates.io reste **optionnel** : `id-token: write` est confiné au job `publish` (le reste du pipeline est en `contents: read`) et l'étape OIDC est ignorée dès qu'un secret existe.
+
+Les actions de **tous** les workflows (`ci.yml`, `release.yml`, `publish.yml`, `conformance.yml`) sont épinglées par SHA de commit — un tag peut être redéplacé, un SHA non. Ces invariants (absence de déclencheur tag, `contents: write` réservé à `github-release`, `id-token: write` réservé à `publish`, épinglage SHA, ordre publication → release → notification, revalidation avant publication) sont figés par `tests/release_pipeline.rs`, et le comportement (tag incohérent, tests rouges, version déjà publiée, réseau indisponible, contenu des paquets) par `scripts/release-tests.ps1` — tous deux **sans secret ni publication réelle**, exécutés par `release.ps1 verify` et, pour les simulations, sur chaque pull request par `ci.yml`.
 
 ## Dépannage
 
-- **« crate `litemcp-macros@X.Y.Z` is already uploaded »** : la macros est déjà en ligne — vérifier que la dépendance `version = "X.Y.Z"` du `Cargo.toml` de `litemcp` correspond, puis publier `litemcp` seul ;
+- **« crate `litemcp-macros@X.Y.Z` is already uploaded »** : la macros est déjà en ligne — vérifier que la dépendance `version = "X.Y.Z"` du `Cargo.toml` de `litemcp` correspond, puis publier `litemcp` seul ; les workflows traitent ce cas comme « déjà publié » et continuent ;
 - **« crate … is not yet indexed »** : la propagation de l'index crates.io n'est pas terminée — attendre quelques minutes et relancer `cargo publish -p litemcp` (les workflows font cette attente automatiquement) ;
+- **« statut invérifiable / crates.io injoignable »** : une erreur réseau ou un code HTTP inattendu (ni 200 ni 404) **arrête le pipeline sans publication** — l'absence d'une version n'est jamais déduite d'un échec réseau ; attendre le rétablissement et relancer le run ;
+- **« OIDC / trusted publishing » en échec** : l'étape `Jeton crates.io par OIDC` ne s'exécute que si `CARGO_REGISTRY_TOKEN` est absent. Si elle échoue, vérifier la configuration *trusted publisher* de la crate sur crates.io (dépôt `DeamonDev888/litemcp`, fichier `.github/workflows/release.yml` **et** `.github/workflows/publish.yml`, environnement éventuel), ou configurer le secret `CARGO_REGISTRY_TOKEN` pour revenir au mode historique ;
 - **La version existe déjà sur crates.io** : une version publiée est **immuable** — couper une nouvelle version `X.Y.(Z+1)` (nouvelle entrée CHANGELOG, nouveau tag) ;
-- **Release GitHub sans corps** : la section `## [X.Y.Z]` manquait dans `CHANGELOG.md` au moment du tag — éditer la release à la main, ou re-taguer proprement après commit de la section ;
+- **Release GitHub sans corps** : impossible sur le chemin canonique — la cohérence refuse de publier sans la section `## [X.Y.Z]` ; si cela arrive malgré tout (CHANGELOG modifié entre les deux jobs), éditer la release à la main ;
 - **Le job `verify` échoue sur le tag** : ne pas republier sur le même tag — corriger sur `main`, couper la version suivante ; crates.io n'accepte pas de republication d'une version.

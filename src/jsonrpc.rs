@@ -63,6 +63,8 @@ impl ErrorObject {
     pub const INTERNAL_ERROR: i64 = -32603;
     /// Version de protocole non supportée (MCP 2026-07-28, SEP-2575).
     pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+    /// Capacité client requise absente (MCP 2026-07-28, SEP-2575).
+    pub const CLIENT_CAPABILITY_REQUIRED: i64 = -32021;
     /// Incohérence entre les en-têtes `Mcp-Method`/`Mcp-Name` et le corps de
     /// la requête (MCP 2026-07-28, SEP-2243).
     pub const HEADER_MISMATCH: i64 = -32020;

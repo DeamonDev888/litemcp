@@ -13,16 +13,17 @@ const CALL_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params
 
 /// Démarre un serveur sur un port libre et rend l'adresse effective.
 fn start(build: impl FnOnce(litemcp::ServerBuilder) -> litemcp::ServerBuilder) -> SocketAddr {
-    let bound =
-        build(
-            litemcp::ServerBuilder::new("t", "0.1.0").tool("add", "Additionne", |args| {
-                let a = args["a"].as_i64().unwrap_or(0);
-                let b = args["b"].as_i64().unwrap_or(0);
-                Ok(serde_json::json!({ "somme": a + b }))
-            }),
-        )
-        .bind("127.0.0.1:0")
-        .unwrap();
+    let bound = build(litemcp::ServerBuilder::new("t", "0.1.0").legacy(true).tool(
+        "add",
+        "Additionne",
+        |args| {
+            let a = args["a"].as_i64().unwrap_or(0);
+            let b = args["b"].as_i64().unwrap_or(0);
+            Ok(serde_json::json!({ "somme": a + b }))
+        },
+    ))
+    .bind("127.0.0.1:0")
+    .unwrap();
     let addr = bound.local_addr().unwrap();
     std::thread::spawn(move || bound.serve().unwrap());
     addr

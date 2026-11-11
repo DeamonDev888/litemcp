@@ -183,6 +183,7 @@ fn spawn() -> std::net::SocketAddr {
 
 fn spawn_with_timeout(rt: Duration) -> std::net::SocketAddr {
     let bound = litemcp::ServerBuilder::new("probe", "1.0")
+        .legacy(true)
         .tool("ok", "ok", |_a| Ok(json!({})))
         .read_timeout(rt)
         .bind("127.0.0.1:0")

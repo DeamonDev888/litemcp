@@ -37,12 +37,10 @@
 //! }
 //! ```
 //!
-//! **Compatibilité** : [`ToolResult`] accepte toujours `Err("message")`
+//! **Compatibilité** : `ToolResult` accepte toujours `Err("message")`
 //! (via `From<&str>`/`From<String>`) — l'erreur est alors `unclassified`,
 //! non retentable par défaut. Le texte du `content` reste exactement le
 //! message.
-//!
-//! [`ToolResult`]: crate::server::ToolResult
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -64,9 +62,8 @@ pub enum ErrorCode {
     RateLimited,
     /// Dépendance en amont défaillante (API tierce, base de données…).
     Upstream,
-    /// Délai d'exécution dépassé ([`ServerBuilder::tool_timeout`]).
+    /// Délai d'exécution dépassé (`ServerBuilder::tool_timeout`).
     ///
-    /// [`ServerBuilder::tool_timeout`]: crate::server::ServerBuilder::tool_timeout
     Timeout,
     /// Arguments rejetés par le handler lui-même (le schéma est déjà passé).
     InvalidInput,

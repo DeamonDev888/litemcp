@@ -1,0 +1,126 @@
+name: conformance
+
+# Gate de conformance officielle MCP 2026-07-28 contre la fixture dédiée
+# `examples/conformance_server.rs` — **pas** contre `examples/hello` (un score
+# pris sur hello n'est pas un score de conformité : hello ne porte pas les
+# fixtures `test_*`).
+#
+# Méthode (reproductible localement) :
+#   cargo build --release --example conformance_server
+#   ./target/release/examples/conformance_server 127.0.0.1:23180 &
+#   # attendre GET /health
+#   npx -y @modelcontextprotocol/conformance@0.2.0-alpha.12 server \
+#     --url http://127.0.0.1:23180/mcp --requirements 2026-07-28 \
+#     --output-dir <dir>
+#
+# Le gate échoue si un scénario SCORÉ (liste figée du fichier
+# `requirements/2026-07-28.yaml` du harness) échoue sans figurer dans la
+# baseline datée `.github/conformance/baseline-2026-07-28.json`, ou si une
+# entrée de baseline est devenue verte (la baseline doit rester vide ou
+# strictement décroissante). Les scénarios not_scored/extension/pending ne
+# comptent pas (ils sont tout de même exécutés et archivés).
+#
+# Harness épinglé par version npm exacte : 0.2.0-alpha.12 (même version que
+# l'audit local ; la liste scorée 2026-07-28 y est gelée par le fichier
+# requirements du paquet).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "examples/conformance_server/**"
+      - "litemcp-macros/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/conformance/**"
+      - ".github/workflows/conformance.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "examples/conformance_server/**"
+      - "litemcp-macros/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/conformance/**"
+      - ".github/workflows/conformance.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance-2026-07-28:
+    name: suite officielle (2026-07-28, Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HARNESS_VERSION: 0.2.0-alpha.12
+      FIXTURE_URL: http://127.0.0.1:23180/mcp
+      FIXTURE_ADDR: 127.0.0.1:23180
+      RESULTS_DIR: conformance-results
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: "1.85"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Build de la fixture
+        run: cargo build --release --locked --example conformance_server
+
+      - name: Démarrage de la fixture (arrière-plan)
+        run: |
+          nohup ./target/release/examples/conformance_server "$FIXTURE_ADDR" \
+            > fixture.log 2>&1 &
+          echo $! > fixture.pid
+
+      - name: Attente de la sonde /health
+        run: |
+          for i in $(seq 1 50); do
+            if curl -fsS http://127.0.0.1:23180/health > /dev/null 2>&1; then
+              echo "fixture prête après $i tentative(s)"; exit 0
+            fi
+            sleep 0.3
+          done
+          echo "la fixture n'a jamais répondu sur /health"; cat fixture.log; exit 1
+
+      - name: Suite officielle (--requirements 2026-07-28)
+        run: |
+          set +e
+          npx -y "@modelcontextprotocol/conformance@${HARNESS_VERSION}" server \
+            --url "$FIXTURE_URL" \
+            --requirements 2026-07-28 \
+            --output-dir "$RESULTS_DIR" \
+            2>&1 | tee conformance-run.log
+          echo "(code de sortie du harness : ${PIPESTATUS[0]}) — la décision appartient au gate."
+          exit 0
+
+      - name: Arrêt de la fixture
+        if: always()
+        run: |
+          if [ -f fixture.pid ]; then kill "$(cat fixture.pid)" 2>/dev/null || true; fi
+
+      - name: Gate — régressions scorées vs baseline datée
+        run: node .github/conformance/check_baseline.js "$RESULTS_DIR"
+
+      - name: Artefacts (hors Git, conservés par le runner)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: conformance-results-2026-07-28
+          path: |
+            conformance-results/
+            conformance-run.log
+            fixture.log
+          retention-days: 30

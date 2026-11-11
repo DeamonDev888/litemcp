@@ -233,6 +233,26 @@ pub trait Schema: Send + Sync {
     fn has_defaults(&self) -> bool {
         false
     }
+
+    /// Ce schéma (ou l'un de ses descendants) déclare-t-il des champs
+    /// **entiers** (["type": "integer"]) ?
+    ///
+    /// Précalculé à l'enregistrement de l'outil (comme
+    /// [`Schema::has_defaults`]) : sans entier déclaré, la normalisation
+    /// est ignorée sans aucune copie des arguments (chemin nominal zéro
+    /// allocation).
+    fn has_integers(&self) -> bool {
+        false
+    }
+
+    /// Normalise les nombres intégraux (`3.0`, `1e2`) en entiers **exacts**
+    /// aux positions entières du schéma — récursivement.
+    ///
+    /// Appelé **après** une validation réussie (toute valeur intégrale
+    /// présente est donc dans la plage exacte publiée — jamais de
+    /// conversion silencieuse hors plage) : le handler reçoit des `Number`
+    /// entiers et `as_i64()` réussit toujours quand le schéma passe.
+    fn normalize_integers(&self, _value: &mut Value) {}
 }
 
 /// Un schéma encapsulé (`Box`, `Arc`) est un schéma.
@@ -257,6 +277,12 @@ impl<S: Schema + ?Sized> Schema for Box<S> {
     fn has_defaults(&self) -> bool {
         (**self).has_defaults()
     }
+    fn has_integers(&self) -> bool {
+        (**self).has_integers()
+    }
+    fn normalize_integers(&self, value: &mut Value) {
+        (**self).normalize_integers(value);
+    }
 }
 
 /// Idem [`Box`] — un schéma partagé (`Arc<dyn Schema>`) reste un schéma.
@@ -275,6 +301,12 @@ impl<S: Schema + ?Sized> Schema for Arc<S> {
     }
     fn has_defaults(&self) -> bool {
         (**self).has_defaults()
+    }
+    fn has_integers(&self) -> bool {
+        (**self).has_integers()
+    }
+    fn normalize_integers(&self, value: &mut Value) {
+        (**self).normalize_integers(value);
     }
 }
 
@@ -296,6 +328,12 @@ impl<S: Schema + ?Sized> Schema for &S {
     }
     fn has_defaults(&self) -> bool {
         (**self).has_defaults()
+    }
+    fn has_integers(&self) -> bool {
+        (**self).has_integers()
+    }
+    fn normalize_integers(&self, value: &mut Value) {
+        (**self).normalize_integers(value);
     }
 }
 
@@ -337,6 +375,12 @@ impl<S> Defaulted<S> {
     pub fn new(inner: S, default: Value) -> Self {
         Self { inner, default }
     }
+
+    /// Associe un nom d'en-tête de transport personnalisé `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, name: &str) -> WithHeader<Self> {
+        WithHeader::new(self, name)
+    }
 }
 
 impl<S: Schema> Schema for Defaulted<S> {
@@ -364,6 +408,100 @@ impl<S: Schema> Schema for Defaulted<S> {
         // Ce schéma porte **toujours** un défaut : la descente dans `inner`
         // n'ajouterait rien (et coûterait un parcours récursif inutile).
         true
+    }
+
+    fn has_integers(&self) -> bool {
+        self.inner.has_integers()
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        self.inner.normalize_integers(value);
+    }
+}
+
+/// Schéma enrichi d'un en-tête de transport personnalisé `x-mcp-header` (SEP-2243).
+///
+/// L'annotation est **publiée** dans le schéma JSON (`x-mcp-header: "<nom>"`)
+/// et **vérifiée** par le transport HTTP lors des appels d'outils.
+#[derive(Clone)]
+pub struct WithHeader<S> {
+    inner: S,
+    header: String,
+}
+
+impl<S> WithHeader<S> {
+    /// Attache un nom d'en-tête `x-mcp-header` au paramètre.
+    ///
+    /// # Panics
+    ///
+    /// Si le nom d'en-tête est vide ou contient des caractères non-ASCII, des
+    /// espaces ou des deux-points `:` (contraintes SEP-2243).
+    #[must_use]
+    pub fn new(inner: S, header: &str) -> Self {
+        assert!(
+            !header.is_empty(),
+            "litemcp/zod : x-mcp-header ne peut pas être vide"
+        );
+        assert!(
+            header
+                .bytes()
+                .all(|b| b.is_ascii() && b != b' ' && b != b':'),
+            "litemcp/zod : x-mcp-header `{header}` doit être composé uniquement de caractères ASCII (hors espace et `:`)"
+        );
+        Self {
+            inner,
+            header: header.to_string(),
+        }
+    }
+
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
+    }
+
+    /// Associe un nom d'en-tête de transport personnalisé `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, name: &str) -> WithHeader<Self> {
+        WithHeader::new(self, name)
+    }
+}
+
+impl<S: Schema> Schema for WithHeader<S> {
+    fn json(&self) -> Value {
+        let mut schema = self.inner.json();
+        if let Some(object) = schema.as_object_mut() {
+            object.insert(
+                "x-mcp-header".to_string(),
+                Value::String(self.header.clone()),
+            );
+        }
+        schema
+    }
+
+    fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
+        self.inner.validate(path, value, issues);
+    }
+
+    fn default_value(&self) -> Option<&Value> {
+        self.inner.default_value()
+    }
+
+    fn apply_defaults(&self, value: &mut Value) {
+        self.inner.apply_defaults(value);
+    }
+
+    fn has_defaults(&self) -> bool {
+        self.inner.has_defaults()
+    }
+
+    fn has_integers(&self) -> bool {
+        self.inner.has_integers()
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        self.inner.normalize_integers(value);
     }
 }
 
@@ -448,6 +586,12 @@ impl Obj {
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
+    }
+
+    /// Attache un en-tête `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, header: &str) -> WithHeader<Self> {
+        WithHeader::new(self, header)
     }
 }
 
@@ -574,20 +718,59 @@ impl Schema for Obj {
     fn has_defaults(&self) -> bool {
         self.fields.iter().any(|field| field.schema.has_defaults())
     }
+
+    fn has_integers(&self) -> bool {
+        self.fields.iter().any(|field| field.schema.has_integers())
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        let Some(map) = value.as_object_mut() else {
+            return;
+        };
+        for field in &self.fields {
+            if field.schema.has_integers() {
+                if let Some(child) = map.get_mut(&field.name) {
+                    field.schema.normalize_integers(child);
+                }
+            }
+        }
+    }
 }
 
 /// Format de chaîne — publié comme `format` (annotation en JSON Schema
-/// 2020-12) et **exécuté** par la validation : le schéma reste exécuteur.
+/// 2020-12) et **exécuté** par la validation avec un **profil publié** :
+/// les formats ne sont pas normatifs en JSON Schema — ce que litemcp
+/// applique est documenté ici (et dans le README, section « Formats ») et
+/// testé en différentiel contre le validateur de référence
+/// (`tests/zod_diff_jsonschema.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
-    /// Adresse e-mail (forme `local@domaine.tld` — approximation assumée,
-    /// sans dépendance regex).
+    /// Profil **plus strict** que la référence : `local@domaine` — un seul
+    /// `@`, pas d'espace ni de caractère de contrôle, bornes RFC 5321
+    /// (`≤ 254` octets, `local ≤ 64`, `label ≤ 63`), `local` sans point
+    /// initial/final ni `..`, domaine en labels LDH (sans `-` initial/final)
+    /// contenant **au moins un point** — un domaine à un seul label
+    /// (`user@localhost`) est refusé, la référence l'accepte.
     Email,
-    /// UUID canonique 8-4-4-4-12 (forme seulement, comme Zod).
+    /// UUID canonique 8-4-4-4-12 (forme seulement : hexadécimal aux
+    /// positions données, tirets aux positions canoniques — casse libre).
     Uuid,
-    /// URL absolue `schéma://hôte…` (approximation assumée).
+    /// Profil **plus strict** que la référence : URL **avec autorité**
+    /// (`schéma://…` — schéma RFC 3986 valide, hôte non vide, IPv6 entre
+    /// crochets, port 1..=65535, aucun espace/contrôle/antislash). Une URI
+    /// sans autorité (`mailto:`, `urn:`) ou sans schéma est refusée — la
+    /// référence, elle, les accepte (RFC 3986).
     Url,
-    /// Date-time ISO 8601 (`YYYY-MM-DDTHH:MM:SS[.frac][Z|±HH:MM]`).
+    /// Date-time **RFC 3339 §5.6, notes incluses** : séparateur `T`/`t`/
+    /// espace (NOTE — la référence refuse l'espace), fuseau obligatoire
+    /// (`Z`/`z` ou `±HH:MM`), calendrier vérifié (jours par mois, années
+    /// bissextiles) et fraction optionnelle. Seconde intercalaire `60`
+    /// acceptée **au seul point UTC 23:59** — décalé par le fuseau (§5.7 :
+    /// « in time zones other than `"Z"`, the leap second point is shifted
+    /// by the zone offset ») : `2026-07-01T01:59:60+02:00` est la même
+    /// seconde que `23:59:60Z`, `23:59:60+02:00` ne représente rien (c'est
+    /// 21:59:60 UTC). Aucun espace superflu (tête/fin/doublé) — refusé par
+    /// litemcp **et** par la référence (RFC 3339 strict).
     Datetime,
 }
 
@@ -715,6 +898,12 @@ fn is_url(text: &str) -> bool {
         };
         (ipv6, port)
     } else if let Some((h, p)) = host_port.rsplit_once(':') {
+        // Un `:` résiduel dans l'hôte = IPv6 **nue** (sans crochets) —
+        // jamais une URL valide (RFC 3986 §3.2.2 : l'hôte IPv6 exige des
+        // crochets) ; `http://::1/` produirait sinon un hôte `":"`.
+        if h.contains(':') {
+            return false;
+        }
         (h, Some(p))
     } else {
         (host_port, None)
@@ -783,18 +972,50 @@ fn is_datetime(text: &str) -> bool {
         }
     }
     // Fuseau obligatoire (RFC 3339) : Z ou ±HH:MM.
-    match bytes.get(i) {
-        Some(&b'Z') | Some(&b'z') => i + 1 == bytes.len(),
-        Some(&b'+') | Some(&b'-') => {
-            digits(i + 1..i + 3)
+    let offset_minutes: i64 = match bytes.get(i) {
+        Some(&b'Z') | Some(&b'z') => {
+            if i + 1 != bytes.len() {
+                return false;
+            }
+            0
+        }
+        Some(&sign @ (b'+' | b'-')) => {
+            if !(digits(i + 1..i + 3)
                 && bytes.get(i + 3) == Some(&b':')
                 && digits(i + 4..i + 6)
                 && two(i + 1) <= 23
                 && two(i + 4) <= 59
-                && i + 6 == bytes.len()
+                && i + 6 == bytes.len())
+            {
+                return false;
+            }
+            let minutes = (two(i + 1) * 60 + two(i + 4)) as i64;
+            if sign == b'+' { minutes } else { -minutes }
         }
-        _ => false,
+        _ => return false,
+    };
+    // RFC 3339 §5.7 : une seconde intercalaire (`60`) n'existe qu'au point
+    // UTC 23:59 — le point local est décalé par le fuseau (« in time zones
+    // other than "Z", the leap second point is shifted by the zone offset
+    // ») : `01:59:60+02:00` est la même seconde que `23:59:60Z`, tandis
+    // que `23:59:60+02:00` ne représente rien (21:59:60 UTC). (Le mois
+    // réel — juin/décembre à ce jour — n'est pas vérifiable sans la table
+    // IERS des intercalaires annoncées : la référence ne le vérifie pas
+    // non plus.)
+    if two(17) == 60 && !leap_second_lands_at_utc_2359(two(11), two(14), offset_minutes) {
+        return false;
     }
+    true
+}
+
+/// RFC 3339 §5.7 : l'intercalaire n'existe qu'au point UTC 23:59, décalé
+/// par le fuseau. La minute locale `hour:minute` avec un offset (minutes,
+/// signé — RFC 3339 §4.2 : l'offset est « heure locale − UTC », donc
+/// UTC = local − offset) représente-t-elle 23:59 UTC ?
+fn leap_second_lands_at_utc_2359(hour: u32, minute: u32, offset_minutes: i64) -> bool {
+    let local = (hour * 60 + minute) as i64;
+    let utc = (local - offset_minutes).rem_euclid(24 * 60);
+    utc == 23 * 60 + 59
 }
 
 fn days_in_month(year: u32, month: u32) -> u32 {
@@ -884,6 +1105,12 @@ impl Str {
         self.format = Some(Format::Datetime);
         self
     }
+
+    /// Attache un en-tête `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, header: &str) -> WithHeader<Self> {
+        WithHeader::new(self, header)
+    }
 }
 
 impl Schema for Str {
@@ -937,19 +1164,27 @@ impl Schema for Str {
 
 /// `z.number().int()` — entier signé 64 bits, contraintes `.min(n)` / `.max(n)`.
 ///
-/// **Validation stricte, alignée sur le schéma publié.** Seuls les entiers
-/// JSON *syntaxiques* sont acceptés (`1`, `-1`, `42`) : un flottant à
-/// fractule nulle (`3.0`, `1e2`) est **refusé**.
+/// **Sémantiques JSON Schema (draft 2020-12), vérifiées contre le validateur
+/// de référence** (corpus différentiel — `tests/zod_diff_jsonschema.rs`) :
+/// `"type": "integer"` matche tout nombre **mathématiquement intégral** —
+/// `3.0` et `1e2` sont des entiers valides.
 ///
-/// Pourquoi ce choix : le schéma publié est `{"type": "integer"}`, et le
-/// JSON Schema draft 2020-12 y accepte `3.0`. Mais `serde_json::Value::as_i64()`
-/// renvoie `None` sur un tel nombre — le motif d'usage documenté par la crate
-/// (`args["a"].as_i64().unwrap()`) **paniquerait** sur une valeur que le
-/// schéma disait valide. Refuser `3.0` rend la garantie du schéma
-/// inconditionnelle : `as_i64()` réussit **toujours** quand le schéma passe.
+/// Deux provisions, toutes deux **publiées dans le schéma** (aucune
+/// divergence implicite) :
 ///
-/// Le schéma publié porte donc les bornes exactes (`minimum`/`maximum`) :
-/// ce qu'il annonce est **exactement** ce que la validation applique.
+/// 1. **Plage exacte 64 bits** : les bornes `minimum`/`maximum` sont
+///    **toujours publiées** (défaut : la plage i64 exacte). Un intégral
+///    au-delà (`1e300`, `u64::MAX`) viole donc les bornes publiées — refusé
+///    exactement comme le ferait un validateur conforme face à ces bornes,
+///    **jamais** converti silencieusement.
+/// 2. **Normalisation sûre** : après une validation réussie, un flottant
+///    intégral est converti en entier **exact** ([`Schema::normalize_integers`])
+///    avant que le handler ne voie les arguments — le motif d'usage
+///    documenté `args["a"].as_i64().unwrap()` réussit **toujours** quand le
+///    schéma passe (la conformité JSON Schema ne casse jamais les handlers).
+///
+/// Ce qu'il annonce est **exactement** ce que la validation applique,
+/// y compris chez un validateur tiers conforme.
 #[derive(Clone, Default)]
 pub struct Int {
     min: Option<i64>,
@@ -990,27 +1225,48 @@ impl Int {
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
     }
+
+    /// Attache un en-tête `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, header: &str) -> WithHeader<Self> {
+        WithHeader::new(self, header)
+    }
 }
 
 impl Schema for Int {
     fn json(&self) -> Value {
         let mut schema = json!({ "type": "integer" });
-        // Les bornes publiées sont **exactement** celles appliquées : le
-        // schéma ne peut pas promettre plus que la validation n'accorde.
+        // Les bornes publiées sont **exactement** celles appliquées — et
+        // elles encodent l'extension de plage 64 bits : un intégral hors
+        // i64 viole ces bornes chez n'importe quel validateur conforme.
         schema["minimum"] = json!(self.min.unwrap_or(i64::MIN));
         schema["maximum"] = json!(self.max.unwrap_or(i64::MAX));
         schema
     }
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
-        // **Entier JSON strict** : `Value::as_i64()` ne réussit que pour un
-        // nombre stocké comme entier (`1`, `-1`). Un flottant à fractule
-        // nulle (`3.0`, `1e2`) est refusé : il passerait le schéma JSON
-        // (« integer » matche `3.0`) mais casserait `as_i64().unwrap()`,
-        // dont la crate **documente** l'usage. Refuser ici rend la promesse
-        // du schéma vraie.
-        let Some(n) = value.as_i64() else {
-            push_issue!(issues, "`{}`: expected an integer", path.as_str());
+        // **Sémantique JSON Schema** : un nombre mathématiquement intégral
+        // (`3.0`, `1e2`) est un `integer`. L'extraction exacte échoue pour
+        // un non-intégral (`3.5`) ou un intégral hors plage 64 bits — le
+        // second cas est rendu comme une **violation des bornes publiées**
+        // (même verdict qu'un validateur conforme), jamais comme une
+        // conversion silencieuse.
+        let Some(n) = value.as_number().and_then(integral_i64) else {
+            if value.as_number().is_some_and(is_mathematically_integral) {
+                // Intégral hors plage exacte : direction selon le signe
+                // (u64 > i64::MAX est positif ; un f64 hors plage peut être
+                // négatif).
+                let negative = value.as_f64().is_some_and(|f| f < 0.0);
+                if negative {
+                    let min = self.min.unwrap_or(i64::MIN);
+                    push_issue!(issues, "`{}`: must be ≥ {min}", path.as_str());
+                } else {
+                    let max = self.max.unwrap_or(i64::MAX);
+                    push_issue!(issues, "`{}`: must be ≤ {max}", path.as_str());
+                }
+            } else {
+                push_issue!(issues, "`{}`: expected an integer", path.as_str());
+            }
             return;
         };
         if let Some(min) = self.min {
@@ -1024,7 +1280,210 @@ impl Schema for Int {
             }
         }
     }
+
+    fn has_integers(&self) -> bool {
+        true
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        // Appelé après une validation réussie : la valeur est soit déjà un
+        // entier exact, soit un intégral dans la plage — conversion sans
+        // surprise (et sans changer une valeur déjà exacte).
+        if let Some(number) = value.as_number() {
+            if number.as_i64().is_none() {
+                if let Some(n) = integral_i64(number) {
+                    *value = Value::Number(serde_json::Number::from(n));
+                }
+            }
+        }
+    }
 }
+
+/// Schéma entier **non signé** exact — `z.uint()`.
+///
+/// Miroir de [`Int`] pour les positions dont le type Rust ne tient pas dans
+/// i64 (`u64`, `usize`) : bornes publiées = bornes appliquées, plage
+/// `[min, max]` en u64 (défaut : `[0, u64::MAX]`), sémantique JSON Schema
+/// identique (un intégral `3.0`/`1e2` est un entier, normalisé **exactement**
+/// en u64 ; un négatif est refusé — jamais transformé en grand entier).
+/// Les types signés continuent d'utiliser [`Int`] sans aucun changement.
+#[derive(Clone, Default)]
+pub struct Uint {
+    min: Option<u64>,
+    max: Option<u64>,
+}
+
+/// `z.uint()` — entier non signé exact, plage u64 par défaut.
+#[must_use]
+pub fn uint() -> Uint {
+    Uint {
+        min: None,
+        max: None,
+    }
+}
+
+impl Uint {
+    /// Valeur minimale (incluse).
+    #[must_use]
+    pub fn min(mut self, n: u64) -> Self {
+        self.min = Some(n);
+        self.check();
+        self
+    }
+
+    /// Valeur maximale (incluse).
+    #[must_use]
+    pub fn max(mut self, n: u64) -> Self {
+        self.max = Some(n);
+        self.check();
+        self
+    }
+
+    fn check(&self) {
+        if let (Some(min), Some(max)) = (self.min, self.max) {
+            assert!(
+                min <= max,
+                "litemcp/zod : uint() : min ({min}) > max ({max}) — \
+                 schéma insatisfaisable"
+            );
+        }
+    }
+
+    /// Valeur par défaut (publiée **et appliquée** — voir
+    /// [`Defaulted`]).
+    #[must_use]
+    pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
+        Defaulted::new(self, value.into())
+    }
+
+    /// Attache un en-tête `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, header: &str) -> WithHeader<Self> {
+        WithHeader::new(self, header)
+    }
+}
+
+impl Schema for Uint {
+    fn json(&self) -> Value {
+        // Bornes publiées = bornes appliquées, en u64 exact : la plage
+        // promise est celle du type Rust, sans troncature vers i64.
+        let mut schema = json!({ "type": "integer" });
+        schema["minimum"] = json!(self.min.unwrap_or(0));
+        schema["maximum"] = json!(self.max.unwrap_or(u64::MAX));
+        schema
+    }
+
+    fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
+        let Some(n) = value.as_number().and_then(integral_u64) else {
+            if value.as_number().is_some_and(is_mathematically_integral) {
+                // Intégral hors plage u64 : négatif → borne basse ; positif
+                // trop grand (> u64::MAX, p. ex. `1e30`) → borne haute.
+                let negative = value.as_f64().is_some_and(|f| f < 0.0);
+                if negative {
+                    push_issue!(
+                        issues,
+                        "`{}`: must be ≥ {}",
+                        path.as_str(),
+                        self.min.unwrap_or(0)
+                    );
+                } else {
+                    push_issue!(
+                        issues,
+                        "`{}`: must be ≤ {}",
+                        path.as_str(),
+                        self.max.unwrap_or(u64::MAX)
+                    );
+                }
+            } else {
+                push_issue!(issues, "`{}`: expected an integer", path.as_str());
+            }
+            return;
+        };
+        if let Some(min) = self.min {
+            if n < min {
+                push_issue!(issues, "`{}`: must be ≥ {min}", path.as_str());
+            }
+        }
+        if let Some(max) = self.max {
+            if n > max {
+                push_issue!(issues, "`{}`: must be ≤ {max}", path.as_str());
+            }
+        }
+    }
+
+    fn has_integers(&self) -> bool {
+        true
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        // Appelé après une validation réussie : un intégral hors i64 mais
+        // dans la plage u64 (`1e19`) est réécrit en u64 **exact** pour que
+        // l'extraction `as_u64` le lise — jamais approximativement.
+        if let Some(number) = value.as_number() {
+            if number.as_u64().is_none() {
+                if let Some(n) = integral_u64(number) {
+                    *value = Value::Number(serde_json::Number::from(n));
+                }
+            }
+        }
+    }
+}
+
+/// Valeur intégrale **exacte** d'un nombre JSON, dans la plage i64 —
+/// `None` pour un non-entier (`3.5`, une chaîne) ou un intégral hors plage
+/// exacte (`1e300`, u64 > i64::MAX) : jamais de conversion approximative.
+pub(crate) fn integral_i64(number: &serde_json::Number) -> Option<i64> {
+    if let Some(n) = number.as_i64() {
+        return Some(n);
+    }
+    // u64 > i64::MAX : intégral, mais hors de la plage exacte publiée.
+    if number.as_u64().is_some() {
+        return None;
+    }
+    let f = number.as_f64()?;
+    // Un f64 intégral dans [-2^63, 2^63) se convertit en i64 **exactement**
+    // (les intégraux entre 2^53 et 2^63 y sont représentables et i64 les
+    // représente tous) ; 2^63 elle-même n'est pas un i64.
+    if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f < TWO_POW_63_F64 {
+        return Some(f as i64);
+    }
+    None
+}
+
+/// Le nombre est-il **mathématiquement intégral** (sémantique JSON Schema
+/// de `"type": "integer"`) — quelle que soit sa représentation ou sa plage ?
+fn is_mathematically_integral(number: &serde_json::Number) -> bool {
+    number.as_i64().is_some()
+        || number.as_u64().is_some()
+        || number
+            .as_f64()
+            .is_some_and(|f| f.is_finite() && f.fract() == 0.0)
+}
+
+/// Valeur intégrale **exacte** d'un nombre JSON, dans la plage u64 —
+/// miroir non signé de [`integral_i64`] : `None` pour un non-entier
+/// (`3.5`, une chaîne) ou un intégral hors plage exacte (`1e300`, un
+/// négatif) : jamais de conversion approximative, jamais de négatif
+/// transformé en grand entier.
+pub(crate) fn integral_u64(number: &serde_json::Number) -> Option<u64> {
+    if let Some(n) = number.as_u64() {
+        return Some(n);
+    }
+    let f = number.as_f64()?;
+    // Un f64 intégral dans [0, 2^64) se convertit en u64 **exactement**
+    // (tout intégral f64 < 2^64 est représentable en u64) ; un négatif est
+    // rejeté net — la conversion `as` Rust bouclerait autour du zéro.
+    if f.is_finite() && f.fract() == 0.0 && (0.0..TWO_POW_64_F64).contains(&f) {
+        return Some(f as u64);
+    }
+    None
+}
+
+/// 2^63 en f64 (exact) — borne haute exclusive de la conversion exacte.
+const TWO_POW_63_F64: f64 = 9_223_372_036_854_775_808.0;
+
+/// 2^64 en f64 (exact) — borne haute exclusive de la conversion exacte u64.
+const TWO_POW_64_F64: f64 = 18_446_744_073_709_551_616.0;
 
 /// `z.number()` — tout nombre JSON, contraintes `.min(n)` / `.max(n)`.
 #[derive(Clone, Default)]
@@ -1080,6 +1539,12 @@ impl Num {
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
     }
+
+    /// Attache un en-tête `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, header: &str) -> WithHeader<Self> {
+        WithHeader::new(self, header)
+    }
 }
 
 impl Schema for Num {
@@ -1129,6 +1594,12 @@ impl Bool {
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
     }
+
+    /// Attache un en-tête `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, header: &str) -> WithHeader<Self> {
+        WithHeader::new(self, header)
+    }
 }
 
 impl Schema for Bool {
@@ -1143,7 +1614,10 @@ impl Schema for Bool {
     }
 }
 
-/// `z.enum([...])` — chaîne parmi un ensemble fermé.
+/// `z.enum([...])` — chaîne ou entier parmi un ensemble fermé.
+///
+/// Les chaînes sont comparées exactement ; les entiers en **égalité
+/// mathématique** (JSON Schema 2020-12) — voir [`integer_enumeration`].
 #[derive(Clone)]
 pub struct Enum {
     /// Les valeurs autorisées — chaînes ou entiers.
@@ -1179,6 +1653,16 @@ pub fn enumeration(values: &[&str]) -> Enum {
 ///
 /// Même contrat que [`enumeration`] : liste vide ou doublon → panique de
 /// développement. Publié `{"type": "integer", "enum": [1, 2, 3]}`.
+///
+/// **Égalité mathématique** (JSON Schema 2020-12, §4.2.1 — deux nombres
+/// sont égaux si leurs valeurs mathématiques le sont) : un flottant
+/// intégral égal à un membre est accepté (`3.0` → `3`, `2e2` → `200`,
+/// `-0.0` → `0`) — exactement comme chez tout validateur conforme sur le
+/// schéma publié (vérifié en différentiel contre la référence) — puis
+/// **normalisé en l'entier exact du membre** avant le handler : le motif
+/// documenté `args["mode"].as_i64()` réussit toujours quand le schéma
+/// passe. Un non-intégral (`3.5`) est refusé, un entier hors énumération
+/// (`9223372036854775808`, hors plage i64) est refusé sans conversion.
 pub fn integer_enumeration(values: &[i64]) -> Enum {
     assert!(
         !values.is_empty(),
@@ -1198,11 +1682,35 @@ pub fn integer_enumeration(values: &[i64]) -> Enum {
 }
 
 impl Enum {
+    /// L'instance appartient-elle à l'énumération ?
+    ///
+    /// Chaînes : égalité exacte. Entiers : égalité **mathématique** (JSON
+    /// Schema 2020-12, §4.2.1) — un flottant intégral égale l'entier de
+    /// même valeur (`3.0`, `2e2`, `-0.0` égale `3`, `200`, `0`) : c'est le
+    /// verdict de tout validateur conforme sur le schéma publié. Un
+    /// intégral hors plage i64 (`1e300`, 2^63) ne peut égaler aucun membre
+    /// (publiés en i64) — refusé, jamais converti.
+    fn contains(&self, value: &Value) -> bool {
+        if self.kind != "integer" {
+            return self.values.iter().any(|v| v == value);
+        }
+        let Some(n) = value.as_number().and_then(integral_i64) else {
+            return false;
+        };
+        self.values.iter().any(|v| v.as_i64() == Some(n))
+    }
+
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
+    }
+
+    /// Attache un en-tête `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, header: &str) -> WithHeader<Self> {
+        WithHeader::new(self, header)
     }
 }
 
@@ -1212,7 +1720,7 @@ impl Schema for Enum {
     }
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
-        if self.values.iter().any(|v| v == value) {
+        if self.contains(value) {
             return;
         }
         if issues.is_full() {
@@ -1221,7 +1729,9 @@ impl Schema for Enum {
         }
         // Type incorrect → message de type ; sinon message d'appartenance.
         let type_ok = match self.kind {
-            "integer" => value.is_i64() || value.is_u64(),
+            // Un flottant **intégral** est un entier (sémantiques JSON
+            // Schema) : il rate l'énumération sur la valeur, pas le type.
+            "integer" => value.as_number().is_some_and(is_mathematically_integral),
             _ => value.is_string(),
         };
         if type_ok {
@@ -1242,6 +1752,30 @@ impl Schema for Enum {
                 "expected a string"
             };
             issues.push(format!("`{}`: {expected}", path.as_str()));
+        }
+    }
+
+    fn has_integers(&self) -> bool {
+        // Une énumération d'entiers peut recevoir un flottant intégral
+        // (`3.0`) : une passe de normalisation est nécessaire pour que le
+        // handler voie l'entier exact (une énumération de chaînes, jamais).
+        self.kind == "integer"
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        if self.kind != "integer" {
+            return;
+        }
+        // Appelé après une validation réussie : la valeur égale alors
+        // mathématiquement un membre (publié en i64) — elle est réécrite
+        // en **la valeur exacte du membre**, sans rejouer une conversion
+        // float→int. Une valeur déjà exacte n'est pas touchée.
+        if value.as_i64().is_none() {
+            if let Some(n) = value.as_number().and_then(integral_i64) {
+                if let Some(member) = self.values.iter().find(|v| v.as_i64() == Some(n)) {
+                    *value = member.clone();
+                }
+            }
         }
     }
 }
@@ -1276,6 +1810,12 @@ impl Record {
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
+    }
+
+    /// Attache un en-tête `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, header: &str) -> WithHeader<Self> {
+        WithHeader::new(self, header)
     }
 }
 
@@ -1334,6 +1874,18 @@ impl Schema for Record {
     fn has_defaults(&self) -> bool {
         self.inner.has_defaults()
     }
+
+    fn has_integers(&self) -> bool {
+        self.inner.has_integers()
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        if let Some(map) = value.as_object_mut() {
+            for child in map.values_mut() {
+                self.inner.normalize_integers(child);
+            }
+        }
+    }
 }
 
 /// `z.array(inner)` — tableau homogène, contraintes `.min(n)` / `.max(n)` (taille).
@@ -1381,6 +1933,12 @@ impl Arr {
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
+    }
+
+    /// Attache un en-tête `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, header: &str) -> WithHeader<Self> {
+        WithHeader::new(self, header)
     }
 }
 
@@ -1452,6 +2010,18 @@ impl Schema for Arr {
     fn has_defaults(&self) -> bool {
         self.inner.has_defaults()
     }
+
+    fn has_integers(&self) -> bool {
+        self.inner.has_integers()
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        if let Some(items) = value.as_array_mut() {
+            for item in items {
+                self.inner.normalize_integers(item);
+            }
+        }
+    }
 }
 
 /// `z.nullable()` — accepte `null` **en plus** du schéma interne.
@@ -1477,6 +2047,12 @@ impl Nullable {
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
+    }
+
+    /// Attache un en-tête `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, header: &str) -> WithHeader<Self> {
+        WithHeader::new(self, header)
     }
 }
 
@@ -1509,6 +2085,16 @@ impl Schema for Nullable {
     fn has_defaults(&self) -> bool {
         self.inner.has_defaults()
     }
+
+    fn has_integers(&self) -> bool {
+        self.inner.has_integers()
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        if !value.is_null() {
+            self.inner.normalize_integers(value);
+        }
+    }
 }
 
 /// Attache une **description** à n'importe quel schéma (`z.describe(…)`).
@@ -1537,6 +2123,12 @@ impl Described {
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
     }
+
+    /// Attache un en-tête `x-mcp-header` (SEP-2243).
+    #[must_use]
+    pub fn header(self, header: &str) -> WithHeader<Self> {
+        WithHeader::new(self, header)
+    }
 }
 
 impl Schema for Described {
@@ -1562,6 +2154,14 @@ impl Schema for Described {
 
     fn has_defaults(&self) -> bool {
         self.inner.has_defaults()
+    }
+
+    fn has_integers(&self) -> bool {
+        self.inner.has_integers()
+    }
+
+    fn normalize_integers(&self, value: &mut Value) {
+        self.inner.normalize_integers(value);
     }
 }
 
@@ -1647,20 +2247,27 @@ mod tests {
     }
 
     #[test]
-    fn integer_rejects_non_integral_floats() {
-        // Le schéma doit être EXÉCUTEUR : une valeur acceptée par la
-        // validation doit toujours être lisible par `Value::as_i64()`.
-        // `3.0` et `1e2` sont des « integer » pour JSON Schema mais
-        // `as_i64()` renvoie None → ils sont refusés.
+    fn integer_accepts_integral_floats_like_json_schema() {
+        // Sémantiques JSON Schema (draft 2020-12) : `"type": "integer"`
+        // matche tout nombre mathématiquement intégral — `3.0`, `1e2`,
+        // `-0.0`. Un non-intégral (`3.5`) reste refusé, et un intégral hors
+        // de la plage 64 bits **publiée** (`minimum`/`maximum`) viole les
+        // bornes — jamais de conversion silencieuse.
         let schema = object().field("n", integer());
-        assert!(!issues_of(&schema, json!({ "n": 3.0 })).is_empty());
-        assert!(!issues_of(&schema, json!({ "n": 1e2 })).is_empty());
-        assert!(!issues_of(&schema, json!({ "n": 0.0 })).is_empty());
-        assert!(!issues_of(&schema, json!({ "n": -0.0 })).is_empty());
+        assert!(issues_of(&schema, json!({ "n": 3.0 })).is_empty());
+        assert!(issues_of(&schema, json!({ "n": 1e2 })).is_empty());
+        assert!(issues_of(&schema, json!({ "n": 0.0 })).is_empty());
+        assert!(issues_of(&schema, json!({ "n": -0.0 })).is_empty());
         // Les vrais entiers passent.
         assert!(issues_of(&schema, json!({ "n": 3 })).is_empty());
         assert!(issues_of(&schema, json!({ "n": -3 })).is_empty());
         assert!(issues_of(&schema, json!({ "n": 0 })).is_empty());
+        // Un non-intégral reste refusé.
+        assert!(!issues_of(&schema, json!({ "n": 3.5 })).is_empty());
+        // Un intégral hors de la plage **publiée** est un refus de borne.
+        let issues = issues_of(&schema, json!({ "n": 1e300 }));
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("must be ≤"), "{issues:?}");
     }
 
     #[test]
@@ -1690,13 +2297,19 @@ mod tests {
     #[test]
     fn integer_rejects_values_outside_i64_range() {
         let schema = object().field("n", integer());
-        // 2^63 n'est pas représentable en i64 : refusé, jamais saturé en i64::MAX.
+        // 2^63 n'est pas représentable en i64 : refusé (violation de la
+        // borne **publiée**), jamais saturé en i64::MAX ni converti.
         let issues = issues_of(&schema, json!({ "n": 9_223_372_036_854_775_808u64 }));
         assert_eq!(issues.len(), 1, "{issues:?}");
-        // Les flottants sont refusés (as_i64() strict).
+        assert!(issues[0].contains("must be ≤"), "{issues:?}");
+        // -2^63 est **exactement** i64::MIN : valide. Les flottants hors
+        // plage sont refusés dans le bon sens (violation de borne publiée).
         let two_pow_63 = 2f64.powi(63);
         assert_eq!(issues_of(&schema, json!({ "n": two_pow_63 })).len(), 1);
-        assert_eq!(issues_of(&schema, json!({ "n": -two_pow_63 })).len(), 1);
+        assert!(
+            issues_of(&schema, json!({ "n": -two_pow_63 })).is_empty(),
+            "-2^63 == i64::MIN : exact et dans la plage publiée"
+        );
         // Les bornes exactes i64, elles, passent.
         assert!(issues_of(&schema, json!({ "n": i64::MAX })).is_empty());
         assert!(issues_of(&schema, json!({ "n": i64::MIN })).is_empty());
@@ -1864,10 +2477,83 @@ mod tests {
         assert!(issues_of(&schema, json!({ "d": "2028-02-29T00:00:00Z" })).is_empty());
         // Fraction et fuseau ±HH:MM.
         assert!(issues_of(&schema, json!({ "d": "2026-10-24T18:30:00.123+02:00" })).is_empty());
+        // Seconde intercalaire : uniquement au point UTC 23:59, décalé par
+        // le fuseau (RFC 3339 §5.7) — `01:59:60+02:00` et `21:59:60-02:00`
+        // valent 23:59:60Z (acceptés) ; `23:59:60+02:00` vaut 21:59:60Z,
+        // point où aucune intercalaire n'existe (refusé).
+        assert!(issues_of(&schema, json!({ "d": "2026-07-01T01:59:60+02:00" })).is_empty());
+        assert!(issues_of(&schema, json!({ "d": "2026-06-30T21:59:60-02:00" })).is_empty());
+        assert!(!issues_of(&schema, json!({ "d": "2026-06-30T23:59:60+02:00" })).is_empty());
+        assert!(!issues_of(&schema, json!({ "d": "2026-01-05T21:59:60Z" })).is_empty());
         // Sans fuseau : refusé (RFC 3339).
         assert!(!issues_of(&schema, json!({ "d": "2026-10-24T18:30:00" })).is_empty());
         // Octets non-ASCII : aucune panique, simple refus.
         assert!(!issues_of(&schema, json!({ "d": "éééé-éé-ééTéé:éé:ééZ" })).is_empty());
+    }
+
+    #[test]
+    fn datetime_rejects_surrounding_or_doubled_whitespace() {
+        // RFC 3339 strict : aucun espace superflu autour des composants ni
+        // séparateur doublé (la référence les tolère — divergence publiée,
+        // épinglée en corpus différentiel).
+        let schema = object().field("d", string().datetime());
+        for bad in [
+            " 2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z ",
+            "\t2026-01-01T00:00:00Z",
+            "2026-01-01  00:00:00Z",
+            "\n2026-01-01T00:00:00Z",
+        ] {
+            assert!(
+                !issues_of(&schema, json!({ "d": bad })).is_empty(),
+                "espace superflu accepté : {bad:?}"
+            );
+        }
+    }
+
+    // --- Énumérations d'entiers : égalité mathématique (corpus différentiel) ---
+
+    #[test]
+    fn integer_enumeration_matches_integral_floats_mathematically() {
+        let schema = object().field("mode", integer_enumeration(&[1, 2, 3]));
+        // Égalité mathématique (JSON Schema 2020-12, §4.2.1) : un flottant
+        // intégral égale le membre de même valeur — comme chez tout
+        // validateur conforme sur le schéma publié.
+        assert!(issues_of(&schema, json!({ "mode": 3.0 })).is_empty());
+        assert!(issues_of(&schema, json!({ "mode": 1.0 })).is_empty());
+        // Entier hors énumération → message d'appartenance (pas de type).
+        let issues = issues_of(&schema, json!({ "mode": 9_223_372_036_854_775_808u64 }));
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("must be one of"), "{issues:?}");
+        // Non-intégral → message de type.
+        let issues = issues_of(&schema, json!({ "mode": 3.5 }));
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("expected an integer"), "{issues:?}");
+        // `-0.0` égale mathématiquement `0` ; `2e2` égale `200`.
+        let zero = object().field("mode", integer_enumeration(&[0]));
+        assert!(issues_of(&zero, json!({ "mode": -0.0 })).is_empty());
+        let two_hundred = object().field("mode", integer_enumeration(&[200]));
+        assert!(issues_of(&two_hundred, json!({ "mode": 2e2 })).is_empty());
+    }
+
+    #[test]
+    fn integer_enumeration_normalizes_integral_floats_to_the_member() {
+        let schema = object().field("mode", integer_enumeration(&[1, 2, 3]));
+        assert!(
+            schema.has_integers(),
+            "une énumération d'entiers déclare des entiers"
+        );
+        let mut value = json!({ "mode": 3.0 });
+        schema.normalize_integers(&mut value);
+        assert_eq!(value["mode"], json!(3), "3.0 → le membre exact 3");
+        assert_eq!(value["mode"].as_i64(), Some(3));
+
+        // Une énumération de chaînes ne déclare jamais d'entiers.
+        let strings = object().field("mode", enumeration(&["a", "b"]));
+        assert!(!strings.has_integers());
+        let mut value = json!({ "mode": "a" });
+        strings.normalize_integers(&mut value);
+        assert_eq!(value["mode"], json!("a"), "une chaîne n'est jamais touchée");
     }
 
     // --- A3 : describe ---
@@ -1921,6 +2607,21 @@ mod tests {
             );
         }
         assert!(issues_of(&url_schema, json!({ "u": "https://[::1]:8080/mcp" })).is_empty());
+        // IPv6 **nue** (sans crochets) : jamais une URL valide (RFC 3986
+        // §3.2.2) — `rsplit_once(':')` en faisait sinon un hôte dégénéré.
+        for bare_ipv6 in ["http://::1/x", "http://fe80::1/x", "http://[::1]:8080:x/y"] {
+            assert!(
+                !issues_of(&url_schema, json!({ "u": bare_ipv6 })).is_empty(),
+                "URL IPv6 nue acceptée : {bare_ipv6:?}"
+            );
+        }
+        // Crochets mal fermés ou hôte vide entre crochets : refusés.
+        for broken in ["http://[::1/x", "http://[]/x", "http://[::1]extra/x"] {
+            assert!(
+                !issues_of(&url_schema, json!({ "u": broken })).is_empty(),
+                "URL à crochets malformés acceptée : {broken:?}"
+            );
+        }
     }
 
     #[test]

@@ -81,6 +81,16 @@ impl Gateway {
     /// Construit le gateway et son premier snapshot.
     #[must_use]
     pub fn new(builder: ServerBuilder) -> Self {
+        // Un compteur d'inflight **par gateway**, partagé par tous ses
+        // snapshots : les handlers détachés d'un ancien snapshot (timeout)
+        // restent comptés dans le plafond global après un `edit` — sinon
+        // chaque noyau reconstruit repartait de zéro et `Gateway::edit`
+        // contournait `MAX_INFLIGHT_HANDLERS`. Deux gateways, deux
+        // compteurs ; un serveur indépendant (bind sans gateway), le sien.
+        // L'injection vit dans le builder stocké : chaque `edit` clone le
+        // builder et le noyau reconstruit hérite du même compteur.
+        let builder =
+            builder.share_inflight_counter(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         let core = Arc::new(builder.core());
         Gateway {
             builder: ReentrantBuilder::new(builder),
@@ -251,6 +261,16 @@ impl Gateway {
         headers: Option<&McpHeaders>,
     ) -> Option<Vec<u8>> {
         self.snapshot().dispatch_with_headers(body, headers)
+    }
+
+    /// Dispatch sur le snapshot courant avec statut structuré — voir
+    /// [`ServerCore::dispatch_request`].
+    pub fn dispatch_request(
+        &self,
+        body: &[u8],
+        headers: Option<&McpHeaders>,
+    ) -> Option<crate::server::DispatchResponse> {
+        self.snapshot().dispatch_request(body, headers)
     }
 
     fn read_current(&self) -> Arc<ServerCore> {
@@ -731,6 +751,7 @@ mod tests {
         let headers = crate::server::McpHeaders {
             method: Some("tools/call".to_string()),
             name: Some("a".to_string()),
+            ..Default::default()
         };
         let reply = gw
             .dispatch_with_headers(body.as_bytes(), Some(&headers))
@@ -740,6 +761,7 @@ mod tests {
         let headers = crate::server::McpHeaders {
             method: Some("ping".to_string()),
             name: None,
+            ..Default::default()
         };
         let reply = gw
             .dispatch_with_headers(body.as_bytes(), Some(&headers))

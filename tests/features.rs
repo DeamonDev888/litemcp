@@ -90,8 +90,10 @@ fn tool_timeout_maps_a_panicking_handler_to_internal_error() {
 
 #[test]
 fn tool_timeout_cuts_slow_resource_and_prompt_handlers() {
-    // Même mécanisme pour resources/read et prompts/get : erreur -32000
-    // (plage implementation-defined), pas de thread de connexion retenu.
+    // Même mécanisme pour resources/read et prompts/get : erreur interne
+    // -32603 avec data structuré (`reason: timeout`) — MCP 2026-07-28
+    // déconseille d'introduire de nouveaux codes en -32000 — et pas de
+    // thread de connexion retenu.
     let core = ServerBuilder::new("t", "0.1.0")
         .tool_timeout(Duration::from_millis(100))
         .resource("mem://lent", "Lent", "dort", || {
@@ -108,7 +110,9 @@ fn tool_timeout_cuts_slow_resource_and_prompt_handlers() {
         &core,
         r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"mem://lent"}}"#,
     );
-    assert_eq!(v["error"]["code"], -32000, "{v}");
+    assert_eq!(v["error"]["code"], -32603, "{v}");
+    assert_eq!(v["error"]["data"]["reason"], "timeout", "{v}");
+    assert_eq!(v["error"]["data"]["timeout_ms"], 100, "{v}");
     assert!(
         v["error"]["message"]
             .as_str()
@@ -121,7 +125,8 @@ fn tool_timeout_cuts_slow_resource_and_prompt_handlers() {
         &core,
         r#"{"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":"lent"}}"#,
     );
-    assert_eq!(v["error"]["code"], -32000, "{v}");
+    assert_eq!(v["error"]["code"], -32603, "{v}");
+    assert_eq!(v["error"]["data"]["reason"], "timeout", "{v}");
     assert!(
         v["error"]["message"]
             .as_str()
@@ -235,7 +240,7 @@ fn resources_list_and_read_work() {
     );
     assert_eq!(v["error"]["code"], -32602, "{v}");
 
-    // Handler en échec : -32000 (plage implementation-defined).
+    // Handler en échec : -32603 (défaillance interne, data `handler_failed`).
     let core = ServerBuilder::new("t", "0.1.0")
         .resource("mem://ko", "Ko", "échoue", || {
             Err("fichier absent".to_string())
@@ -245,7 +250,8 @@ fn resources_list_and_read_work() {
         &core,
         r#"{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"mem://ko"}}"#,
     );
-    assert_eq!(v["error"]["code"], -32000, "{v}");
+    assert_eq!(v["error"]["code"], -32603, "{v}");
+    assert_eq!(v["error"]["data"]["reason"], "handler_failed", "{v}");
     assert!(
         v["error"]["message"]
             .as_str()
@@ -256,9 +262,11 @@ fn resources_list_and_read_work() {
 }
 
 #[test]
-fn resources_and_prompts_capabilities_track_their_registries() {
-    // Une capacité annoncée est une capacité servie : sans registre, pas
-    // d'annonce ; avec, l'objet de capacité apparaît.
+fn resources_and_prompts_capabilities_are_always_announced() {
+    // Capacité annoncée = capacité servie : les méthodes `resources/*` et
+    // `prompts/*` sont servies même à registre vide (catalogue vide), donc
+    // les trois capacités sont annoncées — un `Gateway` peut peupler les
+    // registres après le démarrage sans changer l'annonce.
     let vide = ServerBuilder::new("t", "0.1.0").core();
     let v = call(
         &vide,
@@ -266,10 +274,13 @@ fn resources_and_prompts_capabilities_track_their_registries() {
     );
     assert!(v["result"]["capabilities"]["tools"].is_object(), "{v}");
     assert!(
-        v["result"]["capabilities"].get("resources").is_none(),
-        "aucune ressource enregistrée : pas d'annonce : {v}"
+        v["result"]["capabilities"]["resources"].is_object(),
+        "méthodes servies même à registre vide : annonce attendue : {v}"
     );
-    assert!(v["result"]["capabilities"].get("prompts").is_none(), "{v}");
+    assert!(
+        v["result"]["capabilities"]["prompts"].is_object(),
+        "méthodes servies même à registre vide : annonce attendue : {v}"
+    );
 
     let plein = ServerBuilder::new("t", "0.1.0")
         .resource("mem://x", "X", "x", || {
@@ -351,7 +362,7 @@ fn prompts_list_and_get_work() {
     );
     assert_eq!(v["error"]["code"], -32602, "{v}");
 
-    // Handler en échec → -32000.
+    // Handler en échec → -32603 (défaillance interne, data `handler_failed`).
     let core = ServerBuilder::new("t", "0.1.0")
         .prompt("ko", "échoue", |_args| Err("contexte manquant".to_string()))
         .core();
@@ -359,7 +370,8 @@ fn prompts_list_and_get_work() {
         &core,
         r#"{"jsonrpc":"2.0","id":6,"method":"prompts/get","params":{"name":"ko"}}"#,
     );
-    assert_eq!(v["error"]["code"], -32000, "{v}");
+    assert_eq!(v["error"]["code"], -32603, "{v}");
+    assert_eq!(v["error"]["data"]["reason"], "handler_failed", "{v}");
     assert!(
         v["error"]["message"]
             .as_str()
