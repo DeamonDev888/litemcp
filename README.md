@@ -4,7 +4,7 @@
 
 **La lib MCP la plus légère en mémoire et la plus rapide au monde.**
 
-Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro runtime async
+**Streamable HTTP stateless** (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement
 
 ![Statut](https://img.shields.io/badge/statut-0.10.x%20publié-green) ![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
@@ -25,7 +25,7 @@ Un serveur MCP qui tient **dans votre programme** : quelques lignes de Rust, `.s
 **Pour qui ?**
 
 - **Une CLI** qui veut exposer deux ou trois outils, sans embarquer un framework web ;
-- **Un test unitaire** qui a besoin d'un vrai serveur MCP qui écoute sur un port — sans installer tokio ;
+- **Un test unitaire** qui a besoin d'un vrai serveur MCP qui écoute sur un port ;
 - **Un binaire embarqué** (edge, IoT), où chaque mégaoctet et chaque dépendance compte ;
 - **Un agent** qui lance cinquante serveurs MCP en même temps : chaque mégaoctet de RAM et chaque demi-seconde de démarrage se multiplient par cinquante.
 
