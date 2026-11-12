@@ -12,6 +12,32 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
+### Ajouté
+
+- **`notifications/progress` request-scoped — `litemcp::progress`** : un handler synchrone appelle `progress::report(progress, total, message)` et le transport pousse la notification sur le flux SSE du POST courant, avant l'événement de réponse. Le canal n'existe que si la requête porte `params._meta.progressToken` **et** que le client accepte `text/event-stream` ; le jeton est toujours repris de la requête (jamais choisi par le handler), les écritures sont sérialisées entre le fil du handler (`tool_timeout`) et le fil de connexion, et le canal est fermé **avant** l'écriture de la réponse — une émission tardive d'un handler détaché est ignorée. Sans jeton ou sans SSE, `report` est une non-action (`false`) : aucune rupture pour les handlers existants, aucun flux permanent, pas de session. Nouveau point d'entrée `ServerCore::dispatch_request_with_progress` pour les transports embarqués. Le scénario officiel `tools-call-with-progress` passe (3 notifications 0/50/100, jeton echoé) ;
+- **Fixture de conformance — cycle MRTR et schéma JSON 2020-12** : `examples/conformance_server` enregistre les huit outils `test_input_required_result_*` (`tool_mrtr`), le prompt MRTR (`prompt_mrtr`) et une ressource MRTR (`resource_mrtr`) — les 14 scénarios scorés `input-required-result-*` passent, y compris `tampered-state` (jeton signé refusé en `-32602`) et `capability-check` (seules les capacités déclarées sont demandées). `json_schema_2020_12_tool` est publié depuis un document brut via la feature opt-in `schemars` (workflow de conformance construit avec `--features schemars`), ce qui rend le scénario *pending* `json-schema-2020-12` vert sans le compter comme obligatoire ; la baseline `.github/conformance/` est **vide** (aucun échec scoré) ;
+
+### Corrigé
+
+- **`gateway_e2e::une_requete_en_vol_reste_servie_par_son_snapshot` — plus d'hypothèse d'ordonnancement dans le harnais** : `sleep(50 ms)` supposait que le thread de requête avait déjà pris son snapshot avant le retrait de l'outil ; quand l'edit gagnait la course, l'appel rendait `-32602` (échec intermittent). Le handler signale désormais son entrée (il ne peut s'exécuter qu'après le `snapshot()` du dispatch), le thread principal retire l'outil, puis autorise le handler à terminer — l'invariant « requête en vol servie par son ancien snapshot » est tenu par construction, sans toucher à `Gateway`. 120 exécutions consécutives vertes ;
+
+### Documentation
+
+- **Comptes de tests et commentaires de fixture réalignés sur le code courant** : le README passe de 313/304/295 à **547 all-features / 504 par défaut / 481 sans feature** (somme des suites unitaires, d'intégration et des doctests, mesurée le 2026-11-11) ; l'en-tête de la fixture liste les trois tests qui l'incluent (`conformance_fixture`, `conformance_fixture_mrtr`, `mcp_progress_channel`) et `main.rs` ne prétend plus que les outils MRTR sont absents ni que `tools-call-with-progress` échoue.
+
+## [0.10.5] - 2026-11-11
+
+### Publication
+
+- **`litemcp-macros` 0.4.1 — aucun contenu nouveau sous une version déjà publiée** : la 0.4.0 est en ligne sur crates.io sans les derniers correctifs des macros ni les licences MIT/Apache ajoutées depuis. La réutiliser publierait un contenu différent sous une version immuable (crates.io refuse la republication et le pipeline traiterait « already uploaded » comme déjà publié). La crate passe en **0.4.1** et l'exigence de la dépendance racine est alignée (`litemcp-macros = { …, version = "0.4.1" }`) ; la racine passe en **0.10.5**, son manifeste changeant lui aussi (exigence 0.4.1) alors que la 0.10.4 est déjà publiée. Ordre de publication inchangé : macros puis racine (`docs/RELEASE.md`). Aucun changement d'API ;
+- **Matrice de features dans la CI et dans le gate de release** — `--all-features` ne prouvait rien des configurations réellement servies aux utilisateurs. `ci.yml` exécute désormais `cargo test --workspace --no-default-features` puis chaque feature isolément (`macros`, `schemars`), et `scripts/release.ps1 verify` rejoue les trois mêmes commandes avant toute publication : le gate de release ne peut pas être plus laxiste que la CI ;
+- **Rustdoc strict en CI et en release** — `cargo doc` est construit avec `RUSTDOCFLAGS=-D warnings` sur tout le workspace ; le dernier lien explicite redondant de `ServerCore` (`src/antizombie.rs`) disparaît ([`ServerCore`] résout le même item). Un lien intra-doc cassé ou redondant rompt maintenant la publication au lieu de passer en avertissement ;
+- **Paquets sans avertissement `audit_target`** — la sonde d'audit privée (`examples/audit_target.rs`, ignorée par Git) était découverte par cargo comme exemple, absente du paquet et signalée à chaque `cargo package` (« ignoring example `audit_target`… »). Elle vit désormais dans `.zwork/audit_target.rs` (hors crate, jamais publiée ; procédure d'exécution dans son en-tête) et le manifeste conserve une exclusion explicite en défense en profondeur si une copie réapparaît le temps d'une campagne. Les deux paquets s'empaquettent sans avertissement, sans changement d'API.
+
+### Tests
+
+- `tests/release_pipeline.rs` fige les nouveaux invariants : matrice de features exécutée par `ci.yml` **et** par le gate de release, `RUSTDOCFLAGS=-D warnings` sur `cargo doc --workspace`, alignement exact entre la version de `litemcp-macros` et l'exigence du manifeste racine (bump des deux ensemble), et sonde d'audit hors de la crate exclue du paquet.
+
 ## [0.10.4] - 2026-11-11
 
 ### Corrigé

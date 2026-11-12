@@ -1,8 +1,8 @@
 name: CI
 
-# Les quatre jobs se déclenchent automatiquement sur tout push vers main et
-# sur TOUTE pull request (quelle que soit la branche source). La protection
-# de branche les rend requis avant merge + 1 approbation.
+# Les jobs se déclenchent automatiquement sur tout push vers main et sur
+# TOUTE pull request (quelle que soit la branche source). La protection de
+# branche les rend requis avant merge + 1 approbation.
 on:
   push:
     branches: [main]
@@ -35,6 +35,16 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --workspace --all-features
+      # Matrice de features : `--all-features` ne prouve rien des configurations
+      # servies aux utilisateurs. Tests complets sans les features par défaut,
+      # puis CHAQUE feature isolée (surface publique séparée). Le gate de
+      # release (`scripts/release.ps1 verify`) exécute les mêmes commandes.
+      - name: Tests (sans features par defaut)
+        run: cargo test --workspace --no-default-features
+      - name: Feature macros isolee
+        run: cargo check -p litemcp --no-default-features --features macros
+      - name: Feature schemars isolee
+        run: cargo check -p litemcp --no-default-features --features schemars
       # Les garde-fous du pipeline de publication (scripts/release-tests.ps1 :
       # tag incohérent, tests rouges, version déjà publiée, réseau
       # indisponible, contenu des paquets) tournent aussi sur chaque PR —
@@ -42,8 +52,10 @@ jobs:
       # la structure des workflows via `cargo test` ci-dessus.
       - name: Simulations du pipeline de publication
         run: pwsh -NoProfile -File scripts/release-tests.ps1
-      - name: Doc
-        run: cargo doc --no-deps --all-features
+      - name: Doc (rustdoc strict)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features
 
   msrv:
     # MSRV déclaré dans Cargo.toml (rust-version = "1.85") : vérifié à part

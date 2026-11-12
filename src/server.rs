@@ -786,7 +786,32 @@ impl ServerCore {
         body: &[u8],
         headers: Option<&McpHeaders>,
     ) -> Option<Vec<u8>> {
-        self.dispatch_internal(body, headers, false).map(|r| r.body)
+        self.dispatch_internal(body, headers, false, None)
+            .map(|r| r.body)
+    }
+
+    /// Traite un corps de requête JSON-RPC avec un **canal de progression**
+    /// request-scoped.
+    ///
+    /// Le canal (voir [`crate::progress`]) reçoit les
+    /// `notifications/progress` émises par les handlers pendant l'exécution :
+    /// c'est au transport de les livrer (SSE du POST) et de reprendre le
+    /// jeton `progressToken` de la requête. Sans canal — ou si le client n'a
+    /// pas fourni de jeton — [`crate::progress::report`] est une non-action.
+    ///
+    /// Renvoie `None` pour une notification, comme [`Self::dispatch_request`].
+    pub fn dispatch_request_with_progress(
+        &self,
+        body: &[u8],
+        headers: Option<&McpHeaders>,
+        channel: Arc<dyn crate::progress::ProgressChannel>,
+    ) -> Option<DispatchResponse> {
+        self.dispatch_internal(
+            body,
+            headers,
+            self.protocol_profile == ProtocolProfile::Strict2026_07_28,
+            Some(channel),
+        )
     }
 
     /// Traite un corps de requête JSON-RPC et produit une réponse structurée
@@ -803,6 +828,7 @@ impl ServerCore {
             body,
             headers,
             self.protocol_profile == ProtocolProfile::Strict2026_07_28,
+            None,
         )
     }
 
@@ -811,7 +837,12 @@ impl ServerCore {
         body: &[u8],
         headers: Option<&McpHeaders>,
         strict_meta: bool,
+        progress_channel: Option<Arc<dyn crate::progress::ProgressChannel>>,
     ) -> Option<DispatchResponse> {
+        // Canal de progression lié au fil du dispatch : les handlers
+        // synchrones l'atteignent via `progress::report`, y compris sur un
+        // retour anticipé (le garde le délie au `Drop`).
+        let _progress = crate::progress::bind(progress_channel);
         let incoming = match crate::jsonrpc::parse_incoming(body) {
             Ok(incoming) => incoming,
             Err(crate::jsonrpc::ParseFail::Syntax) => {
@@ -2434,28 +2465,37 @@ impl ServerCore {
                     "internal error (handler panicked)",
                 )),
             },
-            Some(timeout) => match run_with_timeout(
-                timeout,
-                &self.inflight_handlers,
-                self.max_inflight_handlers,
-                f,
-            ) {
-                Outcome::Done(result) => Ok(result),
-                Outcome::Panicked => Err(ErrorObject::new(
-                    ErrorObject::INTERNAL_ERROR,
-                    "internal error (handler panicked)",
-                )),
-                Outcome::TimedOut => Err(ErrorObject::with_data(
-                    HANDLER_FAILURE,
-                    format!("execution timed out after {} ms", timeout.as_millis()),
-                    json!({ "reason": "timeout", "timeout_ms": timeout.as_millis() as u64 }),
-                )),
-                Outcome::Overloaded => Err(ErrorObject::with_data(
-                    HANDLER_FAILURE,
-                    "too many concurrent handlers in flight",
-                    json!({ "reason": "overloaded", "max_in_flight": self.max_inflight_handlers }),
-                )),
-            },
+            Some(timeout) => {
+                // Le handler peut s'exécuter dans un autre fil : le canal de
+                // progression du dispatch y est réinstallé explicitement
+                // (les vars de fil ne traversent pas `spawn`).
+                let ambient = crate::progress::current();
+                match run_with_timeout(
+                    timeout,
+                    &self.inflight_handlers,
+                    self.max_inflight_handlers,
+                    move || {
+                        let _progress = crate::progress::bind(ambient);
+                        f()
+                    },
+                ) {
+                    Outcome::Done(result) => Ok(result),
+                    Outcome::Panicked => Err(ErrorObject::new(
+                        ErrorObject::INTERNAL_ERROR,
+                        "internal error (handler panicked)",
+                    )),
+                    Outcome::TimedOut => Err(ErrorObject::with_data(
+                        HANDLER_FAILURE,
+                        format!("execution timed out after {} ms", timeout.as_millis()),
+                        json!({ "reason": "timeout", "timeout_ms": timeout.as_millis() as u64 }),
+                    )),
+                    Outcome::Overloaded => Err(ErrorObject::with_data(
+                        HANDLER_FAILURE,
+                        "too many concurrent handlers in flight",
+                        json!({ "reason": "overloaded", "max_in_flight": self.max_inflight_handlers }),
+                    )),
+                }
+            }
         }
     }
 
@@ -2603,13 +2643,19 @@ impl ServerCore {
                 let owned = arguments.clone();
                 let owned_round = round.clone();
                 let handler = tool.handler.clone();
+                let ambient = crate::progress::current();
                 match run_with_timeout(
                     timeout,
                     &self.inflight_handlers,
                     self.max_inflight_handlers,
-                    move || match &handler {
-                        ToolHandler::Plain(f) => f(&owned),
-                        ToolHandler::Mrtr(f) => f(&owned, &owned_round).map_err(ToolFailure::Tool),
+                    move || {
+                        let _progress = crate::progress::bind(ambient);
+                        match &handler {
+                            ToolHandler::Plain(f) => f(&owned),
+                            ToolHandler::Mrtr(f) => {
+                                f(&owned, &owned_round).map_err(ToolFailure::Tool)
+                            }
+                        }
                     },
                 ) {
                     Outcome::Done(result) => result,

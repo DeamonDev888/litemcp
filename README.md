@@ -83,6 +83,7 @@ Les features sont **additives** : les dépendances **externes** du cœur sont to
 | 🦀 **Handlers typés** | arguments désérialisés dans vos structs `Deserialize` ; macro `#[tool]` (incluse par défaut) qui dérive le schéma des types des paramètres |
 | 📚 **Resources & Prompts** | `resources/list`·`read`·`templates/list`, `prompts/list`·`get` — mêmes indices de cache que `tools/list` (SEP-2549) ; lectures **binaires** (`blob` base64), gabarits RFC 6570 et `completion/complete` inclus |
 | 🔁 **Multi round-trip (MRTR)** | un handler d'outil/prompt/ressource demande une entrée client (`resultType: "input_required"`) : élicitation, échantillonnage, racines — état opaque signé HMAC-SHA256, rejeu avec `inputResponses` sous un id différent |
+| 📈 **Progression** | `notifications/progress` **request-scoped** : `progress::report(...)` dans le handler, poussée sur le flux SSE borné à la requête (`_meta.progressToken` + `text/event-stream`) — aucun flux permanent, aucun état de session |
 | ⏱️ **Handlers bornés** | `.tool_timeout(duration)` : un handler qui dépasse rend une erreur, la connexion n'est plus retenue indéfiniment |
 | 🩺 **Erreurs structurées & observabilité** | `ToolError` (`rate_limited`, `timeout`, `upstream`… avec `retryable`/`retryAfterMs`) + `.on_call(hook)` pour métriques et latences |
 | 🔐 **Verrou de requête** | `.on_request(hook)` : verdict par requête **avant la lecture du corps** — auth par token, rate-limit par source ; rejet `401`/`403`/`429` + `Retry-After`, paniques contenues |
@@ -437,6 +438,26 @@ ServerBuilder::new("booking", "1.0.0")
 
 Le noyau fait le reste : validation des requêtes embarquées (`elicitation/create`, `sampling/createMessage`, `roots/list` — une autre méthode ou une forme fil invalide est un bogue de handler rendu `-32603` **sans rien émettre**), exigence de la capacité client déclarée correspondante (`-32021` sinon), `requestState` **opaque signé** (HMAC-SHA256, TTL 10 min par défaut — `.request_state_ttl`, clé partagée en flotte — `.request_state_key`, borne d'état 8 Kio), liaison du jeton à la méthode et aux paramètres saillants. Le client réémet la requête **sous un id différent** avec `inputResponses` et l'écho exact du jeton ; un jeton altéré, expiré, malformé ou lié à une autre requête est refusé en `-32602` avant tout handler. Le jeton est **porteur et non consommé** (imposez la consommation unique dans le handler si nécessaire) ; les champs MRTR sont ignorés sur toute autre méthode et **aucune capacité serveur supplémentaire n'est annoncée** — rien n'est servi au-delà des résultats `input_required`. Aucune dépendance nouvelle : SHA-256, HMAC-SHA256 et base64url sont implémentés localement.
 
+### Progression (`notifications/progress`)
+
+Un handler qui exécute une tâche longue peut rapporter sa progression ; la notification est poussée sur le flux SSE **de la requête courante**, avant l'événement de réponse :
+
+```rust
+use litemcp::prelude::*;
+
+ServerBuilder::new("index", "1.0.0")
+    .tool("build", "Indexe un corpus", |_args| {
+        let _ = progress::report(0.0, Some(100.0), Some("starting"));
+        // … travail …
+        let _ = progress::report(100.0, Some(100.0), None);
+        Ok(serde_json::json!({ "done": true }))
+    })
+    .bind("127.0.0.1:23080")?
+    .serve()?;
+```
+
+Le canal n'existe que si le client a fourni `params._meta.progressToken` **et** accepte `text/event-stream` : le transport ouvre alors le flux avant le dispatch, chaque `report` écrit une notification portant **le jeton de la requête** (jamais choisi par le handler), puis l'événement de réponse ferme le flux et la connexion. Toujours une seule requête, aucun flux permanent, aucun état de session. Sans jeton, sans SSE ou une fois la réponse partie, `report` rend `false` (non-action) : un handler qui rapporte ne casse rien chez un client JSON. Le canal est lié au fil du handler pour la durée du dispatch — y compris sous `.tool_timeout`, où il est réinstallé dans le fil détaché ; une émission tardive d'un handler qui a dépassé son délai est ignorée. Un hôte qui possède déjà son transport branche `ServerCore::dispatch_request_with_progress` sur son propre `ProgressChannel`.
+
 ### Annotations
 
 Métadonnées de la spec 2026-07-28, publiées dans `tools/list` : `.title()`, `.read_only()`, `.destructive()`, `.idempotent()`, `.open_world()`. Un client sait ainsi qu'un outil ne modifie rien avant de l'appeler.
@@ -511,7 +532,7 @@ Le durcissement transport est intégré et vérifié par la suite de tests : lim
 | Comportement | Réponse |
 |---|---|
 | `POST /mcp` valide | `200 application/json` — réponse JSON-RPC |
-| `POST` avec `Accept: text/event-stream` seul | `200 text/event-stream` — un événement `data:` (SSE request-scoped) + en-têtes anti-tampon |
+| `POST` avec `Accept: text/event-stream` seul | `200 text/event-stream` — un événement `data:` (SSE request-scoped) + en-têtes anti-tampon ; avec `_meta.progressToken`, les `notifications/progress` précèdent l'événement de réponse |
 | Notification de protocole (`notifications/*`, sans `id`) | `202 Accepted` sans corps (acceptée et ignorée) |
 | Notification d'action (`tools/call`, `resources/read`, `prompts/get`, `completion/complete` sans `id`) | `-32600` **« notification refusée »** — le mode stateless ne peut pas livrer le résultat : le handler **ne tourne pas** et le client le sait |
 | `server/discover` (SEP-2575) | `200` — versions supportées, capacités, `serverInfo` dans `_meta` |
@@ -525,6 +546,7 @@ Le durcissement transport est intégré et vérifié par la suite de tests : lim
 | `prompts/list` / `prompts/get` | `200` — catalogue et rendu (messages `user`/`assistant`, `content` = bloc `ContentBlock` complet : texte, image, audio, `resource_link`, ressource embarquée) ; nom inconnu : `-32602` ; `arguments` non-objet : `-32602` |
 | `completion/complete` | `200` — suggestions (`completion.values`, ≤ 100 : au-delà tronquées + `hasMore: true`) ; fournisseur absent ou params invalides (`ref`, `argument`) : `-32602` ; échec du fournisseur : `-32603` (data `handler_failed`) ; capacité `completions` annoncée seulement quand un fournisseur existe |
 | Résultat `input_required` (MRTR) | `200` — `{ resultType: "input_required", inputRequests?, requestState, _meta }` ; rejeu (id **différent**) avec `inputResponses` + écho du jeton ; état signé HMAC-SHA256 (TTL 10 min, liaison méthode/paramètres saillants) : altéré/expiré/malformé/autre clé/requête modifiée → `-32602` avant tout handler ; requête embarquée dont la capacité client n'est pas déclarée → `-32021` ; requête embarquée invalide ou état > 8 Kio → `-32603` (bogue de handler, rien n'est émis) ; `inputResponses` sans `requestState` → `-32602` ; champs MRTR ignorés sur toute autre méthode |
+| `notifications/progress` | `200 text/event-stream` — flux ouvert **avant** le dispatch quand `_meta.progressToken` est fourni et que le client accepte SSE : chaque `progress::report` écrit une notification (jeton de la requête, `progress`/`total`/`message`), l'événement final clôt le flux ; sans jeton ou sans SSE, rapport ignoré et réponse JSON unique ; aucune notification après la réponse |
 | Capacités `tools` / `resources` / `prompts` | **toujours** annoncées dans `server/discover`/`initialize` — les méthodes correspondantes sont servies même à registre vide (aucune sous-capacité non servie déclarée) |
 | `Mcp-Method` / `Mcp-Name` (SEP-2243) | acceptés ; **incohérents avec le corps** → `-32020` (`HeaderMismatch`) |
 | `initialize` / `ping` | tolérés (méthodes legacy `2025-11-25`, retirées de la spec `2026-07-28`) |
@@ -613,7 +635,7 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 | Mémoire après 2 300 requêtes | < 10 Mo | **2,7 Mio `VmRSS`, +4 Kio pendant la charge** ✅ |
 | Démarrage in-process | < 10 ms | **~0,4 ms** ✅ |
 
-`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **313 tests** (dont fuzz proptest ; 304 par défaut avec les macros, 295 sans aucune feature) est vérifiée sur les deux OS.
+`examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux). La suite **547 tests** (dont fuzz proptest ; 504 par défaut avec les macros, 481 sans aucune feature) est vérifiée sur les deux OS.
 
 ## Comparatif — ViteMCP (TypeScript)
 
@@ -661,14 +683,14 @@ location /mcp {
 
 **Repli officiel si l'hébergeur est hostile au SSE** : le client négocie `Accept: application/json` et reçoit une réponse JSON sèche — aucun flux, rien à tamponner. Les clients MCP gèrent cette négociation automatiquement.
 
-**Choix architectural : pas de SSE longue durée.** Le mode stateless ne tient aucun flux ouvert (pas de progress ni de notifications serveur→client) : un POST, un événement, clôture. C'est ce choix qui immunise le transport contre le tamponnage des proxies et le rend trivial à déployer derrière nginx. Un flux permanent exigerait des sessions — hors périmètre, réévalué seulement si un besoin concret l'exige. **Conséquence assumée : pas d'annulation MCP** — la déconnexion d'un client pendant l'exécution d'un handler n'est détectée qu'à l'écriture de la réponse (une seule écriture, qui échoue alors silencieusement) et aucun jeton d'annulation n'est exposé aux handlers ; l'évolution (jeton coopératif + détection pendant l'exécution) est chiffrée dans le CHANGELOG « Prévu ».
+**Choix architectural : pas de SSE longue durée.** Le mode stateless ne tient aucun flux ouvert **entre deux requêtes** : un POST, une réponse, clôture. Une requête qui porte `_meta.progressToken` et accepte `text/event-stream` ouvre un flux **request-scoped** — les `notifications/progress` émises par le handler (`litemcp::progress::report`) précèdent l'événement de réponse, puis la connexion est fermée ; sans jeton, la réponse reste un JSON unique. C'est ce choix qui immunise le transport contre le tamponnage des proxies et le rend trivial à déployer derrière nginx. Un flux permanent (abonnements, notifications hors requête) exigerait des sessions — hors périmètre, réévalué seulement si un besoin concret l'exige. **Conséquence assumée : pas d'annulation MCP** — la déconnexion d'un client pendant l'exécution n'est détectée qu'à l'écriture (événement de réponse, ou première notification de progression qui échoue) et aucun jeton d'annulation n'est exposé aux handlers ; l'évolution (jeton coopératif + détection pendant l'exécution) est chiffrée dans le CHANGELOG « Prévu ».
 
 ## Tests
 
 ```bash
-cargo test --workspace --all-features        # 313 tests : unitaires + intégration (vraies sockets) + doctests
-cargo test --workspace                       # 304 tests : le noyau + macros incluses (jeu par défaut)
-cargo test --workspace --no-default-features # 295 tests : le noyau strict, sans les macros
+cargo test --workspace --all-features        # 547 tests : unitaires + intégration (vraies sockets) + doctests
+cargo test --workspace                       # 504 tests : le noyau + macros incluses (jeu par défaut)
+cargo test --workspace --no-default-features # 481 tests : le noyau strict, sans les macros
 cargo clippy --workspace --all-targets --all-features -- -D warnings   # CI stricte
 cargo fmt --check                       # formatage
 ```
@@ -706,13 +728,13 @@ Une lib MCP sans schéma n'est qu'un routeur JSON : les clients ont besoin de l'
 Une lib MCP mono-outil n'a pas besoin d'un runtime async complet pour lire des requêtes et répondre du JSON. Le thread par connexion suffit jusqu'à des centaines de connexions (plafond par défaut : 256). Si votre application est déjà dans un runtime async, l'avez-vous simplement dans le même processus — LiteMCP reste un serveur réseau, appelable en HTTP.
 
 **Pourquoi réécrire HTTP ?**
-Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE mono-événement. Pas de chunked entrant, pas de TLS, pas de compression. Ce choix est **tranché par les tests** : le bench maison contre le backend alternatif testé (tiny_http) montre la route maison ~1,85× plus rapide en keep-alive et 0 dépendance de plus (voir [Benchmarks](#benchmarks)) — et elle embarque son durcissement (timeouts, limites d'en-têtes, `Expect: 100-continue`).
+Le périmètre est volontairement minuscule : une route POST, `Content-Length`, keep-alive, un writer SSE (un événement de réponse, ou N `notifications/progress` puis la réponse). Pas de chunked entrant, pas de TLS, pas de compression. Ce choix est **tranché par les tests** : le bench maison contre le backend alternatif testé (tiny_http) montre la route maison ~1,85× plus rapide en keep-alive et 0 dépendance de plus (voir [Benchmarks](#benchmarks)) — et elle embarque son durcissement (timeouts, limites d'en-têtes, `Expect: 100-continue`).
 
 **Pourquoi pas de WebSocket ?**
 Choix architectural, pas un oubli : WS n'économiserait que le re-parsing des en-têtes HTTP (~1–2 % du trajet — JSON, syscalls et noyau réseau dominent), ne passe pas bien derrière les proxies d'hébergement, et traînerait sessions et reconnexions — les trois choses que le mode stateless évite. La spec 2026-07-28 est HTTP-only ; le keep-alive one-write de LiteMCP est déjà au plancher de TCP.
 
 **Pourquoi pas de SSE longue durée ?**
-Le mode stateless n'a aucun flux ouvert : chaque POST est auto-suffisant (un événement `data:`, clôture). C'est ce choix qui immunise le transport contre le tamponnage des proxies de VPS et le rend trivial à déployer derrière nginx — voir [Hébergement VPS & proxies](#hébergement-vps--proxies-le-piège-du-tamponnage-sse). Un flux permanent (progress, notifications serveur→client) exigerait des sessions : hors périmètre, réévalué si un besoin concret l'exige.
+Le mode stateless n'a aucun flux **permanent** : chaque POST est auto-suffisant, et un flux éventuel (`text/event-stream`, `notifications/progress`) reste **request-scoped** — il s'ouvre pour la durée du handler et se referme avec l'événement de réponse. C'est ce choix qui immunise le transport contre le tamponnage des proxies de VPS et le rend trivial à déployer derrière nginx — voir [Hébergement VPS & proxies](#hébergement-vps--proxies-le-piège-du-tamponnage-sse). Un flux permanent (abonnements, notifications hors requête) exigerait des sessions : hors périmètre, réévalué si un besoin concret l'exige.
 
 **Comment sont choisies les versions ?**
 Pacement volontaire : toute modification atterrit d'abord dans la section `[Unreleased]` du [CHANGELOG](CHANGELOG.md) ; une version n'est coupée que pour un lot cohérent (fonction, correctif, doc majeure). Le `0.x` court jusqu'à la conformance officielle MCP verte ; la mention « 1.0 » attend ce jalon.

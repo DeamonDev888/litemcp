@@ -1,7 +1,7 @@
 name: conformance
 
 # Gate de conformance officielle MCP 2026-07-28 contre la fixture dédiée
-# `examples/conformance_server.rs` — **pas** contre `examples/hello` (un score
+# `examples/conformance_server/` — **pas** contre `examples/hello` (un score
 # pris sur hello n'est pas un score de conformité : hello ne porte pas les
 # fixtures `test_*`).
 #
@@ -80,7 +80,10 @@ jobs:
         # Pas de `--locked` : `Cargo.lock` n'est pas versionné (convention lib du
         # dépôt, cf. ci.yml) — sur un checkout neuf, `--locked` échoue faute de
         # fichier de verrouillage à respecter.
-        run: cargo build --release --example conformance_server
+        # `--features schemars` : publie `json_schema_2020_12_tool` (scénario
+        # pending, non scoré) depuis le document JSON Schema 2020-12 brut — la
+        # feature reste opt-in, le cœur garde serde + serde_json seuls.
+        run: cargo build --release --example conformance_server --features schemars
 
       - name: Démarrage de la fixture (arrière-plan)
         run: |

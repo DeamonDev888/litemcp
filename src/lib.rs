@@ -111,7 +111,8 @@
 //!
 //! Spec cible : MCP **2026-07-28** — protocole **stateless**, sans handshake :
 //! chaque message est un `POST /mcp`, la réponse arrive en `application/json`
-//! (ou en `text/event-stream` si le client ne demande que du SSE).
+//! (ou en `text/event-stream` si le client ne demande que du SSE, ou s'il
+//! fournit un jeton de progression).
 //!
 //! - `server/discover` : implémentée (SEP-2575) — annonce les versions
 //!   supportées, les capacités (`tools`, `resources`, `prompts` — toujours
@@ -144,6 +145,13 @@
 //!   (la consommation unique, si requise, est à imposer dans le handler) ;
 //!   **aucune capacité serveur supplémentaire n'est annoncée** — rien
 //!   n'est servi au-delà des résultats `input_required` ;
+//! - progression **request-scoped** : un client qui envoie
+//!   `params._meta.progressToken` **et** accepte `text/event-stream` reçoit
+//!   les `notifications/progress` émises par
+//!   [`progress::report`] pendant l'exécution du handler, avant
+//!   l'événement de réponse, puis la connexion est fermée. Le jeton est
+//!   toujours repris de la requête (jamais choisi par le handler) ; sans
+//!   jeton, sans flux SSE ou après la réponse, `report` est une non-action ;
 //! - version de protocole : lue dans `_meta`, refusée en `-32022` si
 //!   inconnue ; son absence est tolérée (compatibilité `2025-11-25`) ;
 //! - `Mcp-Method` / `Mcp-Name` : acceptés et vérifiés contre le corps
@@ -184,6 +192,10 @@ pub mod error;
 pub mod gateway;
 pub mod http;
 pub mod jsonrpc;
+/// Progression **request-scoped** — `notifications/progress` poussées pendant
+/// qu'un handler s'exécute, sur le flux SSE du POST (jeton fourni par le
+/// client). Voir [`progress`].
+pub mod progress;
 /// Macros `#[tool]`/`#[resource]`/`#[prompt]` (incluses par défaut) — voir
 /// [`litemcp_macros`].
 #[cfg(feature = "macros")]
@@ -255,12 +267,14 @@ pub mod prelude {
     pub use crate::http::{RequestContext, RequestRejection, ServerHandle};
     #[cfg(feature = "macros")]
     pub use crate::macros::{prompt, resource, tool};
+    pub use crate::progress;
     pub use crate::protocol::{
         AudioContent, BlobResourceContents, CacheScope, CallToolResult, CompleteReference,
         Completion, CompletionArgument, CompletionRequest, ContentBlock, EmbeddedResourceContent,
-        ImageContent, InputRequiredSpec, META_CLIENT_CAPABILITIES, META_PROTOCOL_VERSION,
-        PROTOCOL_VERSION, PromptArgument, PromptMessage, ResourceData, ResourceLinkContent,
-        ResourceTemplate, ResultType, SUPPORTED_VERSIONS, TextContent, ToolAnnotations,
+        ImageContent, InputRequiredSpec, META_CLIENT_CAPABILITIES, META_PROGRESS_TOKEN,
+        META_PROTOCOL_VERSION, NOTIFICATION_PROGRESS, PROTOCOL_VERSION, PromptArgument,
+        PromptMessage, ResourceData, ResourceLinkContent, ResourceTemplate, ResultType,
+        SUPPORTED_VERSIONS, TextContent, ToolAnnotations,
     };
     #[cfg(feature = "schemars")]
     pub use crate::schemars::{from_json_schema, from_schemars};

@@ -6,8 +6,9 @@
 # dessous. Quatre jobs séquentiels :
 #   1. `verify` — cohérence des versions (cargo metadata : racine = tag/input,
 #      macros = exigence exacte de la dépendance, section CHANGELOG présente)
-#      PUIS gate qualité (fmt workspace, clippy -D warnings, tests, doc,
-#      contenu des deux paquets — scripts/release.ps1) ;
+#      PUIS gate qualité (fmt workspace, clippy -D warnings, tests all-features
+#      ET sans features par défaut, chaque feature isolée, doc rustdoc stricte
+#      RUSTDOCFLAGS=-D warnings, contenu des deux paquets — scripts/release.ps1) ;
 #   2. `publish` — publication crates.io IDEMPOTENTE via scripts/release.ps1
 #      : litemcp-macros d'abord, puis litemcp ; le job REVALIDE lui-même les
 #      versions (`cargo metadata`) juste avant le premier `cargo publish`,
@@ -51,7 +52,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Verifier (coherence des versions + simulations + fmt, clippy, tests, doc)
+    name: Verifier (coherence des versions + simulations + fmt, clippy, tests, matrice de features, doc stricte)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

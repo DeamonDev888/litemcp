@@ -83,6 +83,14 @@ pub fn is_protocol_notification(method: &str) -> bool {
     method.starts_with("notifications/")
 }
 
+/// Clé `params._meta` portant le jeton de progression fourni par le client
+/// (`notifications/progress` — le serveur reprend **ce** jeton, il ne
+/// l'invente jamais).
+pub const META_PROGRESS_TOKEN: &str = "progressToken";
+
+/// Nom de la méthode `notifications/progress` (spec MCP).
+pub const NOTIFICATION_PROGRESS: &str = "notifications/progress";
+
 /// Type de résultat — champ **obligatoire** dans chaque `result` (SEP-2322).
 ///
 /// * `"complete"` : résultat ordinaire, terminal ;

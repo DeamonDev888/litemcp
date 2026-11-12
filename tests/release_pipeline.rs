@@ -13,7 +13,13 @@
 //!      (une liaison `-Param ""` dépend de l'hôte qui lance PowerShell) ; le
 //!      tag n'est jamais passé en argument : le script le dérive de `GITHUB_REF`
 //!      (source unique, un tag présent ne peut pas être ignoré en silence) ;
-//!   6. les licences MIT/Apache accompagnent le paquet `litemcp-macros`.
+//!   6. les licences MIT/Apache accompagnent le paquet `litemcp-macros` ;
+//!   7. la CI exécute la **matrice de features** (`--no-default-features`,
+//!      chaque feature isolée) et construit la doc avec `RUSTDOCFLAGS=-D
+//!      warnings` — le gate `verify` de release exécute les mêmes contrôles ;
+//!   8. les deux versions de crate sont alignées (exigence racine =
+//!      `litemcp-macros`) et la sonde d'audit privée reste hors de la crate
+//!      publiée (jamais d'avertissement `cargo package` ni de fuite).
 //!
 //! `.github/` est exclu du paquet crates.io (`exclude` du manifeste) : ces
 //! assertions ne concernent que l'arbre du dépôt et sont donc ignorées dans
@@ -367,6 +373,144 @@ fn workflows_never_pass_an_empty_version_argument() {
             "{name} : l'appel de cohérence doit n'ajouter que les arguments non vides"
         );
     }
+}
+
+/// Version déclarée par un manifeste (première ligne `version = "…"`).
+///
+/// Volontairement sans dépendance TOML : le manifeste racine et celui de
+/// `litemcp-macros` sont de forme connue, un parseur complet serait une
+/// dépendance de plus pour trois lignes.
+fn manifest_version(manifest: &str) -> Option<String> {
+    manifest.lines().map(str::trim).find_map(|line| {
+        line.strip_prefix("version = ")
+            .and_then(|value| value.trim().trim_matches('"').split('"').next())
+            .map(str::to_string)
+    })
+}
+
+/// Exigence de version de la dépendance `litemcp-macros` du manifeste racine.
+fn macros_requirement(manifest: &str) -> Option<String> {
+    let line = manifest
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("litemcp-macros = "))?;
+    let after_key = line.split("version = ").nth(1)?;
+    after_key.split('"').nth(1).map(str::to_string)
+}
+
+#[test]
+fn feature_matrix_is_enforced_in_ci_and_release_gate() {
+    // `--all-features` ne prouve rien des configurations servies aux
+    // utilisateurs : le noyau sans features par défaut et chaque feature
+    // isolée sont des surfaces publiques. Les mêmes commandes doivent tourner
+    // en CI (retour rapide) et dans le gate de release (avant publication).
+    const COMMANDS: [&str; 3] = [
+        "cargo test --workspace --no-default-features",
+        "cargo check -p litemcp --no-default-features --features macros",
+        "cargo check -p litemcp --no-default-features --features schemars",
+    ];
+
+    let Some(ci) = workflow("ci.yml") else {
+        return;
+    };
+    for command in COMMANDS {
+        assert!(
+            ci.contains(command),
+            "ci.yml : la matrice de features doit exécuter `{command}`"
+        );
+    }
+
+    // `scripts/` est exclu du paquet crates.io : dans une crate empaquetée,
+    // le gate de release n'est pas là et l'assertion est sans objet.
+    let Ok(release) = std::fs::read_to_string(workspace().join("scripts").join("release.ps1"))
+    else {
+        eprintln!("scripts/release.ps1 absent (paquet crates.io) — assertion ignorée");
+        return;
+    };
+    for command in COMMANDS {
+        assert!(
+            release.contains(command),
+            "release.ps1 (verify) : la matrice de features doit exécuter `{command}`"
+        );
+    }
+}
+
+#[test]
+fn rustdoc_warnings_are_denied_in_ci_and_release_gate() {
+    // Un lien intra-doc cassé ou redondant ne doit jamais passer en silence :
+    // la doc est construite avec `-D warnings` sur TOUT le workspace.
+    let Some(ci) = workflow("ci.yml") else {
+        return;
+    };
+    assert!(
+        ci.contains("RUSTDOCFLAGS: -D warnings") || ci.contains("RUSTDOCFLAGS=\"-D warnings\""),
+        "ci.yml : la doc doit être construite avec RUSTDOCFLAGS=-D warnings"
+    );
+    assert!(
+        ci.contains("cargo doc --workspace --no-deps --all-features"),
+        "ci.yml : la doc doit couvrir tout le workspace"
+    );
+
+    let Ok(release) = std::fs::read_to_string(workspace().join("scripts").join("release.ps1"))
+    else {
+        eprintln!("scripts/release.ps1 absent (paquet crates.io) — assertion ignorée");
+        return;
+    };
+    assert!(
+        release.contains("$env:RUSTDOCFLAGS = '-D warnings'"),
+        "release.ps1 : le gate de doc doit poser RUSTDOCFLAGS=-D warnings"
+    );
+    assert!(
+        release.contains("cargo doc --workspace --no-deps --all-features"),
+        "release.ps1 : le gate de doc doit couvrir tout le workspace"
+    );
+}
+
+#[test]
+fn crate_versions_are_aligned() {
+    // crates.io refuse une dépendance versionnée non publiée : un bump de
+    // `litemcp-macros` sans son exigence racine (ou l'inverse) fait échouer la
+    // publication de `litemcp` APRÈS celle des macros. Une version publiée est
+    // immuable — le bump doit donc toujours toucher les deux manifestes.
+    let root = workspace();
+    let root_manifest =
+        std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml racine lisible");
+    let Ok(macros_manifest) =
+        std::fs::read_to_string(root.join("litemcp-macros").join("Cargo.toml"))
+    else {
+        eprintln!("litemcp-macros absent (paquet crates.io) — assertion ignorée");
+        return;
+    };
+    let macros_version = manifest_version(&macros_manifest)
+        .expect("version déclarée dans litemcp-macros/Cargo.toml");
+    let requirement = macros_requirement(&root_manifest)
+        .expect("exigence `litemcp-macros = { … version = \"X.Y.Z\" }` dans Cargo.toml racine");
+    assert_eq!(
+        requirement, macros_version,
+        "l'exigence `litemcp-macros` du manifeste racine doit être exactement la version publiée de la macros \
+         (une version crates.io est immuable : bump macros ET exigence ensemble)"
+    );
+}
+
+#[test]
+fn audit_probe_stays_out_of_the_published_crate() {
+    // Sonde d'audit locale (`examples/audit_target.rs`, ignorée par Git) :
+    // laissée dans `examples/`, elle n'est pas dans le paquet et `cargo
+    // package` avertit à chaque empaquetage. Elle vit donc dans `.zwork/`,
+    // exclue par construction ; l'exclusion explicite reste en défense en
+    // profondeur si une copie réapparaît le temps d'une campagne.
+    let root = workspace();
+    let manifest =
+        std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml racine lisible");
+    assert!(
+        manifest.contains("\"examples/audit_target.rs\""),
+        "Cargo.toml : la sonde d'audit doit rester explicitement exclue du paquet"
+    );
+    assert!(
+        !root.join("examples").join("audit_target.rs").exists(),
+        "examples/audit_target.rs est une sonde privée : elle vit dans .zwork/ (sinon `cargo package` \
+         avertit et le fichier n'est de toute façon jamais publié)"
+    );
 }
 
 #[test]

@@ -1,7 +1,7 @@
 {
   "revision": "2026-07-28",
   "harness": "@modelcontextprotocol/conformance@0.2.0-alpha.12",
-  "updated": "2026-11-09",
+  "updated": "2026-11-11",
   "policy": "Le gate échoue sur tout échec scoré absent de cette liste (nouvelle régression) ET sur toute entrée devenue verte (baseline périmée — elle doit rester vide ou strictement décroissante). Chaque entrée porte une justification datée ; une entrée sans date ou sans cause vérifiable est interdite.",
   "scored_scenarios_provenance": "Copie gelée de la section server: de requirements/2026-07-28.yaml du harness épinglé @modelcontextprotocol/conformance@0.2.0-alpha.12 (SHA-256 du YAML : AE2F4F6210FD729E2E318EDD5BBFA31A43CEE0BC608E48052FA26DBF1D939B57, identique octet pour octet à la copie upstream). Mettre à jour uniquement si la version du harness change.",
   "expected_server_scenario_count": 50,
@@ -59,72 +59,5 @@
     "http-header-validation",
     "http-custom-header-server-validation"
   ],
-  "expected_failures": [
-    {
-      "scenario": "tools-call-with-progress",
-      "date": "2026-11-09",
-      "reason": "Transport stateless sans canal de notifications pendant l'exécution d'un handler (la réponse part en un seul write après calcul) — les 3 notifications/progress exigées ne peuvent pas être livrées. Sujet transport séparé de la feuille de route (annulation/notifications) ; le tool test_tool_with_progress répond correctement.",
-      "evidence": ".zwork/conformance/results-fixture-2026-11-09/server-tools-call-with-progress-*"
-    },
-    {
-      "scenario": "input-required-result-basic-elicitation",
-      "date": "2026-11-09",
-      "reason": "MRTR/SEP-2322 : aucun handler LiteMCP ne peut produire resultType=input_required (inputRequests/requestState) — sujet dédié « Combler ou assumer les surfaces MCP manquantes » de la feuille de route. Fixture : outil non enregistré.",
-      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
-    },
-    {
-      "scenario": "input-required-result-basic-sampling",
-      "date": "2026-11-09",
-      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
-      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
-    },
-    {
-      "scenario": "input-required-result-basic-list-roots",
-      "date": "2026-11-09",
-      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
-      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
-    },
-    {
-      "scenario": "input-required-result-request-state",
-      "date": "2026-11-09",
-      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
-      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
-    },
-    {
-      "scenario": "input-required-result-multiple-input-requests",
-      "date": "2026-11-09",
-      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
-      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
-    },
-    {
-      "scenario": "input-required-result-multi-round",
-      "date": "2026-11-09",
-      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
-      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
-    },
-    {
-      "scenario": "input-required-result-non-tool-request",
-      "date": "2026-11-09",
-      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation (prompts/get doit aussi produire input_required).",
-      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
-    },
-    {
-      "scenario": "input-required-result-result-type",
-      "date": "2026-11-09",
-      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
-      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
-    },
-    {
-      "scenario": "input-required-result-tampered-state",
-      "date": "2026-11-09",
-      "reason": "MRTR/SEP-2322 — l'outil test_input_required_result_tampered_state ne peut pas exister tant que requestState n'existe pas.",
-      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
-    },
-    {
-      "scenario": "input-required-result-capability-check",
-      "date": "2026-11-09",
-      "reason": "MRTR/SEP-2322 — voir input-required-result-basic-elicitation.",
-      "evidence": ".zwork/conformance/results-fixture-2026-11-09/"
-    }
-  ]
+  "expected_failures": []
 }

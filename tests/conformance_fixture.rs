@@ -35,6 +35,15 @@ const SCORED_TOOLS: &[&str] = &[
     "test_streaming_elicitation",
     "test_logging_tool",
     "test_missing_capability",
+    // Scénarios `input-required-result-*` (SEP-2322) — cycle MRTR.
+    "test_input_required_result_elicitation",
+    "test_input_required_result_sampling",
+    "test_input_required_result_list_roots",
+    "test_input_required_result_request_state",
+    "test_input_required_result_multiple_inputs",
+    "test_input_required_result_multi_round",
+    "test_input_required_result_tampered_state",
+    "test_input_required_result_capabilities",
 ];
 
 const SCORED_PROMPTS: &[&str] = &[
@@ -42,6 +51,8 @@ const SCORED_PROMPTS: &[&str] = &[
     "test_prompt_with_arguments",
     "test_prompt_with_embedded_resource",
     "test_prompt_with_image",
+    // `prompts/get` supporte le MRTR (scénario non-tool-request).
+    "test_input_required_result_prompt",
 ];
 
 const SCORED_RESOURCES: &[&str] = &[
@@ -287,7 +298,9 @@ fn tools_call_scored_content_shapes() {
     assert_result_ok("tools/call test_error_handling", status, &v);
     assert_eq!(v["result"]["isError"], true, "isError attendu : {v}");
 
-    // Progression — répond sans canal de notifications (baseline datée).
+    // Progression — sans jeton, aucune notification : le flux JSON reste
+    // unique (le canal request-scoped est couvert par
+    // `tests/mcp_progress_channel.rs`).
     let (status, v) = rpc(
         addr,
         "tools/call",

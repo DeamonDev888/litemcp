@@ -2,12 +2,14 @@
 //!
 //! Une seule route (`POST /mcp` par défaut) : chaque message JSON-RPC est un
 //! POST, la réponse arrive en `application/json` ou en `text/event-stream`
-//! (SSE request-scoped, un seul événement de réponse) selon l'en-tête
-//! `Accept`. Pas de session, pas de listener `GET` (405), garde
-//! DNS-rebinding sur `Origin`. **Pas d'annulation MCP** : le flux n'est
-//! ouvert qu'après calcul complet du handler — une déconnexion client
-//! pendant l'exécution n'est détectée qu'à l'écriture finale (une seule
-//! écriture, jamais de réécriture) et aucun jeton d'annulation n'est exposé
+//! selon l'en-tête `Accept`. Un flux SSE reste **request-scoped** : sans jeton
+//! de progression, un seul événement de réponse ; avec
+//! `params._meta.progressToken`, les `notifications/progress` du handler
+//! ([`crate::progress`]) précèdent l'événement de réponse et la connexion est
+//! fermée à la fin. Pas de session, pas de listener `GET` (405), garde
+//! DNS-rebinding sur `Origin`. **Pas d'annulation MCP** : une déconnexion
+//! client pendant l'exécution n'est détectée qu'à l'écriture (réponse finale
+//! ou notification de progression) et aucun jeton d'annulation n'est exposé
 //! aux handlers (voir le commentaire au point d'écriture SSE).
 //!
 //! Durcissement :
@@ -68,12 +70,14 @@
 //!   `panic = "abort"` neutralise `catch_unwind` — une panique de handler
 //!   arrête alors le processus entier.
 
+use crate::progress::ProgressChannel;
 use crate::server::ServerCore;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -1945,13 +1949,56 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
             return Ok(());
         }
 
+        // En-têtes de routage MCP (SEP-2243) — construits une seule fois :
+        // le chemin `notifications/progress` et le chemin nominal partagent
+        // le même verdict de cohérence.
+        let headers = crate::server::McpHeaders {
+            protocol_version: mcp_protocol_version,
+            method: mcp_method,
+            name: mcp_name,
+            params: mcp_params,
+        };
+
+        // **Progression request-scoped** : le client a fourni un jeton ET
+        // accepte `text/event-stream` → la réponse est un flux SSE ouvert
+        // AVANT le dispatch, alimenté par `progress::report` pendant
+        // l'exécution et refermé par l'événement de réponse. C'est le seul
+        // chemin où le handler écrit avant la réponse finale ; il reste
+        // borné à une requête (pas de flux longue durée, pas de session) et
+        // la connexion est fermée à la fin pour qu'aucune écriture tardive
+        // d'un handler détaché ne puisse atteindre une requête suivante.
+        // Sans jeton, le transport garde sa réponse en un seul write.
+        //
+        // Conséquence du streaming : la tête part en `200 OK` et le verdict
+        // JSON-RPC (succès **ou** erreur) voyage dans l'événement final — un
+        // statut 4xx ne peut plus être annoncé une fois le flux ouvert.
+        if accept_sse {
+            if let Some(token) = progress_token_of(&body) {
+                respond_stream_head(&mut stream, response_version)?;
+                let channel = Arc::new(SseProgressChannel::new(stream.try_clone()?, token));
+                let dispatch_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    core.dispatch_request_with_progress(&body, Some(&headers), channel.clone())
+                }));
+                let reply = match dispatch_result {
+                    Ok(Some(resp)) => Some(resp.body),
+                    Ok(None) => None,
+                    Err(_) => Some(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": extract_request_id(&body),
+                            "error": { "code": -32603, "message": "internal error" }
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    ),
+                };
+                channel.finish(reply.as_deref())?;
+                shutdown_gracefully(&mut stream);
+                break;
+            }
+        }
+
         let dispatch_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let headers = crate::server::McpHeaders {
-                protocol_version: mcp_protocol_version,
-                method: mcp_method,
-                name: mcp_name,
-                params: mcp_params,
-            };
             core.dispatch_request(&body, Some(&headers))
         }));
 
@@ -2008,30 +2055,31 @@ fn handle_connection(stream: TcpStream, env: ConnectionEnv<'_>) -> std::io::Resu
             }
         };
 
-        // SSE request-scoped : le client ne veut qu'un flux d'événements.
+        // SSE request-scoped (sans jeton de progression) : le client ne veut
+        // qu'un flux d'événements, et la réponse tient en un seul événement.
         //
-        // Choix architectural assumé : **pas de SSE longue durée** (progress,
-        // notifications serveur→client). Le mode stateless ne tient aucun
-        // flux ouvert — un POST, un événement, clôture. C'est ce qui rend le
+        // **Pas de SSE longue durée** : aucun flux n'est tenu entre deux
+        // requêtes — un POST, un événement, clôture. La seule exception est
+        // le flux de progression ouvert plus haut, borné à la durée du
+        // handler et refermé par l'événement de réponse. C'est ce qui rend le
         // transport immunisé contre les proxies de VPS qui tamponnent les
         // flux en cours (empilement jusqu'au seuil de leur buffer) : une
-        // réponse terminée, avec `Connection: close` et un `Content-Length`
-        // explicite, est toujours poussée par le proxy.
+        // réponse terminée porte un `Content-Length` explicite et un
+        // `Connection: close` qui la font toujours pousser par le proxy.
         //
-        // Contrat de transport pour tout futur écrivain SSE : flusher après
+        // Contrat de transport pour tout écrivain SSE : flusher après
         // CHAQUE événement (`respond` fait `write_all` + `flush`) et porter
         // [`SSE_ANTI_BUFFERING`].
         //
-        // **Annulation non supportée (documentée, sciemment)** : le flux n'est
-        // ouvert qu'APRÈS calcul complet du handler — une déconnexion client
-        // pendant l'exécution n'est détectée qu'ici, à l'écriture (échec →
-        // connexion fermée, et il n'y a qu'une écriture : aucune écriture
-        // ultérieure n'existe). Aucun jeton d'annulation n'est exposé aux
-        // handlers : un handler bloquant termine toujours (Rust n'a pas
-        // d'annulation de thread) et `notifications/cancelled` n'est pas
-        // implémentée. Le transport ne prétend donc pas à la conformité
-        // d'annulation MCP — l'évolution (jeton coopératif + watcher borné)
-        // est chiffrée dans le CHANGELOG « Prévu ».
+        // **Annulation non supportée (documentée, sciemment)** : sur un flux
+        // de progression, une déconnexion client n'est détectée qu'à la
+        // première écriture qui échoue — le canal est alors fermé, mais le
+        // handler n'est pas interrompu (Rust n'a pas d'annulation de thread)
+        // et `notifications/cancelled` n'est pas implémentée. Aucun jeton
+        // d'annulation n'est exposé aux handlers : le transport ne prétend
+        // donc pas à la conformité d'annulation MCP — l'évolution (jeton
+        // coopératif + watcher borné) est chiffrée dans le CHANGELOG
+        // « Prévu ».
         if accept_sse && !accept_json {
             let event = format_sse_event(&reply);
             respond_version(
@@ -2354,6 +2402,139 @@ fn starts_a_request_line(buffer: &[u8]) -> bool {
         // doivent être des `tchar` (un préfixe de méthode valide).
         None => line.iter().all(|&b| is_tchar(b)),
     }
+}
+
+/// Marqueur de recherche rapide avant de parser le corps : la quasi-totalité
+/// des requêtes ne porte pas de jeton de progression, et un `windows()` sur
+/// 13 octets est moins coûteux qu'un parsing JSON systématique.
+const PROGRESS_TOKEN_MARKER: &[u8] = b"progressToken";
+
+/// Jeton `params._meta.progressToken` d'une requête **actionnable**.
+///
+/// Une notification (sans `id`) ne reçoit aucun flux ; les méthodes non
+/// actionnables n'exécutent rien qui puisse rapporter une progression. Le
+/// jeton doit être une chaîne ou un nombre (forme fil de la spec).
+fn progress_token_of(body: &[u8]) -> Option<serde_json::Value> {
+    if !body
+        .windows(PROGRESS_TOKEN_MARKER.len())
+        .any(|window| window == PROGRESS_TOKEN_MARKER)
+    {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let request = value.as_object()?;
+    request.get("id")?;
+    let method = request.get("method")?.as_str()?;
+    if !crate::protocol::is_action(method) {
+        return None;
+    }
+    let token = request
+        .get("params")?
+        .get("_meta")?
+        .get(crate::protocol::META_PROGRESS_TOKEN)?;
+    match token {
+        serde_json::Value::String(_) | serde_json::Value::Number(_) => Some(token.clone()),
+        _ => None,
+    }
+}
+
+/// État d'écriture du flux de progression — sérialisé entre le fil du
+/// handler (`tool_timeout`) et le fil de connexion (événement final).
+struct ProgressWriter {
+    stream: TcpStream,
+    token: serde_json::Value,
+    closed: bool,
+}
+
+/// Canal `notifications/progress` d'une requête servie en SSE.
+///
+/// Le jeton vient de la requête (jamais du handler) et chaque émission
+/// reprend la forme fil de la spec. `closed` est posé **avant** l'écriture
+/// de l'événement final : une émission tardive d'un handler détaché est
+/// ignorée, jamais intercalée dans la réponse ni dans une requête suivante.
+struct SseProgressChannel {
+    writer: Mutex<ProgressWriter>,
+}
+
+impl SseProgressChannel {
+    fn new(stream: TcpStream, token: serde_json::Value) -> Self {
+        Self {
+            writer: Mutex::new(ProgressWriter {
+                stream,
+                token,
+                closed: false,
+            }),
+        }
+    }
+
+    /// Ferme le canal puis écrit l'événement de réponse final (s'il y en a
+    /// un). Aucune notification ne peut suivre.
+    fn finish(&self, reply: Option<&[u8]>) -> std::io::Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        writer.closed = true;
+        if let Some(reply) = reply {
+            writer.stream.write_all(&format_sse_event(reply))?;
+        }
+        writer.stream.flush()
+    }
+}
+
+impl ProgressChannel for SseProgressChannel {
+    fn progress(&self, progress: f64, total: Option<f64>, message: Option<&str>) -> bool {
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if writer.closed {
+            return false;
+        }
+        let mut params = serde_json::Map::new();
+        params.insert("progressToken".to_string(), writer.token.clone());
+        params.insert("progress".to_string(), serde_json::json!(progress));
+        if let Some(total) = total {
+            params.insert("total".to_string(), serde_json::json!(total));
+        }
+        if let Some(message) = message {
+            params.insert(
+                "message".to_string(),
+                serde_json::Value::String(message.to_string()),
+            );
+        }
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": crate::protocol::NOTIFICATION_PROGRESS,
+            "params": params,
+        });
+        let Ok(payload) = serde_json::to_vec(&notification) else {
+            return false;
+        };
+        if writer
+            .stream
+            .write_all(&format_sse_event(&payload))
+            .and_then(|()| writer.stream.flush())
+            .is_err()
+        {
+            // Client parti : plus aucune écriture sur ce descripteur.
+            writer.closed = true;
+            return false;
+        }
+        true
+    }
+}
+
+/// Tête d'une réponse SSE **ouverte avant le dispatch** : pas de
+/// `Content-Length` (le corps est délimité par la fermeture), anti-tampon
+/// pour les proxies, et `Connection: close` pour qu'aucune écriture tardive
+/// ne puisse être lue comme la réponse d'une requête suivante.
+fn respond_stream_head(stream: &mut impl Write, version: &str) -> std::io::Result<()> {
+    write!(
+        stream,
+        "{version} 200 OK\r\n{SSE_ANTI_BUFFERING}Content-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+    )?;
+    stream.flush()
 }
 
 /// Formate une charge utile en événement SSE (`data: ...\n\n`) en

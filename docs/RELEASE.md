@@ -16,16 +16,21 @@ Ce document décrit le pipeline de publication d'une version de LiteMCP (crates 
 
 `litemcp` dépend de sa crate macros avec une **exigence de version** (`litemcp-macros = { path = "litemcp-macros", version = "X.Y.Z" }`). crates.io refuse de publier un crate dont une dépendance versionnée n'existe pas encore sur l'index : **la macros part donc toujours la première**, et le `version = "…"` de la dépendance dans le `Cargo.toml` de `litemcp` est **aligné** sur la version qui vient d'être publiée. Après chaque publication, l'index met quelques secondes à propager — c'est pourquoi la publication de `litemcp` suit (les workflows interrogent d'ailleurs l'API crates.io et attendent l'indexation avant d'enchaîner).
 
+**Une version publiée est immuable** : dès que le contenu de `litemcp-macros` change (correctif de macro, licence ajoutée au paquet…), il faut **bumper la macros** (`0.4.0` → `0.4.1`) et **aligner l'exigence de la dépendance racine**, jamais republier la même version. La racine suit le mouvement (`litemcp` passe en `0.10.N+1`) puisque son manifeste change ; une version déjà en ligne est définitivement figée sur crates.io. Tant que la macros n'est pas publiée, `cargo package -p litemcp` (résolution des dépendances) échoue — attendu : `cargo package --list` reste utilisable, et le pipeline publie les macros d'abord.
+
 ## Séquence exacte (locale)
 
 Depuis la racine du workspace, sur un arbre propre, commité et à jour de `main` :
 
 ```bash
 # 1. Vérifications — exactement les étapes du job `verify` du workflow Release
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo doc --no-deps --all-features
+cargo test --workspace --no-default-features
+cargo check -p litemcp --no-default-features --features macros
+cargo check -p litemcp --no-default-features --features schemars
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
 # 2. Bump de version — litemcp-macros D'ABORD, puis litemcp
 #    litemcp-macros/Cargo.toml : version = "X.Y.Z"
@@ -66,12 +71,12 @@ Deux chemins sont autorisés et aboutissent au même état : publier localement 
 
 ## Automatisation — quel workflow fait quoi
 
-Tous les contrôles de publication vivent dans **`scripts/release.ps1`** (source unique, exécuté par les deux workflows sous `pwsh`) : `semver` (regex SemVer complète — toutes les combinaisons numériques, `0.10.10` inclus), `check` (cohérence dérivée de `cargo metadata` : racine = tag/input, `litemcp-macros` = exigence exacte de la dépendance racine, section `## [X.Y.Z]` du CHANGELOG ; le tag est lu dans `GITHUB_REF`, donc aucun argument optionnel vide ne peut faire disparaître le contrôle), `verify` (gate qualité : **simulations du pipeline** via `scripts/release-tests.ps1`, puis fmt workspace, clippy `-D warnings`, tests, doc, contenu des deux paquets — licences MIT/Apache, README) et `publish` (crates.io avec distinction stricte `200`/`404`/autre : une erreur réseau n'est **jamais** interprétée comme une preuve d'absence, un « already uploaded » est traité comme déjà-publié).
+Tous les contrôles de publication vivent dans **`scripts/release.ps1`** (source unique, exécuté par les deux workflows sous `pwsh`) : `semver` (regex SemVer complète — toutes les combinaisons numériques, `0.10.10` inclus), `check` (cohérence dérivée de `cargo metadata` : racine = tag/input, `litemcp-macros` = exigence exacte de la dépendance racine, section `## [X.Y.Z]` du CHANGELOG ; le tag est lu dans `GITHUB_REF`, donc aucun argument optionnel vide ne peut faire disparaître le contrôle), `verify` (gate qualité : **simulations du pipeline** via `scripts/release-tests.ps1`, puis fmt workspace, clippy `-D warnings`, tests all-features **et sans features par défaut**, chaque feature isolée (`macros`, `schemars`), doc rustdoc **stricte** (`RUSTDOCFLAGS=-D warnings`, workspace), contenu des deux paquets — licences MIT/Apache, README) et `publish` (crates.io avec distinction stricte `200`/`404`/autre : une erreur réseau n'est **jamais** interprétée comme une preuve d'absence, un « already uploaded » est traité comme déjà-publié).
 
 | Workflow | Déclencheurs | Rôle |
 |---|---|---|
-| [`ci.yml`](../.github/workflows/ci.yml) — **CI** | push `main`, toute pull request | fmt, clippy strict, tests, **simulations du pipeline de publication**, doc, MSRV 1.85, advisories RustSec |
-| [`release.yml`](../.github/workflows/release.yml) — **Release (canonique)** | push de tag `v*`, dispatch manuel | **`verify`** (cohérence des versions PUIS simulations + fmt + clippy + tests + doc + paquets) → **`publish`** (revalidation `check` **puis** crates.io, idempotent, macros d'abord, jeton secret ou OIDC) → **release GitHub** (SEUL job avec `contents: write` ; corps extrait du CHANGELOG) → **notification du tuto** (après la release GitHub) |
+| [`ci.yml`](../.github/workflows/ci.yml) — **CI** | push `main`, toute pull request | fmt, clippy strict, tests, **matrice de features** (sans features par défaut + chaque feature isolée), **simulations du pipeline de publication**, doc rustdoc **stricte** (`RUSTDOCFLAGS=-D warnings`), MSRV 1.85, advisories RustSec |
+| [`release.yml`](../.github/workflows/release.yml) — **Release (canonique)** | push de tag `v*`, dispatch manuel | **`verify`** (cohérence des versions PUIS simulations + fmt + clippy + tests + matrice de features + doc stricte + paquets) → **`publish`** (revalidation `check` **puis** crates.io, idempotent, macros d'abord, jeton secret ou OIDC) → **release GitHub** (SEUL job avec `contents: write` ; corps extrait du CHANGELOG) → **notification du tuto** (après la release GitHub) |
 | [`publish.yml`](../.github/workflows/publish.yml) — **Publication (break-glass)** | dispatch manuel UNIQUEMENT (input `version` obligatoire) — **aucun déclencheur tag** | même gate `verify` que le canonique, même publication idempotente, notification du tuto — pour republier/notifier sans tag (ex. raté crates.io transitoire) |
 
 **Séparation stricte des deux chemins** : le push d'un tag ne déclenche **que** `release.yml` — aucun workflow ne peut plus publier sur tag avant son gate `verify` (l'ancien déclencheur `tags: v*` de `publish.yml` est supprimé ; le groupe de concurrence `publication` reste partagé pour sérialiser un break-glass manuel contre un run canonique en cours, et l'idempotence de `scripts/release.ps1 publish` écarte toute publication en double). **Attention** : GitHub ne conserve qu'**un seul** run en attente par groupe de concurrence — pousser plusieurs tags d'un coup annule les runs en file (constaté : `v0.10.3` annulé pendant que `v0.10.1` et `v0.10.2` tournaient). Poussez les tags **un par un**, et vérifiez la conclusion de chaque run avant de passer au suivant. Les actions GitHub sont épinglées par SHA de commit dans ces deux workflows. La cohérence (`cargo metadata`) est vérifiée **avant** tout `cargo publish` : un tag `vX.Y.Z` différent du manifeste racine, une `litemcp-macros` désalignée de sa dépendance ou une section CHANGELOG manquante stoppent le pipeline en secondes.
@@ -86,6 +91,7 @@ Les actions de **tous** les workflows (`ci.yml`, `release.yml`, `publish.yml`, `
 - **« crate … is not yet indexed »** : la propagation de l'index crates.io n'est pas terminée — attendre quelques minutes et relancer `cargo publish -p litemcp` (les workflows font cette attente automatiquement) ;
 - **« statut invérifiable / crates.io injoignable »** : une erreur réseau ou un code HTTP inattendu (ni 200 ni 404) **arrête le pipeline sans publication** — l'absence d'une version n'est jamais déduite d'un échec réseau ; attendre le rétablissement et relancer le run ;
 - **« OIDC / trusted publishing » en échec** : l'étape `Jeton crates.io par OIDC` ne s'exécute que si `CARGO_REGISTRY_TOKEN` est absent. Si elle échoue, vérifier la configuration *trusted publisher* de la crate sur crates.io (dépôt `DeamonDev888/litemcp`, fichier `.github/workflows/release.yml` **et** `.github/workflows/publish.yml`, environnement éventuel), ou configurer le secret `CARGO_REGISTRY_TOKEN` pour revenir au mode historique ;
-- **La version existe déjà sur crates.io** : une version publiée est **immuable** — couper une nouvelle version `X.Y.(Z+1)` (nouvelle entrée CHANGELOG, nouveau tag) ;
+- **« failed to select a version for the requirement `litemcp-macros = "^X.Y.Z"` »** : la version des macros n'est pas encore sur l'index — publier `litemcp-macros` d'abord (le pipeline le fait), puis `litemcp` ; `cargo package --list` reste utilisable entre-temps ;
+- **La version existe déjà sur crates.io** : une version publiée est **immuable** — couper une nouvelle version `X.Y.(Z+1)` (nouvelle entrée CHANGELOG, nouveau tag) ; si c'est la macros qui change, bumper `litemcp-macros` **et** l'exigence du manifeste racine avant de couper `litemcp` ;
 - **Release GitHub sans corps** : impossible sur le chemin canonique — la cohérence refuse de publier sans la section `## [X.Y.Z]` ; si cela arrive malgré tout (CHANGELOG modifié entre les deux jobs), éditer la release à la main ;
 - **Le job `verify` échoue sur le tag** : ne pas republier sur le même tag — corriger sur `main`, couper la version suivante ; crates.io n'accepte pas de republication d'une version.

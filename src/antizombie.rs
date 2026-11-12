@@ -49,7 +49,7 @@
 //! Opt-in strict : sans `.anti_zombie()`, aucun sweep, aucun drain, aucun
 //! code de plus sur les chemins chauds — les compteurs utilisés
 //! (`live_connections` du [`BoundServer`](crate::http::BoundServer), threads
-//! de handler bornés du [`ServerCore`](crate::server::ServerCore)) existent
+//! de handler bornés du [`ServerCore`]) existent
 //! déjà ; le bilan se contente de les lire.
 //!
 //! ```no_run

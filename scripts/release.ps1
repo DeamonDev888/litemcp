@@ -25,7 +25,10 @@ Sous-commandes :
   verify                          gate qualité : simulations du pipeline
                                   (release-tests.ps1 - aucun secret, aucune
                                   publication), fmt (workspace), clippy
-                                  -D warnings, tests all-features, doc, contenu
+                                  -D warnings, tests all-features ET sans les
+                                  features par défaut, chaque feature isolée
+                                  (macros, schemars), doc rustdoc STRICTE
+                                  (RUSTDOCFLAGS=-D warnings, workspace), contenu
                                   des deux paquets (licences MIT/Apache,
                                   README) - échec = arrêt immédiat.
   publish -Version <x.y.z> [-DryRun]
@@ -153,7 +156,23 @@ function Invoke-VerifyGates {
     Invoke-ReleaseStep 'cargo fmt (workspace)' 'cargo fmt --all -- --check'
     Invoke-ReleaseStep 'cargo clippy (-D warnings)' 'cargo clippy --workspace --all-targets --all-features -- -D warnings'
     Invoke-ReleaseStep 'cargo test (all-features)' 'cargo test --workspace --all-features'
-    Invoke-ReleaseStep 'cargo doc (all-features)' 'cargo doc --no-deps --all-features'
+    # Matrice de features - mêmes commandes que ci.yml : le gate de release ne
+    # peut pas être plus laxiste que la CI. Le noyau sans features par défaut
+    # et chaque feature isolée sont des surfaces publiques distinctes.
+    Invoke-ReleaseStep 'cargo test (sans features par defaut)' 'cargo test --workspace --no-default-features'
+    Invoke-ReleaseStep 'cargo check (feature macros isolee)' 'cargo check -p litemcp --no-default-features --features macros'
+    Invoke-ReleaseStep 'cargo check (feature schemars isolee)' 'cargo check -p litemcp --no-default-features --features schemars'
+    # Doc STRICTE : un lien intra-doc cassé ou redondant rompt la publication.
+    # RUSTDOCFLAGS doit être posé pour le processus enfant lancé par
+    # Invoke-Expression ; restauré ensuite pour ne pas colorer les étapes
+    # suivantes (en cas d'échec le script sort de toute façon).
+    $previousRustdocFlags = $env:RUSTDOCFLAGS
+    $env:RUSTDOCFLAGS = '-D warnings'
+    try {
+        Invoke-ReleaseStep 'cargo doc (workspace, RUSTDOCFLAGS=-D warnings)' 'cargo doc --workspace --no-deps --all-features'
+    } finally {
+        $env:RUSTDOCFLAGS = $previousRustdocFlags
+    }
     Assert-PackageContents
     Write-Host ''
     Write-Host '[verify] gate qualité vert - publication autorisée par le pipeline'

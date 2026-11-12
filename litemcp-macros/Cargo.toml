@@ -1,6 +1,6 @@
 [package]
 name = "litemcp-macros"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Macros procédurales de LiteMCP (#[tool]/#[resource]/#[prompt]) — feature « macros » du crate litemcp."

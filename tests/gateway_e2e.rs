@@ -22,8 +22,9 @@ use litemcp::prelude::*;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 // ---------------------------------------------------------------- helpers
 
@@ -269,12 +270,32 @@ fn une_requete_en_vol_reste_servie_par_son_snapshot() {
     let gw = Arc::new(Gateway::new(ServerBuilder::new("gw", "1.0.0")));
     let compte = Arc::new(AtomicUsize::new(0));
 
-    // Un handler lent : la requête prend le snapshot, puis l'edit a lieu
-    // PENDANT son exécution.
+    // **Synchronisation déterministe, aucune hypothèse temporelle** :
+    // l'ancien `sleep(50 ms)` supposait que le thread de requête avait déjà
+    // pris son snapshot avant l'edit — l'ordonnanceur ne le garantit pas
+    // (test intermittent : l'edit gagne la course, l'outil est déjà retiré
+    // au dispatch et l'appel rend `-32602`). Le handler signale son ENTRÉE
+    // (il ne peut s'exécuter qu'après le `snapshot()` du dispatch), le
+    // thread principal attend ce signal avant de retirer l'outil, puis
+    // autorise le handler à terminer : l'invariant « requête en vol servie
+    // par son ancien snapshot » est tenu par construction, pas par chance.
+    let (entree_tx, entree_rx) = mpsc::channel::<()>();
+    let (poursuite_tx, poursuite_rx) = mpsc::channel::<()>();
+    // `Receiver` n'est pas `Sync` : le handler est `Send + Sync`, d'où le
+    // `Mutex` (un seul thread de requête consomme l'autorisation).
+    let poursuite_rx = Mutex::new(poursuite_rx);
+
     let c = Arc::clone(&compte);
     gw.edit(|b| {
         b.tool("lent", "handler lent", move |_a| {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            entree_tx
+                .send(())
+                .expect("le test doit être en attente de l'entrée");
+            poursuite_rx
+                .lock()
+                .expect("verrou de poursuite non empoisonné")
+                .recv()
+                .expect("le test doit autoriser la poursuite");
             c.fetch_add(1, Ordering::SeqCst);
             Ok(json!({ "lent": true }))
         })
@@ -282,20 +303,35 @@ fn une_requete_en_vol_reste_servie_par_son_snapshot() {
 
     let gw2 = Arc::clone(&gw);
     let requete = std::thread::spawn(move || {
-        let v = dispatch(
+        dispatch(
             &gw2,
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lent","arguments":{}}}"#,
-        );
-        v.unwrap()
+        )
+        .unwrap()
     });
 
-    // Pendant que la requête dort, l'outil est retiré : le snapshot de la
-    // requête en vol doit TOUT DE MÊME servir l'appel (déjà commencé).
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Le handler tourne ET retient sa requête : son snapshot est déjà pris.
+    // L'attente est bornée pour qu'un harnais cassé échoue clairement au
+    // lieu de figer la suite.
+    entree_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("le handler doit signaler son entrée");
+
+    // L'outil est retiré PENDANT l'exécution : le snapshot courant ne le
+    // publie plus, mais la requête en vol doit rester servie par le sien.
     gw.edit(|mut b| {
-        b.remove_tool("lent");
+        assert!(b.remove_tool("lent"), "l'outil en vol doit exister");
         b
     });
+    assert!(
+        tool_names(&gw).is_empty(),
+        "le snapshot courant ne doit plus publier l'outil retiré"
+    );
+
+    // Autorisation de terminer : le retrait est déjà publié.
+    poursuite_tx
+        .send(())
+        .expect("le handler doit attendre l'autorisation");
 
     let reponse = requete.join().unwrap();
     assert_eq!(

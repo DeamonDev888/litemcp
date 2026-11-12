@@ -17,11 +17,12 @@
 //!   --output-dir <dossier d'artefacts>
 //! ```
 //!
-//! Les outils MRTR (`test_input_required_result_*`, SEP-2322) ne sont pas
-//! enregistrés : l'API de handlers de LiteMCP ne permet pas encore de
-//! produire un résultat `input_required` (sujet séparé de la feuille de
-//! route) — les scénarios correspondants échouent et sont portés, avec
-//! justification datée, par la baseline `.github/conformance/`.
+//! Les outils MRTR (`test_input_required_result_*`, SEP-2322) sont
+//! enregistrés (`.tool_mrtr`/`.prompt_mrtr`) et le scénario
+//! `tools-call-with-progress` est servi par le canal `notifications/progress`
+//! request-scoped de `src/progress.rs` : les scénarios scorés correspondants
+//! passent contre cette fixture, et la baseline `.github/conformance/` reste
+//! vide — toute entrée qui y apparaît est une régression à justifier.
 
 mod fixture;
 
