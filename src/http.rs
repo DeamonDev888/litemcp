@@ -73,7 +73,8 @@
 use crate::progress::ProgressChannel;
 use crate::server::ServerCore;
 use std::fmt;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fmt::Write as _;
+use std::io::{BufRead, BufReader, IoSlice, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -2351,25 +2352,64 @@ fn respond_version(
         content_type,
     } = *head_meta;
     let connection = if keep_alive { "keep-alive" } else { "close" };
-    // En-tête et corps assemblés dans un seul buffer → **un seul write** :
-    // avec nodelay, tête et corps partent dans le même segment TCP (deux
-    // syscalls et un paquet de gagnés par réponse).
-    let mut buf = Vec::with_capacity(
-        96 + version.len() + status.len() + extra_headers.len() + content_type.len() + body.len(),
+    // Tête et corps partent dans **un seul syscall** (`write_vectored`) :
+    // avec nodelay, ils partent dans le même segment TCP (un syscall et un
+    // paquet, comme l'assemblage en un seul tampon) — mais le corps n'est
+    // **jamais recopié** dans un tampon d'assemblage : une copie pleine
+    // charge de gagnée par réponse (à 1 Mio, ~1 Mio d'allocations et de
+    // memcpy en moins). Les octets fil sont identiques : même suite d'octets,
+    // seul le vecteur d'écriture change.
+    //
+    // La tête est pré-réservée en une allocation (même convention que
+    // l'assemblage historique : `96 + longueurs`) — sans elle, le `format!`
+    // croîtrait par doublement et alourdirait le chemin chaud.
+    let mut tete = String::with_capacity(
+        96 + version.len() + status.len() + extra_headers.len() + content_type.len(),
     );
     write!(
-        buf,
+        tete,
         "{version} {status}\r\n{extra_headers}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
         body.len()
-    )?;
+    )
+    .expect("écriture de tête dans String : infaillible");
     // Réponse à HEAD : en-têtes du GET équivalent, **sans corps** (RFC 9110
     // §9.3.2). Un corps sur une réponse HEAD désynchroniserait un client
     // keep-alive, qui lirait ces octets comme la réponse suivante.
-    if !head {
-        buf.extend_from_slice(body);
+    if head {
+        stream.write_all(tete.as_bytes())?;
+    } else {
+        let mut vecteurs = [IoSlice::new(tete.as_bytes()), IoSlice::new(body)];
+        ecrire_tous_vecteurs(stream, &mut vecteurs)?;
     }
-    stream.write_all(&buf)?;
     stream.flush()
+}
+
+/// Écrit **tous** les octets des iovecs en bouclant sur `write_vectored`
+/// (`write_all_vectored` n'est pas encore stable — rust-lang/rust#70436) :
+/// un seul syscall dans le cas nominal ; les iovecs avancent si le noyau
+/// n'accepte qu'une partie de l'écriture.
+fn ecrire_tous_vecteurs(
+    stream: &mut impl Write,
+    mut bufs: &mut [IoSlice<'_>],
+) -> std::io::Result<()> {
+    let ecrits = stream.write_vectored(bufs)?;
+    IoSlice::advance_slices(&mut bufs, ecrits);
+    while !bufs.is_empty() {
+        match stream.write_vectored(bufs) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => {
+                IoSlice::advance_slices(&mut bufs, n);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Le tampon résiduel commence-t-il par une **ligne de requête plausible** ?

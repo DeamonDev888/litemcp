@@ -169,6 +169,122 @@ struct OutgoingSuccessRef<'a, T: Serialize + ?Sized> {
     result: &'a T,
 }
 
+/// Résultat d'une sérialisation **bornée** par le plafond de réponse.
+///
+/// Le writer borné cesse de **stocker** dès que le plafond est atteint
+/// (aucun octet au-delà de `max_response_bytes` n'est matérialisé) mais
+/// **continue de compter** : le message d'erreur du plafond rapporte la
+/// taille réelle de la réponse (`response size (N bytes) …`) et cet `N`
+/// exige de connaître le total exact. La sérialisation elle-même n'est donc
+/// **pas** interrompue — seul son assemblage mémoire l'est ; la valeur
+/// `Value` rendue par le handler reste intégralement matérialisée par
+/// ailleurs (aucune borne totale du tas n'est promise, seulement une borne
+/// sur les octets de la réponse sérialisée).
+pub(crate) enum BoundedReply {
+    /// Corps complet — octets **identiques** à `to_vec` (taille ≤ plafond).
+    Complete(Vec<u8>),
+    /// Plafond dépassé : `total` octets produits (> plafond). Aucun corps
+    /// n'est matérialisé au-delà du plafond.
+    Over { total: usize },
+}
+
+impl BoundedReply {
+    /// Taille de la réponse sérialisée : longueur du corps complet, ou
+    /// taille totale comptée pour un dépassement. C'est exactement la
+    /// `reply.len()` du contrôle historique — le verdict du plafond et le
+    /// message d'erreur restent inchangés.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Complete(body) => body.len(),
+            Self::Over { total } => *total,
+        }
+    }
+
+    /// Rend le corps complet. Ne s'applique qu'à un reply **sous le
+    /// plafond** : l'appelant doit avoir traité [`BoundedReply::Over`]
+    /// avant (le dispatch remplace tout dépassement par l'enveloppe
+    /// d'erreur historique).
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Complete(body) => body,
+            Self::Over { .. } => Vec::new(),
+        }
+    }
+}
+
+/// Writer d'écriture JSON borné : stocke au plus `cap` octets (`0` =
+/// illimité) tout en comptant la taille totale écrite. Une fois le plafond
+/// atteint, les octets continuent d'être comptés **sans être stockés** :
+/// la croissance du tampon s'arrête (`cap` octets au plus), et le total
+/// exact reste disponible pour le message d'erreur du plafond.
+struct BoundedWriter {
+    buf: Vec<u8>,
+    cap: usize,
+    total: usize,
+}
+
+impl BoundedWriter {
+    fn new(cap: usize) -> Self {
+        Self {
+            // Même capacité initiale que `serde_json::to_vec` (128 o) : le
+            // chemin nominal (réponse sous le plafond) garde la **même**
+            // séquence d'allocations qu'avant — zéro régression compte
+            // d'allocations sur le chemin chaud.
+            buf: Vec::with_capacity(128),
+            cap,
+            total: 0,
+        }
+    }
+
+    fn finish(self) -> BoundedReply {
+        if self.cap > 0 && self.total > self.cap {
+            BoundedReply::Over { total: self.total }
+        } else {
+            BoundedReply::Complete(self.buf)
+        }
+    }
+}
+
+impl std::io::Write for BoundedWriter {
+    fn write(&mut self, fragment: &[u8]) -> std::io::Result<usize> {
+        self.total += fragment.len();
+        // Sous le plafond : tout stocker. Une fois le plafond atteint :
+        // comptage seul (la troncature est exacte — jamais plus de `cap`
+        // octets stockés, même si un fragment unique dépasse la place
+        // restante : serde_json écrit parfois une chaîne entière d'un
+        // trait, et un tampon qui continuerait de croître aurait exactement
+        // le coût que cette borne supprime).
+        if self.cap == 0 || self.buf.len() < self.cap {
+            let room = if self.cap == 0 {
+                fragment.len()
+            } else {
+                self.cap - self.buf.len()
+            };
+            let take = fragment.len().min(room);
+            self.buf.extend_from_slice(&fragment[..take]);
+        }
+        Ok(fragment.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Sérialise `value` dans un writer borné. Le repli d'échec de sérialisation
+/// (même cause que `to_vec` — valeur non représentable) reste le corps figé
+/// d'erreur interne, rendu **complet** : il suit alors le contrôle de
+/// plafond historique sur sa longueur, comme tout corps complet.
+fn serialize_bounded<T: Serialize + ?Sized>(value: &T, cap: usize) -> BoundedReply {
+    let mut writer = BoundedWriter::new(cap);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => writer.finish(),
+        Err(_) => BoundedReply::Complete(
+            br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal"}}"#.to_vec(),
+        ),
+    }
+}
+
 impl Outgoing {
     pub fn success(id: Value, result: Value) -> Self {
         Self {
@@ -191,6 +307,25 @@ impl Outgoing {
         .unwrap_or_else(|_| {
             br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal"}}"#.to_vec()
         })
+    }
+
+    /// [`Self::success_vec`] en version bornée : la sérialisation cesse de
+    /// stocker dès le plafond (`cap` = `max_response_bytes`, `0` = illimité)
+    /// tout en comptant la taille totale — voir [`BoundedReply`]. Octets
+    /// identiques à `success_vec` quand la réponse tient sous le plafond.
+    pub(crate) fn success_bounded<T: Serialize + ?Sized>(
+        id: &Value,
+        result: &T,
+        cap: usize,
+    ) -> BoundedReply {
+        serialize_bounded(
+            &OutgoingSuccessRef {
+                jsonrpc: "2.0",
+                id,
+                result,
+            },
+            cap,
+        )
     }
 
     pub fn failure(id: Value, error: ErrorObject) -> Self {
@@ -223,6 +358,12 @@ impl Outgoing {
         serde_json::to_vec(self).unwrap_or_else(|_| {
             br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal"}}"#.to_vec()
         })
+    }
+
+    /// [`Self::to_vec`] en version bornée — voir [`BoundedReply`]. Octets
+    /// identiques à `to_vec` quand la réponse tient sous le plafond.
+    pub(crate) fn to_bounded(&self, cap: usize) -> BoundedReply {
+        serialize_bounded(self, cap)
     }
 }
 

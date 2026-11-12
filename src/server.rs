@@ -2,7 +2,7 @@
 
 use crate::error::{ErrorCode, ToolError};
 use crate::http::{RequestContext, RequestHook, RequestRejection};
-use crate::jsonrpc::{ErrorObject, Outgoing, RequestId};
+use crate::jsonrpc::{BoundedReply, ErrorObject, Outgoing, RequestId};
 use crate::protocol;
 use crate::protocol::{
     CacheScope, CallToolResult, CompleteReference, CompleteResult, Completion, CompletionArgument,
@@ -1437,35 +1437,39 @@ impl ServerCore {
         } else {
             InputRound::first()
         };
+        // Plafond de réponse : passé aux sérialisations bornées (le writer
+        // cesse de stocker au-delà — voir `BoundedReply`), le contrôle
+        // historique sur la taille totale reste le seul verdict.
+        let cap = self.max_response_bytes;
         let (mut reply, mut status) = match incoming.method.as_str() {
             protocol::method::DISCOVER => (
-                Outgoing::success_vec(&id, self.discover_json()),
+                Outgoing::success_bounded(&id, self.discover_json(), cap),
                 CallStatus::Success,
             ),
             protocol::method::INITIALIZE if is_legacy => (
-                Outgoing::success_vec(&id, self.initialize_json()),
+                Outgoing::success_bounded(&id, self.initialize_json(), cap),
                 CallStatus::Success,
             ),
             protocol::method::PING if is_legacy => (
-                Outgoing::success_vec(&id, self.ping_json()),
+                Outgoing::success_bounded(&id, self.ping_json(), cap),
                 CallStatus::Success,
             ),
             protocol::method::TOOLS_LIST => (
-                Outgoing::success_vec(&id, self.tools_list_json()),
+                Outgoing::success_bounded(&id, self.tools_list_json(), cap),
                 CallStatus::Success,
             ),
             protocol::method::TOOLS_CALL => self.call_tool(&id, params, &mrtr_round),
             protocol::method::RESOURCES_LIST => (
-                Outgoing::success_vec(&id, self.resources_list_json()),
+                Outgoing::success_bounded(&id, self.resources_list_json(), cap),
                 CallStatus::Success,
             ),
             protocol::method::RESOURCES_TEMPLATES_LIST => (
-                Outgoing::success_vec(&id, self.templates_list_json()),
+                Outgoing::success_bounded(&id, self.templates_list_json(), cap),
                 CallStatus::Success,
             ),
             protocol::method::RESOURCES_READ => self.read_resource(&id, params, &mrtr_round),
             protocol::method::PROMPTS_LIST => (
-                Outgoing::success_vec(&id, self.prompts_list_json()),
+                Outgoing::success_bounded(&id, self.prompts_list_json(), cap),
                 CallStatus::Success,
             ),
             protocol::method::PROMPTS_GET => self.get_prompt(&id, params, &mrtr_round),
@@ -1478,23 +1482,25 @@ impl ServerCore {
                         format!("Unknown method: {}", sanitize_echo(other)),
                     ),
                 )
-                .to_vec(),
+                .to_bounded(cap),
                 CallStatus::ProtocolError(ErrorObject::METHOD_NOT_FOUND),
             ),
         };
         if self.max_response_bytes > 0 && reply.len() > self.max_response_bytes {
             let actual = reply.len();
-            reply = Outgoing::failure(
-                id,
-                ErrorObject::new(
-                    ErrorObject::INTERNAL_ERROR,
-                    format!(
-                        "response size ({actual} bytes) exceeds maximum ({} bytes)",
-                        self.max_response_bytes
+            reply = BoundedReply::Complete(
+                Outgoing::failure(
+                    id,
+                    ErrorObject::new(
+                        ErrorObject::INTERNAL_ERROR,
+                        format!(
+                            "response size ({actual} bytes) exceeds maximum ({} bytes)",
+                            self.max_response_bytes
+                        ),
                     ),
-                ),
-            )
-            .to_vec();
+                )
+                .to_vec(),
+            );
             status = CallStatus::ProtocolError(ErrorObject::INTERNAL_ERROR);
         }
         self.emit_call(&incoming.method, name, started.elapsed(), status);
@@ -1507,7 +1513,7 @@ impl ServerCore {
         };
 
         Some(DispatchResponse {
-            body: reply,
+            body: reply.into_vec(),
             status: http_status,
         })
     }
@@ -1734,14 +1740,15 @@ impl ServerCore {
         params: &Value,
         spec: InputRequiredSpec,
         round: &InputRound,
-    ) -> (Vec<u8>, CallStatus) {
+    ) -> (BoundedReply, CallStatus) {
+        let cap = self.max_response_bytes;
         let internal = |message: String| {
             (
                 Outgoing::failure(
                     id.clone(),
                     ErrorObject::new(ErrorObject::INTERNAL_ERROR, message),
                 )
-                .to_vec(),
+                .to_bounded(cap),
                 CallStatus::ProtocolError(ErrorObject::INTERNAL_ERROR),
             )
         };
@@ -1796,7 +1803,7 @@ impl ServerCore {
                         json!({ "requiredCapabilities": missing }),
                     ),
                 )
-                .to_vec(),
+                .to_bounded(cap),
                 CallStatus::ProtocolError(ErrorObject::CLIENT_CAPABILITY_REQUIRED),
             );
         }
@@ -1832,7 +1839,7 @@ impl ServerCore {
             &serde_json::to_value(&payload).expect("payload serialization is infallible"),
         );
         (
-            Outgoing::success_vec(
+            Outgoing::success_bounded(
                 id,
                 &InputRequiredResultRef {
                     result_type: ResultType::InputRequired,
@@ -1844,6 +1851,7 @@ impl ServerCore {
                     request_state: &token,
                     meta: &self.meta,
                 },
+                cap,
             ),
             CallStatus::Success,
         )
@@ -2054,14 +2062,15 @@ impl ServerCore {
         id: &Value,
         params: &Value,
         round: &InputRound,
-    ) -> (Vec<u8>, CallStatus) {
+    ) -> (BoundedReply, CallStatus) {
+        let cap = self.max_response_bytes;
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return (
                 Outgoing::failure(
                     id.clone(),
                     ErrorObject::new(ErrorObject::INVALID_PARAMS, "missing params.uri"),
                 )
-                .to_vec(),
+                .to_bounded(cap),
                 CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
             );
         };
@@ -2074,7 +2083,7 @@ impl ServerCore {
                         format!("Unknown resource: {}", sanitize_echo(uri)),
                     ),
                 )
-                .to_vec(),
+                .to_bounded(cap),
                 CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
             );
         };
@@ -2088,7 +2097,7 @@ impl ServerCore {
             Err(failure) => {
                 let code = failure.code;
                 return (
-                    Outgoing::failure(id.clone(), failure).to_vec(),
+                    Outgoing::failure(id.clone(), failure).to_bounded(cap),
                     CallStatus::ProtocolError(code),
                 );
             }
@@ -2099,7 +2108,7 @@ impl ServerCore {
                 self.emit_input_required(id, protocol::method::RESOURCES_READ, params, spec, round)
             }
             Ok(ResourceOutcome::Data(contents)) => (
-                Outgoing::success_vec(
+                Outgoing::success_bounded(
                     id,
                     &ReadResourceResultRef {
                         result_type: ResultType::Complete,
@@ -2108,6 +2117,7 @@ impl ServerCore {
                         contents: std::slice::from_ref(&contents),
                         meta: &self.meta,
                     },
+                    cap,
                 ),
                 CallStatus::Success,
             ),
@@ -2120,7 +2130,7 @@ impl ServerCore {
                         json!({ "reason": "handler_failed" }),
                     ),
                 )
-                .to_vec(),
+                .to_bounded(cap),
                 CallStatus::ProtocolError(HANDLER_FAILURE),
             ),
         }
@@ -2128,14 +2138,20 @@ impl ServerCore {
 
     /// Exécute un handler de prompt, borné par `tool_timeout` — le tour
     /// MRTR ([`InputRound`]) est remis au handler à chaque passage.
-    fn get_prompt(&self, id: &Value, params: &Value, round: &InputRound) -> (Vec<u8>, CallStatus) {
+    fn get_prompt(
+        &self,
+        id: &Value,
+        params: &Value,
+        round: &InputRound,
+    ) -> (BoundedReply, CallStatus) {
+        let cap = self.max_response_bytes;
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return (
                 Outgoing::failure(
                     id.clone(),
                     ErrorObject::new(ErrorObject::INVALID_PARAMS, "missing params.name"),
                 )
-                .to_vec(),
+                .to_bounded(cap),
                 CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
             );
         };
@@ -2148,7 +2164,7 @@ impl ServerCore {
                         format!("Unknown prompt: {}", sanitize_echo(name)),
                     ),
                 )
-                .to_vec(),
+                .to_bounded(cap),
                 CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
             );
         };
@@ -2165,7 +2181,7 @@ impl ServerCore {
                             "params.arguments must be an object",
                         ),
                     )
-                    .to_vec(),
+                    .to_bounded(cap),
                     CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
                 );
             }
@@ -2199,7 +2215,7 @@ impl ServerCore {
                             json!({ "issues": rendered }),
                         ),
                     )
-                    .to_vec(),
+                    .to_bounded(cap),
                     CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
                 );
             }
@@ -2223,7 +2239,7 @@ impl ServerCore {
             Err(failure) => {
                 let code = failure.code;
                 return (
-                    Outgoing::failure(id.clone(), failure).to_vec(),
+                    Outgoing::failure(id.clone(), failure).to_bounded(cap),
                     CallStatus::ProtocolError(code),
                 );
             }
@@ -2234,7 +2250,7 @@ impl ServerCore {
                 self.emit_input_required(id, protocol::method::PROMPTS_GET, params, spec, round)
             }
             Ok(PromptOutcome::Messages(messages)) => (
-                Outgoing::success_vec(
+                Outgoing::success_bounded(
                     id,
                     &GetPromptResultRef {
                         result_type: ResultType::Complete,
@@ -2242,6 +2258,7 @@ impl ServerCore {
                         messages: &messages,
                         meta: &self.meta,
                     },
+                    cap,
                 ),
                 CallStatus::Success,
             ),
@@ -2254,7 +2271,7 @@ impl ServerCore {
                         json!({ "reason": "handler_failed" }),
                     ),
                 )
-                .to_vec(),
+                .to_bounded(cap),
                 CallStatus::ProtocolError(HANDLER_FAILURE),
             ),
         }
@@ -2264,7 +2281,8 @@ impl ServerCore {
     /// mêmes conventions que prompts/ressources : params mal formés ou
     /// fournisseur absent → `-32602`, échec du fournisseur → `-32603`
     /// (data `handler_failed`), timeout/saturation → erreur noyau `-32603`.
-    fn complete(&self, id: &Value, params: &Value) -> (Vec<u8>, CallStatus) {
+    fn complete(&self, id: &Value, params: &Value) -> (BoundedReply, CallStatus) {
+        let cap = self.max_response_bytes;
         let Some(provider) = &self.completions else {
             return (
                 Outgoing::failure(
@@ -2274,7 +2292,7 @@ impl ServerCore {
                         "completion is not supported: no completion provider is registered",
                     ),
                 )
-                .to_vec(),
+                .to_bounded(cap),
                 CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
             );
         };
@@ -2390,7 +2408,7 @@ impl ServerCore {
             Err(failure) => {
                 let code = failure.code;
                 return (
-                    Outgoing::failure(id.clone(), failure).to_vec(),
+                    Outgoing::failure(id.clone(), failure).to_bounded(cap),
                     CallStatus::ProtocolError(code),
                 );
             }
@@ -2407,7 +2425,7 @@ impl ServerCore {
                             json!({ "reason": "handler_failed" }),
                         ),
                     )
-                    .to_vec(),
+                    .to_bounded(cap),
                     CallStatus::ProtocolError(HANDLER_FAILURE),
                 );
             }
@@ -2422,13 +2440,14 @@ impl ServerCore {
             }
         }
         (
-            Outgoing::success_vec(
+            Outgoing::success_bounded(
                 id,
                 &CompleteResult {
                     result_type: ResultType::Complete,
                     completion,
                     meta: Some(self.meta.clone()),
                 },
+                cap,
             ),
             CallStatus::Success,
         )
@@ -2440,13 +2459,13 @@ impl ServerCore {
         &self,
         id: &Value,
         message: impl Into<String>,
-    ) -> (Vec<u8>, CallStatus) {
+    ) -> (BoundedReply, CallStatus) {
         (
             Outgoing::failure(
                 id.clone(),
                 ErrorObject::new(ErrorObject::INVALID_PARAMS, message),
             )
-            .to_vec(),
+            .to_bounded(self.max_response_bytes),
             CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
         )
     }
@@ -2499,14 +2518,22 @@ impl ServerCore {
         }
     }
 
-    fn call_tool(&self, id: &Value, params: &Value, round: &InputRound) -> (Vec<u8>, CallStatus) {
+    fn call_tool(
+        &self,
+        id: &Value,
+        params: &Value,
+        round: &InputRound,
+    ) -> (BoundedReply, CallStatus) {
+        // `response_cap` (et non `cap`) : la boucle des capacités requises
+        // plus bas itère déjà sous le nom `cap`.
+        let response_cap = self.max_response_bytes;
         let Some(name) = params.get("name").and_then(Value::as_str) else {
             return (
                 Outgoing::failure(
                     id.clone(),
                     ErrorObject::new(ErrorObject::INVALID_PARAMS, "missing params.name"),
                 )
-                .to_vec(),
+                .to_bounded(response_cap),
                 CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
             );
         };
@@ -2519,7 +2546,7 @@ impl ServerCore {
                         format!("Unknown tool: {}", sanitize_echo(name)),
                     ),
                 )
-                .to_vec(),
+                .to_bounded(response_cap),
                 CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
             );
         };
@@ -2546,7 +2573,7 @@ impl ServerCore {
                                 json!({ "requiredCapabilities": required }),
                             ),
                         )
-                        .to_vec(),
+                        .to_bounded(response_cap),
                         CallStatus::ProtocolError(ErrorObject::CLIENT_CAPABILITY_REQUIRED),
                     );
                 }
@@ -2568,7 +2595,7 @@ impl ServerCore {
                             "params.arguments must be an object",
                         ),
                     )
-                    .to_vec(),
+                    .to_bounded(response_cap),
                     CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
                 );
             }
@@ -2606,7 +2633,7 @@ impl ServerCore {
                             json!({ "issues": rendered }),
                         ),
                     )
-                    .to_vec(),
+                    .to_bounded(response_cap),
                     CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
                 );
             }
@@ -2794,7 +2821,8 @@ impl ServerCore {
             }
             Err(ToolFailure::Protocol(code, message)) => {
                 return (
-                    Outgoing::failure(id.clone(), ErrorObject::new(code, message)).to_vec(),
+                    Outgoing::failure(id.clone(), ErrorObject::new(code, message))
+                        .to_bounded(response_cap),
                     CallStatus::ProtocolError(code),
                 );
             }
@@ -2804,7 +2832,7 @@ impl ServerCore {
         // Sérialisation directe vers `Vec<u8>` par référence sans passer par
         // un arbre `serde_json::Value` intermédiaire ni cloner `self.meta`.
         (
-            Outgoing::success_vec(
+            Outgoing::success_bounded(
                 id,
                 &CallToolResultRef {
                     result_type: result.result_type,
@@ -2813,6 +2841,7 @@ impl ServerCore {
                     structured_content: result.structured_content.as_ref(),
                     meta: &self.meta,
                 },
+                response_cap,
             ),
             status,
         )
@@ -3470,11 +3499,20 @@ impl ServerBuilder {
     /// Défaut : [`MAX_RESPONSE_BYTES`] (16 Mio). `0` = illimité (le contrôle
     /// est désactivé).
     ///
-    /// Le contrôle est appliqué sur la réponse **après** sérialisation : il
-    /// borne le transit, pas l'allocation. Pour borner la mémoire, c'est la
-    /// taille de la **valeur rendue par le handler** qu'il faut surveiller
-    /// (un handler qui rend 100 Mo consomme 100 Mo avant d'être refusé) —
-    /// ce plafond protège le réseau, pas le tas.
+    /// Le verdict est appliqué sur la taille **totale** de la réponse
+    /// sérialisée : il borne le transit, pas l'allocation. La sérialisation
+    /// est néanmoins **bornée en mémoire** (writer borné, voir
+    /// `BoundedReply`) : les octets au-delà du plafond ne sont jamais
+    /// matérialisés — le writer cesse de stocker dès le plafond atteint et
+    /// se contente de compter la taille exacte, que le message d'erreur
+    /// rapporte (`response size (N bytes) …`, inchangé).
+    ///
+    /// La valeur `Value` rendue par le handler reste, elle, intégralement
+    /// matérialisée **avant** sérialisation : ce plafond ne promet donc pas
+    /// une borne totale du tas. Pour borner la mémoire, c'est la taille de
+    /// la valeur rendue qu'il faut surveiller (un handler qui rend 100 Mo
+    /// consomme 100 Mo avant d'être refusé) — ce plafond protège le
+    /// réseau, pas le tas.
     #[must_use]
     pub fn max_response_bytes(mut self, max: usize) -> Self {
         self.max_response_bytes = max;
