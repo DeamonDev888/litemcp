@@ -1002,10 +1002,7 @@ fn is_datetime(text: &str) -> bool {
     // réel — juin/décembre à ce jour — n'est pas vérifiable sans la table
     // IERS des intercalaires annoncées : la référence ne le vérifie pas
     // non plus.)
-    if two(17) == 60 && !leap_second_lands_at_utc_2359(two(11), two(14), offset_minutes) {
-        return false;
-    }
-    true
+    !(two(17) == 60 && !leap_second_lands_at_utc_2359(two(11), two(14), offset_minutes))
 }
 
 /// RFC 3339 §5.7 : l'intercalaire n'existe qu'au point UTC 23:59, décalé
