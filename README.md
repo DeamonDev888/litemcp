@@ -20,7 +20,7 @@ Stateless · socket bindé · **Streamable HTTP uniquement** (POST/SSE) · zéro
 
 ## Pourquoi LiteMCP
 
-La plupart des serveurs MCP sont des **services** : un programme qui s'installe, charge un gros framework et tourne à côté de votre application. **LiteMCP fait l'inverse : c'est une bibliothèque Rust.** Vous écrivez quelques lignes, vous appelez `.serve()`, et un vrai serveur MCP tourne **dans** votre programme — avec les threads standards du langage, sans runtime async, sans framework HTTP. Seule dépendance pour le JSON : `serde`.
+Un serveur MCP qui tient **dans votre programme** : quelques lignes de Rust, `.serve()`, et vos fonctions sont des outils pour les agents IA. Ultra léger, gateway dynamique, verrou d'authentification par requête — **0,09 ms** par requête, **5,5 Mo** de RSS ([mesures](#benchmarks)).
 
 **Pour qui ?**
 

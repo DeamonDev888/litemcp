@@ -23,7 +23,8 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ### Documentation
 
-- **Comptes de tests et commentaires de fixture réalignés sur le code courant** : le README passe de 313/304/295 à **547 all-features / 504 par défaut / 481 sans feature** (somme des suites unitaires, d'intégration et des doctests, mesurée le 2026-11-11) ; l'en-tête de la fixture liste les trois tests qui l'incluent (`conformance_fixture`, `conformance_fixture_mrtr`, `mcp_progress_channel`) et `main.rs` ne prétend plus que les outils MRTR sont absents ni que `tools-call-with-progress` échoue.
+- **Comptes de tests et commentaires de fixture réalignés sur le code courant** : le README passe de 313/304/295 à **547 all-features / 504 par défaut / 481 sans feature** (somme des suites unitaires, d'intégration et des doctests, mesurée le 2026-11-11) ; l'en-tête de la fixture liste les trois tests qui l'incluent (`conformance_fixture`, `conformance_fixture_mrtr`, `mcp_progress_channel`) et `main.rs` ne prétend plus que les outils MRTR sont absents ni que `tools-call-with-progress` échoue ;
+- **Nouveau chapeau « Pourquoi LiteMCP »** : le pitch d'ouverture annonce le produit en une phrase (« un serveur MCP qui tient dans votre programme… vos fonctions sont des outils pour les agents IA ») au lieu de la critique des serveurs-services, et porte les chiffres mesurés (0,09 ms par requête, 5,5 Mo de RSS) avec renvoi vers la [section Benchmarks](README.md#benchmarks) ; « OAuth ready » écarté — la section Sécurité documente que l'OAuth/OIDC intégré est délibérément à la périphérie (proxy/gateway), le pitch reste cohérent avec le choix architectural : la formulation retenue est « verrou d'authentification par requête » (`.on_request`).
 
 ## [0.10.5] - 2026-11-11
 
