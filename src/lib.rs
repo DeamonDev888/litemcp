@@ -152,11 +152,15 @@
 //!   l'événement de réponse, puis la connexion est fermée. Le jeton est
 //!   toujours repris de la requête (jamais choisi par le handler) ; sans
 //!   jeton, sans flux SSE ou après la réponse, `report` est une non-action ;
-//! - version de protocole : lue dans `_meta`, refusée en `-32022` si
-//!   inconnue ; son absence est tolérée (compatibilité `2025-11-25`) ;
-//! - `Mcp-Method` / `Mcp-Name` : acceptés et vérifiés contre le corps
-//!   (SEP-2243) ;
-//! - `initialize` et `ping` : tolérés (méthodes legacy `2025-11-25`).
+//! - version de protocole : **obligatoire** dans `_meta`
+//!   (`io.modelcontextprotocol/protocolVersion`) en profil strict — son
+//!   absence est refusée en `-32602`, une version inconnue en `-32022` ;
+//!   seul le profil legacy (`.legacy(true)`) tolère l'absence de `_meta` ;
+//! - `MCP-Protocol-Version`, `Mcp-Method` / `Mcp-Name` : **exigés** par le
+//!   transport HTTP en profil strict et vérifiés contre le corps (SEP-2243) ;
+//! - `initialize` et `ping` : refusés en profil strict (`-32601`) ; servis
+//!   uniquement en profil legacy (`.legacy(true)`), où `initialize` négocie
+//!   la révision legacy `2025-11-25` (voir [`protocol::LEGACY_PROTOCOL_VERSION`]).
 //!
 //! Tutoriel officiel pas à pas (du premier outil aux schémas, ressources
 //! et prompts) : <https://deamondev888.github.io/litemcp-tuto/>.

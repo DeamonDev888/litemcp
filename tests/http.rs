@@ -62,7 +62,9 @@ fn initialize_and_tools_list() {
     );
     assert_eq!(status, 200);
     let v: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["result"]["protocolVersion"], "2026-07-28");
+    // Profil legacy : `initialize` négocie une révision servie
+    // (`2025-11-25`) — voir `tests/mcp_legacy_negotiation_2026_11_13.rs`.
+    assert_eq!(v["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(v["result"]["serverInfo"]["name"], "calc");
 
     let (status, body) = post(
@@ -353,7 +355,12 @@ fn typed_tool_derives_schema_and_annotations_in_tools_list() {
     assert_eq!(schema["properties"]["query"]["type"], "string");
     assert_eq!(schema["properties"]["query"]["minLength"], 2);
     assert_eq!(schema["properties"]["query"]["maxLength"], 64);
-    assert_eq!(schema["properties"]["limit"]["type"], "integer");
+    // Champ optionnel : publié `[T, "null"]` (M3 — `null` vaut absence,
+    // même contrat que `Option<T>`), `required` ne le contient pas.
+    assert_eq!(
+        schema["properties"]["limit"]["type"],
+        serde_json::json!(["integer", "null"])
+    );
     assert_eq!(schema["properties"]["limit"]["maximum"], 100);
     assert_eq!(schema["required"], serde_json::json!(["query"]));
     assert_eq!(schema["additionalProperties"], false);

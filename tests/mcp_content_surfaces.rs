@@ -47,7 +47,7 @@ fn dispatch(core: &ServerCore, id: i64, method: &str, params: Value) -> Value {
         "params": params_with_meta(params),
     });
     let reply = core
-        .dispatch(serde_json::to_string(&body).unwrap().as_bytes())
+        .dispatch_unchecked(serde_json::to_string(&body).unwrap().as_bytes())
         .expect("une requête identifiée reçoit une réponse");
     serde_json::from_slice(&reply).expect("réponse JSON-RPC lisible")
 }
@@ -181,7 +181,7 @@ fn legacy_value_path_wire_shape_is_unchanged() {
         "params": params_with_meta(json!({ "name": "add", "arguments": { "a": 5, "b": 7 } })),
     });
     let reply = String::from_utf8(
-        core.dispatch(serde_json::to_string(&body).unwrap().as_bytes())
+        core.dispatch_unchecked(serde_json::to_string(&body).unwrap().as_bytes())
             .unwrap(),
     )
     .unwrap();

@@ -7,7 +7,7 @@ use serde_json::json;
 use std::sync::Mutex;
 
 fn call(core: &litemcp::ServerCore, body: &str) -> serde_json::Value {
-    let reply = core.dispatch(body.as_bytes()).unwrap();
+    let reply = core.dispatch_unchecked(body.as_bytes()).unwrap();
     serde_json::from_slice(&reply).unwrap()
 }
 
@@ -194,12 +194,12 @@ fn on_call_observes_methods_names_and_statuses() {
         r#"{"jsonrpc":"2.0","id":5,"method":"methode/aucune"}"#,
     );
     // Notification d'action refusée : observée aussi (verdict -32600).
-    let _ = core.dispatch(
+    let _ = core.dispatch_unchecked(
         br#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ok","arguments":{}}}"#,
     );
     // Notification de protocole : acceptée et ignorée → observée comme
     // telle.
-    let _ = core.dispatch(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    let _ = core.dispatch_unchecked(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
 
     let seen = seen.lock().unwrap().clone();
     let of = |method: &str| seen.iter().find(|o| o.method == method).cloned();
@@ -374,7 +374,7 @@ fn protocol_errors_are_english() {
     );
     assert_eq!(v["error"]["message"], "missing params.name");
     // JSON illisible : parse error en anglais.
-    let reply = core.dispatch(b"not json").unwrap();
+    let reply = core.dispatch_unchecked(b"not json").unwrap();
     let v: serde_json::Value = serde_json::from_slice(&reply).unwrap();
     assert_eq!(v["error"]["message"], "invalid JSON");
 }

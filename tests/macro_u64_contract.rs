@@ -28,7 +28,7 @@ use litemcp::macros::tool;
 use serde_json::{Value, json};
 
 fn call(core: &litemcp::ServerCore, body: &str) -> Value {
-    let reply = core.dispatch(body.as_bytes()).unwrap();
+    let reply = core.dispatch_unchecked(body.as_bytes()).unwrap();
     serde_json::from_slice(&reply).unwrap()
 }
 
@@ -425,6 +425,31 @@ fn option_u64_grande_valeur_est_some_exact() {
         json!(Value::Null),
         "champ absent → None : {v}"
     );
+
+    // `null` : même verdict que l'absence (M3) — accepté, `None`.
+    let v = call_tool(&core, 3, "pris_option_u64", json!({ "v": null }));
+    assert!(
+        v.get("error").is_none(),
+        "`null` doit valoir absence pour `Option<u64>` : {v}"
+    );
+    assert_eq!(
+        v["result"]["structuredContent"]["recu"],
+        json!(Value::Null),
+        "champ `null` → None : {v}"
+    );
+
+    // Le schéma publié dit la même chose : `null` est admis.
+    let list = call(&core, r#"{"jsonrpc":"2.0","id":4,"method":"tools/list"}"#);
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let schema = &tools
+        .iter()
+        .find(|t| t["name"] == "pris_option_u64")
+        .unwrap()["inputSchema"];
+    assert_eq!(
+        schema["properties"]["v"]["type"],
+        json!(["integer", "null"]),
+        "{list}"
+    );
 }
 
 // ===========================================================================
@@ -567,5 +592,26 @@ fn defaut_u64_sans_suffixe_est_publie_puis_injecte() {
         v["result"]["structuredContent"]["recu"],
         json!(9223372036854775808u64),
         "le défaut sans suffixe doit être injecté exact : {v}"
+    );
+}
+
+#[test]
+fn null_sur_un_parametre_a_defaut_recoit_le_defaut() {
+    // « `null` ≡ absence » vaut aussi pour un paramètre de macro couvert par
+    // `default(..)` : la macro émet `.opt(nom, schéma.default(valeur))`, donc
+    // le champ publie `type: [T, "null"]` **avec** son défaut et `null` est
+    // traité comme l'absence (résidu D1).
+    let core = core_with(&["defaut_u64_max"]);
+    let list = call(&core, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+    let schema = &list["result"]["tools"][0]["inputSchema"]["properties"]["v"];
+    assert_eq!(schema["type"], json!(["integer", "null"]), "{list}");
+    assert_eq!(schema["default"], json!(u64::MAX), "{list}");
+
+    let v = call_tool(&core, 2, "defaut_u64_max", json!({ "v": null }));
+    assert!(v.get("error").is_none(), "`null` doit valoir absence : {v}");
+    assert_eq!(
+        v["result"]["structuredContent"]["recu"],
+        json!(u64::MAX),
+        "`null` doit recevoir le défaut : {v}"
     );
 }

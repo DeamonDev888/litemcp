@@ -48,6 +48,7 @@ impl RequestId {
 
 /// Objet d'erreur JSON-RPC.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ErrorObject {
     pub code: i64,
     pub message: String,

@@ -18,7 +18,7 @@ use std::net::{SocketAddr, TcpStream};
 
 fn call(core: &litemcp::ServerCore, body: &str) -> Value {
     let reply = core
-        .dispatch(body.as_bytes())
+        .dispatch_unchecked(body.as_bytes())
         .expect("une réponse est attendue pour une requête");
     serde_json::from_slice(&reply).unwrap()
 }

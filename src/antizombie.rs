@@ -98,6 +98,7 @@ pub const DEBRIS_AGE: Duration = Duration::from_secs(60);
 /// disjoints : chaque fichier du dossier tombe dans exactement une case
 /// (ou n'est pas visité, voir [`SweepReport::skipped`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SweepReport {
     /// Annonces **usurpées** retirées : l'adresse publiée répond avec une
     /// identité d'instance différente de celle publiée — preuve positive que
@@ -156,6 +157,7 @@ impl SweepReport {
 /// lisible via
 /// [`ServerHandle::zombie_report`](crate::http::ServerHandle::zombie_report).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ZombieReport {
     /// Toutes les connexions ont été fermées avant l'échéance du drain.
     /// `false` : des threads de connexion vivaient encore au terme de

@@ -10,10 +10,12 @@ use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 
-/// Serveur identique à l'exemple « Intégration » du README.
+/// Serveur identique à l'exemple « Premier serveur » du README : **profil
+/// par défaut** (strict 2026-07-28), aucun `.legacy(true)`. Seule différence,
+/// imposée par un test : le bind sur un port éphémère au lieu de
+/// `bind_default()`, pour ne dépendre d'aucun port de la machine.
 fn spawn_readme_server() -> SocketAddr {
     let bound = ServerBuilder::new("calc", "1.0.0")
-        .legacy(true)
         .tool("add", "Additionne deux nombres", |args| {
             let a = args["a"].as_i64().ok_or("a manquant")?;
             let b = args["b"].as_i64().ok_or("b manquant")?;
@@ -26,9 +28,61 @@ fn spawn_readme_server() -> SocketAddr {
     addr
 }
 
-fn post_body(addr: SocketAddr, body: &str) -> (u16, String) {
+/// Bloc `curl` du README : en-têtes `-H` et corps `-d`, lus dans le README
+/// lui-même (aucune copie qui pourrait diverger), plus le bloc JSON de réponse
+/// qui le suit.
+fn readme_curl_example() -> (Vec<(String, String)>, String, String) {
+    let readme =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("README.md à la racine de la crate");
+    let mut lines = readme
+        .lines()
+        .skip_while(|line| !line.contains("curl -s http://127.0.0.1:23080/mcp"));
+    lines.next().expect("bloc `curl` du README");
+
+    let mut headers = Vec::new();
+    let mut body = None;
+    for line in lines.by_ref() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("-H '") {
+            let value = rest.strip_suffix('\\').unwrap_or(rest).trim_end();
+            let value = value.strip_suffix('\'').unwrap_or(value);
+            let (name, value) = value.split_once(':').expect("en-tête `-H 'Nom: valeur'`");
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        } else if let Some(rest) = line.strip_prefix("-d '") {
+            body = Some(
+                rest.strip_suffix('\'')
+                    .expect("corps `-d '…'` clos par une apostrophe")
+                    .to_string(),
+            );
+            break;
+        }
+    }
+    let body = body.expect("le bloc curl du README porte un corps `-d`");
+    let documented = lines
+        .find(|line| {
+            line.trim_start()
+                .starts_with(r#"{"jsonrpc":"2.0","id":1,"result""#)
+        })
+        .expect("bloc JSON de réponse après le curl du README")
+        .trim()
+        .to_string();
+    (headers, body, documented)
+}
+
+/// POST /mcp en HTTP/1.1 avec les en-têtes **donnés à la lettre** ; seuls
+/// `Host`, `Content-Length` et `Connection: close` sont ajoutés (nécessaires
+/// pour lire la réponse jusqu'à la fermeture).
+fn post_body_with_headers(addr: SocketAddr, body: &str, headers: &[(&str, &str)]) -> (u16, String) {
+    let mut extra = String::new();
+    for (name, value) in headers {
+        extra.push_str(name);
+        extra.push_str(": ");
+        extra.push_str(value);
+        extra.push_str("\r\n");
+    }
     let request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: test\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /mcp HTTP/1.1\r\nHost: test\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let mut stream = TcpStream::connect(addr).unwrap();
@@ -45,20 +99,51 @@ fn post_body(addr: SocketAddr, body: &str) -> (u16, String) {
     (status, rest.to_string())
 }
 
+fn post_body(addr: SocketAddr, body: &str) -> (u16, String) {
+    post_body_with_headers(
+        addr,
+        body,
+        &[
+            ("Accept", "application/json"),
+            ("Content-Type", "application/json"),
+        ],
+    )
+}
+
 #[test]
 fn readme_integration_example_returns_the_documented_response() {
     let addr = spawn_readme_server();
-    // Le corps exact du curl documenté dans le README.
-    let (status, body) = post_body(
-        addr,
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"a":5,"b":7}}}"#,
+    // La requête du bloc `curl` du README, à la lettre (trois en-têtes de
+    // protocole + les deux clés `_meta`) et le bloc JSON affiché juste après :
+    // profil strict (défaut), comme le snippet Rust du README, sans `.legacy`.
+    let (headers, body, documented) = readme_curl_example();
+    let headers: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let (status, reply) = post_body_with_headers(addr, &body, &headers);
+    assert_eq!(
+        status, 200,
+        "profil strict : la requête du README doit passer, réponse {reply}"
     );
-    assert_eq!(status, 200);
-    // La réponse documentée dans le README — octet pour octet (l'ordre des
-    // champs compte pour un exemple affiché : un lecteur qui compare la
-    // sortie réelle au README ne doit pas voir de divergence).
-    let documented = r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","content":[{"type":"text","text":"{\"somme\":12}"}],"structuredContent":{"somme":12},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"calc","version":"1.0.0"}}}}"#;
-    assert_eq!(body, documented, "la réponse réelle diffère du README");
+    // Octet pour octet (l'ordre des champs compte pour un exemple affiché :
+    // un lecteur qui compare la sortie réelle au README ne doit voir aucune
+    // divergence).
+    assert_eq!(reply, documented, "la réponse réelle diffère du README");
+
+    // Contre-preuve : le même corps **sans** les en-têtes de protocole est
+    // refusé en -32020 par ce serveur — la parité ci-dessus porte donc bien
+    // sur le profil strict du README, pas sur un mode de tolérance rétabli
+    // par mégarde.
+    let (status, reply) = post_body(addr, &body);
+    assert_eq!(
+        status, 400,
+        "sans en-têtes, le profil strict refuse : {reply}"
+    );
+    assert!(
+        reply.contains("-32020"),
+        "refus attendu en -32020 (MCP-Protocol-Version requis) : {reply}"
+    );
 }
 
 #[test]
@@ -84,6 +169,9 @@ fn readme_zod_concept_example_publishes_and_enforces_the_schema() {
 
     // `tools/list` publie l'inputSchema dérivé : les contraintes deviennent
     // les mots-clés JSON Schema documentés (minLength/maxLength/minimum/maximum).
+    // `limit` est optionnel sans défaut publié : le schéma le dit (`null`
+    // accepté), conformément à la règle `Option<T>` du noyau (voir
+    // `tests/schema_defaults_parity.rs`).
     let (_, body) = post_body(addr, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
     let reply: Value = serde_json::from_str(&body).unwrap();
     let tool = &reply["result"]["tools"][0];
@@ -93,7 +181,7 @@ fn readme_zod_concept_example_publishes_and_enforces_the_schema() {
         json!({
             "type": "object",
             "properties": {
-                "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+                "limit": { "type": ["integer", "null"], "minimum": 1, "maximum": 100 },
                 "query": { "type": "string", "minLength": 2, "maxLength": 64 }
             },
             "required": ["query"]

@@ -39,20 +39,19 @@ fn dispatch(core: &ServerCore, id: i64, method: &str, params: Value) -> Value {
         "params": params_with_meta(params),
     });
     let reply = core
-        .dispatch(serde_json::to_string(&body).unwrap().as_bytes())
+        .dispatch_unchecked(serde_json::to_string(&body).unwrap().as_bytes())
         .expect("une requête identifiée reçoit une réponse");
     serde_json::from_slice(&reply).expect("réponse JSON-RPC lisible")
 }
 
-fn dispatch_status(core: &ServerCore, method: &str, params: Value) -> u16 {
+fn notification_status(core: &ServerCore, method: &str, params: Value) -> u16 {
     let body = json!({
         "jsonrpc": "2.0",
-        "id": 1,
         "method": method,
         "params": params_with_meta(params),
     });
     core.dispatch_request(serde_json::to_string(&body).unwrap().as_bytes(), None)
-        .expect("requête identifiée : réponse")
+        .expect("notification d'action refusée : réponse")
         .status
         .code()
 }
@@ -130,7 +129,7 @@ fn completion_complete_notification_is_rejected_as_an_action() {
         },
     });
     let reply = core
-        .dispatch(serde_json::to_string(&body).unwrap().as_bytes())
+        .dispatch_unchecked(serde_json::to_string(&body).unwrap().as_bytes())
         .expect("id: null explicite — réponse attendue");
     let v: Value = serde_json::from_slice(&reply).unwrap();
     assert_eq!(v["error"]["code"], -32600, "{v}");
@@ -141,7 +140,7 @@ fn completion_complete_notification_is_rejected_as_an_action() {
             .contains("notification rejected"),
         "message d'action attendu : {v}"
     );
-    let status = dispatch_status(
+    let status = notification_status(
         &core,
         "completion/complete",
         json!({

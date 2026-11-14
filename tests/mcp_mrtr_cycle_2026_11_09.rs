@@ -214,7 +214,7 @@ fn mrtr_core() -> ServerCore {
 
 fn call(core: &ServerCore, body: Value) -> Value {
     let reply = core
-        .dispatch(body.to_string().as_bytes())
+        .dispatch_unchecked(body.to_string().as_bytes())
         .expect("une réponse est attendue pour une requête");
     serde_json::from_slice(&reply).unwrap()
 }

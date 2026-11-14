@@ -19,6 +19,45 @@ pub const PROTOCOL_VERSION: &str = "2026-07-28";
 /// `UnsupportedProtocolVersionError` (`-32022`).
 pub const SUPPORTED_VERSIONS: &[&str] = &[PROTOCOL_VERSION];
 
+/// Révision legacy la plus récente servie par le profil `.legacy(true)`.
+///
+/// Le profil legacy est un serveur **dual-era** (spec `2026-07-28`,
+/// « Backward Compatibility with Initialization-Based Versions ») : une
+/// requête portant `_meta` est servie selon `2026-07-28`, un `initialize`
+/// ouvre la sémantique legacy de cette révision.
+pub const LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Révisions servies par le handshake `initialize` du profil legacy, de la
+/// plus récente à la plus ancienne (indice 0 = réponse par défaut).
+///
+/// Distinct de [`SUPPORTED_VERSIONS`], qui régit la négociation par requête
+/// (`_meta`, `server/discover`) : `2025-11-25` n'accepte pas `_meta` et ne
+/// connaît pas `server/discover`.
+pub const LEGACY_SUPPORTED_VERSIONS: &[&str] = &[LEGACY_PROTOCOL_VERSION];
+
+/// Négociation de version du handshake legacy (révision `2025-11-25`,
+/// « Version Negotiation ») : la révision demandée si le profil la sert,
+/// sinon la plus récente révision legacy servie.
+///
+/// « If the server supports the requested protocol version, it MUST respond
+/// with the same version. Otherwise, the server MUST respond with another
+/// protocol version it supports. »
+#[must_use]
+pub fn negotiate_legacy_version(requested: Option<&str>) -> &'static str {
+    let served = requested.and_then(|version| {
+        LEGACY_SUPPORTED_VERSIONS
+            .iter()
+            .find(|served| **served == version)
+            .copied()
+    });
+    served.unwrap_or_else(|| {
+        LEGACY_SUPPORTED_VERSIONS
+            .first()
+            .copied()
+            .unwrap_or(LEGACY_PROTOCOL_VERSION)
+    })
+}
+
 /// Clé `_meta` portant la version de protocole d'une requête (SEP-2575).
 pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 
@@ -35,7 +74,8 @@ pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 pub mod method {
     /// Découverte des capacités du serveur (**MUST**, SEP-2575).
     pub const DISCOVER: &str = "server/discover";
-    /// Handshake legacy `2025-11-25` — toléré, plus requis.
+    /// Handshake legacy `2025-11-25` — servi uniquement en profil legacy
+    /// (`.legacy(true)`) ; refusé en `-32601` en profil strict (défaut).
     pub const INITIALIZE: &str = "initialize";
     /// Méthode legacy `2025-11-25` — retirée de la spec `2026-07-28`.
     pub const PING: &str = "ping";
@@ -98,6 +138,7 @@ pub const NOTIFICATION_PROGRESS: &str = "notifications/progress";
 ///   (MRTR) — le client doit réémettre la requête avec `inputResponses`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ResultType {
     /// Résultat terminal.
     Complete,
@@ -259,6 +300,7 @@ impl InputRequiredSpec {
 /// * `"private"` : cache réservé au client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CacheScope {
     /// Cacheable par les intermédiaires.
     Public,
@@ -651,6 +693,7 @@ pub(crate) fn encode_base64(bytes: &[u8]) -> String {
 /// ou par `From` (`"texte".into()`, `ImageContent::new(..).into()`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum ContentBlock {
     /// Texte.
     Text(TextContent),
@@ -1249,11 +1292,21 @@ pub struct ServerInfo {
 /// Annonce les versions de protocole supportées, les capacités du serveur et
 /// son identité. C'est la méthode que les clients `2026-07-28` appellent
 /// pour découvrir les capacités *avant* toute autre requête.
+///
+/// Conformité `2026-07-28` : la page *Caching* exige `ttlMs` et `cacheScope`
+/// sur tout résultat `resultType: "complete"` de `server/discover`, comme sur
+/// `tools/list` — mêmes valeurs, même mécanisme (SEP-2549).
 #[derive(Debug, Serialize)]
 pub struct DiscoverResult {
     /// Type de résultat — **obligatoire** (SEP-2322).
     #[serde(rename = "resultType")]
     pub result_type: ResultType,
+    /// Durée de vie conseillée des capacités, en millisecondes (SEP-2549).
+    #[serde(rename = "ttlMs")]
+    pub ttl_ms: u64,
+    /// Portée de cache (SEP-2549).
+    #[serde(rename = "cacheScope")]
+    pub cache_scope: CacheScope,
     /// Versions de protocole supportées par le serveur.
     #[serde(rename = "supportedVersions")]
     pub supported_versions: Vec<&'static str>,

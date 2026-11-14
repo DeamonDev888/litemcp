@@ -7,6 +7,11 @@
 //! serveur et le client vivent dans le **même processus** — le VmRSS rendu
 //! couvre donc l'ensemble (serveur + client de charge), comme les mesures
 //! historiques du README. 200 requêtes de warmup, puis 2 300 mesurées.
+//!
+//! Les requêtes portent l'enveloppe du **profil strict** (défaut depuis
+//! 0.10.6) : `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` pour
+//! `tools/call`, et les deux clés `_meta` — le profil tolérant
+//! (`.legacy(true)`) n'est pas utilisé, ce qui est mesuré est le chemin réel.
 
 use litemcp::prelude::*;
 use std::io::{Read, Write};
@@ -16,6 +21,15 @@ use std::time::Instant;
 const WARMUP: usize = 200;
 const N: usize = 2_300;
 
+/// Révision servie par le profil strict.
+const PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// `tools/list` : `Mcp-Name` est interdit sur cette méthode, `_meta` reste exigé.
+const LIST_BODY: &str = r#"{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+
+/// `tools/call` sur `add`, avec l'enveloppe `_meta` exigée en profil strict.
+const CALL_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"add","arguments":{"a":2,"b":3}}}"#;
+
 fn vm_rss_kib() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     status
@@ -23,6 +37,35 @@ fn vm_rss_kib() -> Option<u64> {
         .find(|line| line.starts_with("VmRSS:"))
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|value| value.parse().ok())
+}
+
+/// Requête HTTP complète du profil strict (mêmes en-têtes que le README).
+fn http_request(port: u16, method: &str, name: Option<&str>, body: &str, close: bool) -> String {
+    let mut head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {PROTOCOL_VERSION}\r\nMcp-Method: {method}\r\n"
+    );
+    if let Some(name) = name {
+        head.push_str(&format!("Mcp-Name: {name}\r\n"));
+    }
+    format!(
+        "{head}Content-Length: {}\r\nConnection: {}\r\n\r\n{body}",
+        body.len(),
+        if close { "close" } else { "keep-alive" }
+    )
+}
+
+/// Lit une réponse complète d'une connexion `Connection: close` et vérifie
+/// le statut — jamais un `400` compté comme une mesure.
+fn one_shot(port: u16, method: &str, name: Option<&str>, body: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.write_all(http_request(port, method, name, body, true).as_bytes())?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw)?;
+    assert!(
+        raw.starts_with("HTTP/1.1 200 OK"),
+        "enveloppe stricte refusée ({method}) : {raw:?}"
+    );
+    Ok(raw)
 }
 
 /// Lit une réponse complète délimitée par son `Content-Length`.
@@ -55,15 +98,9 @@ fn read_one_response(stream: &mut TcpStream) -> std::io::Result<()> {
     }
 }
 
-fn request(body: &str) -> String {
-    format!(
-        "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-}
-
 fn main() -> std::io::Result<()> {
     println!("=== litemcp — campagne SLO (release, in-process) ===");
+    println!("profil strict {PROTOCOL_VERSION} : 3 en-têtes + 2 clés `_meta` par requête");
 
     // Démarrage in-process : début de main → bind → première réponse 200.
     let started = Instant::now();
@@ -79,22 +116,21 @@ fn main() -> std::io::Result<()> {
         let _ = bound.serve();
     });
 
-    let mut stream = TcpStream::connect(addr)?;
-    let first = request(r#"{"jsonrpc":"2.0","id":0,"method":"tools/list"}"#);
-    stream.write_all(first.as_bytes())?;
-    let mut buf = [0u8; 8192];
-    let read = stream.read(&mut buf)?;
-    assert!(
-        buf[..read].starts_with(b"HTTP/1.1 200"),
-        "première réponse : {:?}",
-        &buf[..read]
-    );
+    let _ = one_shot(addr.port(), "tools/list", None, LIST_BODY)?;
     let startup_us = started.elapsed().as_micros();
 
-    // Charge keep-alive : warmup puis N mesurées.
-    let call = request(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}"#,
+    // La sonde de démarrage s'est fermée : la charge part sur une connexion
+    // neuve, sans reste de réponse à absorber. Le contrôle vérifie que le
+    // handler répond vraiment avant de compter 2 300 tours.
+    let probe = one_shot(addr.port(), "tools/call", Some("add"), CALL_BODY)?;
+    assert!(
+        probe.contains("\"somme\":5"),
+        "handler non atteint : {probe:?}"
     );
+
+    // Charge keep-alive : warmup puis N mesurées.
+    let mut stream = TcpStream::connect(addr)?;
+    let call = http_request(addr.port(), "tools/call", Some("add"), CALL_BODY, false);
     for _ in 0..WARMUP {
         stream.write_all(call.as_bytes())?;
         read_one_response(&mut stream)?;

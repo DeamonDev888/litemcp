@@ -220,7 +220,7 @@ fn integer_enumeration_integral_float_reaches_the_handler_exact() {
     // `2.0` égale mathématiquement le membre `2` : accepté, et le handler
     // reçoit l'entier **exact**.
     let reply = core
-        .dispatch(
+        .dispatch_unchecked(
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pick","arguments":{"mode":2.0}}}"#,
         )
         .expect("réponse attendue");
@@ -233,7 +233,7 @@ fn integer_enumeration_integral_float_reaches_the_handler_exact() {
 
     // Un non-intégral reste refusé avant le handler.
     let reply = core
-        .dispatch(
+        .dispatch_unchecked(
             br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pick","arguments":{"mode":2.5}}}"#,
         )
         .expect("réponse attendue");
@@ -332,7 +332,7 @@ fn handlers_receive_exact_integers_end_to_end() {
         .core();
 
     let reply = core
-        .dispatch(
+        .dispatch_unchecked(
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"count","arguments":{"n":3.0,"label":"trois"}}}"#,
         )
         .expect("réponse attendue");
@@ -347,7 +347,7 @@ fn handlers_receive_exact_integers_end_to_end() {
 
     // `1e2` aussi.
     let reply = core
-        .dispatch(
+        .dispatch_unchecked(
             br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"count","arguments":{"n":1e2,"label":"cent"}}}"#,
         )
         .expect("réponse attendue");
@@ -357,7 +357,7 @@ fn handlers_receive_exact_integers_end_to_end() {
 
     // Un non-entier reste refusé avant le handler.
     let reply = core
-        .dispatch(
+        .dispatch_unchecked(
             br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"count","arguments":{"n":3.5,"label":"x"}}}"#,
         )
         .expect("réponse attendue");
@@ -593,6 +593,51 @@ fn documented_format_divergences_are_pinned_against_the_reference() {
                 "convergence attendue (refusé) : {instance}"
             );
         }
+    }
+}
+
+// --- Champs optionnels : `null` publié et validé comme la référence --------
+
+#[test]
+fn optional_fields_publish_null_and_match_the_reference() {
+    // M3 : un champ `.opt()` accepte `null` (comme `Option<T>` côté
+    // schemars) — le schéma publié le dit (`type: [T, "null"]`) et le
+    // verdict reste identique à celui du validateur de référence.
+    let schema = zod::object()
+        .opt("s", zod::string().max(3))
+        .opt("n", zod::uint())
+        .opt("d", zod::integer().default(1));
+    let published = schema.json();
+    assert_eq!(
+        published["properties"]["s"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        published["properties"]["n"]["type"],
+        json!(["integer", "null"])
+    );
+    // Un champ couvert par un **défaut** suit le même contrat : `null` ≡
+    // absence (l'exception a été retirée) — le `default` reste publié à côté
+    // du type nullable, et `null` reçoit le défaut.
+    assert_eq!(
+        published["properties"]["d"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(published["properties"]["d"]["default"], 1);
+
+    for instance in [
+        json!({}),
+        json!({ "s": null, "n": null }),
+        json!({ "s": "ab", "n": 1e19 }),
+        json!({ "s": "abcd" }),
+        json!({ "d": null }),
+        json!({ "d": 2.0 }),
+        json!({ "n": -1 }),
+        json!({ "n": 1e30 }),
+        json!({ "n": 18446744073709551615u64 }),
+        json!({ "s": 1 }),
+    ] {
+        assert_same(&schema, instance.clone(), "object().opt(...)");
     }
 }
 

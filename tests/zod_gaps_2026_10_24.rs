@@ -5,7 +5,7 @@ use litemcp::prelude::*;
 use serde_json::json;
 
 fn call(core: &litemcp::ServerCore, body: &str) -> serde_json::Value {
-    let reply = core.dispatch(body.as_bytes()).unwrap();
+    let reply = core.dispatch_unchecked(body.as_bytes()).unwrap();
     serde_json::from_slice(&reply).unwrap()
 }
 

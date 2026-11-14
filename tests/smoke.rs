@@ -24,7 +24,7 @@ fn tool_parse_deserialize_failure_is_protocol_error_32602() {
     }
 
     let reply = core
-        .dispatch(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pick","arguments":{"n":4294967296}}}"#)
+        .dispatch_unchecked(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pick","arguments":{"n":4294967296}}}"#)
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&reply).unwrap();
     assert_eq!(

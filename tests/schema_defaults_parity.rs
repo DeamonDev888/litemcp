@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex};
 // ===========================================================================
 
 fn call(core: &litemcp::ServerCore, body: &str) -> Value {
-    let reply = core.dispatch(body.as_bytes()).unwrap();
+    let reply = core.dispatch_unchecked(body.as_bytes()).unwrap();
     serde_json::from_slice(&reply).unwrap()
 }
 
@@ -901,4 +901,429 @@ fn schemas_booleens_aux_emplacements_json_schema_restants() {
     // booléen est un schéma JSON Schema) : c'est l'USAGE comme inputSchema
     // d'outil qui est refusé.
     let _ = from_json_schema(json!(true));
+}
+
+// ===========================================================================
+// 9. M1 — aucun défaut injecté dans une branche `anyOf`/`oneOf` non choisie
+// ===========================================================================
+
+/// Verdict du validateur de **référence** (`jsonschema`) sur un document.
+fn reference_valid(document: &Value, instance: &Value) -> bool {
+    jsonschema::options()
+        .build(document)
+        .expect("le document doit compiler chez la référence")
+        .is_valid(instance)
+}
+
+/// Verdict de l'adaptateur sur une instance.
+fn accepted(schema: &dyn Schema, instance: &Value) -> bool {
+    let mut issues = litemcp::zod::Issues::new();
+    let mut path = litemcp::zod::Path::root("arguments");
+    schema.validate(&mut path, instance, &mut issues);
+    issues.is_empty()
+}
+
+/// `oneOf` de deux objets **stricts** : `{"a": 5}` ne satisfait que la
+/// première branche, la seconde porte un défaut `b`.
+fn one_of_strict_doc() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": { "a": { "type": "integer" } },
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": { "b": { "type": "integer", "default": 2 } },
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+#[test]
+fn aucun_defaut_injecte_dans_une_branche_one_of_non_selectionnee() {
+    // Preuve du défaut (audit M1) : la référence juge `{"a": 5}` valide…
+    assert!(
+        reference_valid(&one_of_strict_doc(), &json!({ "a": 5 })),
+        "l'instance de départ est valide"
+    );
+    // …et l'appel doit donc réussir : avant correctif, le `b: 2` de l'autre
+    // branche était injecté, rendant l'instance invalide (-32602).
+    let vu = seen_arguments(from_json_schema(one_of_strict_doc()), json!({ "a": 5 }));
+    assert_eq!(
+        vu,
+        json!({ "a": 5 }),
+        "aucun défaut ne doit venir d'une branche non sélectionnée"
+    );
+}
+
+#[test]
+fn defaut_de_la_branche_selectionnee_reste_injecte() {
+    // Le correctif n'est pas « plus d'injection du tout » : `{"a": 5}`
+    // sélectionne la première branche, qui porte `c` avec défaut 7.
+    let doc = json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "a": { "type": "integer" },
+                    "c": { "type": "integer", "default": 7 }
+                },
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": { "b": { "type": "integer" } },
+                "additionalProperties": false
+            }
+        ]
+    });
+    let vu = seen_arguments(from_json_schema(doc), json!({ "a": 5 }));
+    assert_eq!(
+        vu,
+        json!({ "a": 5, "c": 7 }),
+        "le défaut de la branche choisie reste injecté"
+    );
+}
+
+/// Forme publiée par `schemars` pour une énumération taguée avec un défaut
+/// dans une variante (`oneOf` d'objets, `const` sur le discriminant).
+fn tagged_enum_doc() -> Value {
+    json!({
+        "type": "object",
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": { "kind": { "type": "string", "const": "fast" } },
+                "required": ["kind"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "const": "slow" },
+                    "delay": { "type": "integer", "format": "uint8", "default": 0, "maximum": 255, "minimum": 0 }
+                },
+                "required": ["kind"]
+            }
+        ]
+    })
+}
+
+#[test]
+fn instance_valide_avant_injection_reste_valide_apres() {
+    let cases: Vec<(Value, Value)> = vec![
+        // `oneOf` strict : le défaut de l'autre branche invalidait l'instance.
+        (one_of_strict_doc(), json!({ "a": 5 })),
+        // `anyOf` strict : même défaut, autre mot-clé.
+        (
+            json!({
+                "anyOf": [
+                    { "type": "object", "properties": { "a": { "type": "integer" } }, "additionalProperties": false },
+                    { "type": "object", "properties": { "b": { "type": "integer", "default": 2 } }, "additionalProperties": false }
+                ]
+            }),
+            json!({ "a": 5 }),
+        ),
+        // `anyOf` : `{}` satisfait les deux branches, une seule reçoit ses défauts.
+        (
+            json!({
+                "anyOf": [
+                    { "type": "object", "properties": { "a": { "type": "integer", "default": 1 } }, "additionalProperties": false },
+                    { "type": "object", "properties": { "b": { "type": "integer", "default": 2 } }, "additionalProperties": false }
+                ]
+            }),
+            json!({}),
+        ),
+        // Énumération taguée (forme publiée par schemars).
+        (tagged_enum_doc(), json!({ "kind": "fast" })),
+        (tagged_enum_doc(), json!({ "kind": "slow" })),
+        // Objet simple, défaut imbriqué.
+        (
+            json!({
+                "type": "object",
+                "properties": { "outer": { "type": "object", "properties": { "d": { "type": "integer", "default": 2 } } } }
+            }),
+            json!({ "outer": {} }),
+        ),
+        // `allOf` : toutes les branches s'appliquent, les défauts restent injectés.
+        (
+            json!({ "type": "object", "allOf": [ { "properties": { "a": { "type": "integer", "default": 1 } } } ] }),
+            json!({}),
+        ),
+    ];
+    for (index, (document, instance)) in cases.into_iter().enumerate() {
+        assert!(
+            reference_valid(&document, &instance),
+            "cas {index} : l'instance de départ doit être valide : {instance} / {document}"
+        );
+        let mut after = instance.clone();
+        from_json_schema(document.clone()).apply_defaults(&mut after);
+        assert!(
+            reference_valid(&document, &after),
+            "cas {index} : l'injection a invalidé une instance valide ({instance} → {after}) : {document}"
+        );
+    }
+}
+
+#[test]
+fn enum_taguee_schemars_ne_recoit_pas_le_defaut_d_une_autre_variante() {
+    #[derive(JsonSchema)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum Mode {
+        Fast,
+        Slow {
+            #[serde(default)]
+            delay: u8,
+        },
+    }
+
+    // `{"kind":"fast"}` : valide, et le handler ne doit PAS recevoir le
+    // `delay` de la variante `slow`.
+    let vu = seen_arguments(from_schemars::<Mode>(), json!({ "kind": "fast" }));
+    assert_eq!(vu, json!({ "kind": "fast" }), "aucun `delay` inventé");
+
+    // `{"kind":"slow"}` : la branche sélectionnée porte le défaut → injecté.
+    let vu = seen_arguments(from_schemars::<Mode>(), json!({ "kind": "slow" }));
+    assert_eq!(
+        vu,
+        json!({ "kind": "slow", "delay": 0 }),
+        "le défaut de la variante choisie reste injecté"
+    );
+}
+
+// ===========================================================================
+// 10. M3 — `Option<T>` : même verdict `null` sur les trois chemins
+// ===========================================================================
+
+#[derive(JsonSchema)]
+#[allow(dead_code)] // dérivation uniquement
+struct OptionParity {
+    n: Option<u64>,
+    s: Option<String>,
+}
+
+#[test]
+fn option_null_verdict_identique_pour_zod_et_schemars() {
+    let zod_schema = litemcp::zod::object()
+        .opt("n", litemcp::zod::uint())
+        .opt("s", litemcp::zod::string());
+    let derived = from_schemars::<OptionParity>();
+
+    // Le schéma PUBLIÉ dit la même chose des deux côtés : `null` admis, et
+    // la borne haute de `u64` présente (schemars l'omet, l'adaptateur la
+    // complète).
+    for (label, document) in [("zod", zod_schema.json()), ("schemars", derived.json())] {
+        assert_eq!(
+            document["properties"]["s"]["type"],
+            json!(["string", "null"]),
+            "type publié côté {label} : {document}"
+        );
+        assert_eq!(
+            document["properties"]["n"]["type"],
+            json!(["integer", "null"]),
+            "type publié côté {label} : {document}"
+        );
+        assert_eq!(
+            document["properties"]["n"]["maximum"],
+            json!(u64::MAX),
+            "borne haute publiée côté {label} : {document}"
+        );
+    }
+
+    // …et le verdict est identique sur `null`, l'absence et les valeurs.
+    let two_pow_64: Value = serde_json::from_str("18446744073709551616").unwrap();
+    for instance in [
+        json!({}),
+        json!({ "n": null, "s": null }),
+        json!({ "n": 7, "s": "x" }),
+        json!({ "n": 7.0 }),
+        json!({ "n": -1 }),
+        json!({ "n": 1.5 }),
+        json!({ "s": 3 }),
+        json!({ "n": u64::MAX }),
+        json!({ "n": two_pow_64 }),
+        json!({ "n": 1e19 }),
+    ] {
+        assert_eq!(
+            accepted(&zod_schema, &instance),
+            accepted(&derived, &instance),
+            "verdict divergent sur {instance}"
+        );
+    }
+}
+
+#[test]
+fn option_null_arrive_comme_absent_dans_les_deux_adaptateurs() {
+    // `null` n'est ni refusé ni remplacé : il arrive tel quel au handler,
+    // qui le lit comme l'absence (`Option<T>` → `None`).
+    for (label, vu) in [
+        (
+            "zod",
+            seen_arguments(
+                litemcp::zod::object()
+                    .opt("n", litemcp::zod::integer().min(0))
+                    .opt("s", litemcp::zod::string()),
+                json!({ "n": null }),
+            ),
+        ),
+        (
+            "schemars",
+            seen_arguments(from_schemars::<OptionParity>(), json!({ "n": null })),
+        ),
+    ] {
+        assert_eq!(vu, json!({ "n": null }), "côté {label}");
+    }
+}
+
+// ===========================================================================
+// 10bis. D1 — `Option<T>` + `default` : `null` ≡ absence, un seul verdict
+// ===========================================================================
+
+/// Le cas laissé en exception par C1 : un champ `Option<u64>` couvert par un
+/// `#[serde(default)]` — schemars publie `type: ["integer", "null"]` et
+/// accepte `null`, zod publiait `integer` et le refusait.
+#[derive(JsonSchema)]
+#[allow(dead_code)] // dérivation uniquement
+struct OptionDefaultParity {
+    #[serde(default)]
+    v: Option<u64>,
+}
+
+fn zod_uint_default() -> impl Schema + 'static {
+    litemcp::zod::object().opt("v", litemcp::zod::uint().default(3))
+}
+
+#[test]
+fn option_avec_defaut_meme_type_publie_et_meme_verdict_sur_null() {
+    let zod_schema = zod_uint_default();
+    let derived = from_schemars::<OptionDefaultParity>();
+    let zod_doc = zod_schema.json();
+    let derived_doc = derived.json();
+
+    // Même `type` publié : tableau incluant `null`, et `default` conservé.
+    for (label, document) in [("zod", &zod_doc), ("schemars", &derived_doc)] {
+        assert_eq!(
+            document["properties"]["v"]["type"],
+            json!(["integer", "null"]),
+            "type publié côté {label} : {document}"
+        );
+    }
+    assert_eq!(zod_doc["properties"]["v"]["default"], json!(3));
+    assert_eq!(derived_doc["properties"]["v"]["default"], Value::Null);
+
+    // Même verdict sur l'absence, `null`, une valeur, un négatif, un non entier.
+    for instance in [
+        json!({}),
+        json!({ "v": null }),
+        json!({ "v": 7 }),
+        json!({ "v": -1 }),
+        json!({ "v": 1.5 }),
+    ] {
+        assert_eq!(
+            accepted(&zod_schema, &instance),
+            accepted(&derived, &instance),
+            "verdict divergent sur {instance}"
+        );
+    }
+
+    // Côté zod : `{}` ET `null` injectent le défaut (null ≡ absence).
+    for instance in [json!({}), json!({ "v": null })] {
+        assert_eq!(
+            seen_arguments(zod_uint_default(), instance.clone()),
+            json!({ "v": 3 }),
+            "le défaut doit être injecté sur {instance}"
+        );
+    }
+
+    // Côté schemars : le défaut serde (`None`) reste injecté pour `{}` — la
+    // sémantique serde n'est pas modifiée (seul le VERDICT est figé).
+    assert_eq!(
+        seen_arguments(from_schemars::<OptionDefaultParity>(), json!({})),
+        json!({ "v": null }),
+        "le défaut serde reste injecté"
+    );
+}
+
+// ===========================================================================
+// 11. M5 — inputSchema dont la racine n'admet pas d'objet : refusé à
+//     l'enregistrement (même convention que la racine booléenne)
+// ===========================================================================
+
+#[test]
+#[should_panic(expected = "inputSchema")]
+fn input_schema_racine_string_refusee_pour_un_outil() {
+    let _ = ServerBuilder::new("reg", "1.0").tool_typed(
+        "t",
+        "t",
+        from_json_schema(json!({ "type": "string" })),
+        |_args| Ok(json!({})),
+    );
+}
+
+#[test]
+#[should_panic(expected = "inputSchema")]
+fn input_schema_racine_enum_refusee_pour_un_outil() {
+    // Une racine `enum` sans `object` n'admet aucun argument : l'outil
+    // serait inutilisable (tout appel rendrait -32602).
+    let _ = ServerBuilder::new("reg", "1.0").tool_typed(
+        "t",
+        "t",
+        from_json_schema(json!({ "enum": ["a", "b"] })),
+        |_args| Ok(json!({})),
+    );
+}
+
+#[test]
+#[should_panic(expected = "inputSchema")]
+fn input_schema_racine_ref_vers_non_objet_refusee() {
+    let _ = ServerBuilder::new("reg", "1.0").tool_typed(
+        "t",
+        "t",
+        from_json_schema(json!({
+            "$ref": "#/$defs/S",
+            "$defs": { "S": { "type": "string" } }
+        })),
+        |_args| Ok(json!({})),
+    );
+}
+
+#[test]
+#[should_panic(expected = "inputSchema")]
+fn input_schema_racine_non_objet_refusee_via_from_schemars() {
+    // L'audit (M5) : `enum Simple { Alpha, Beta }` publie
+    // `{"enum":["Alpha","Beta"],"type":"string"}` — inutilisable comme
+    // inputSchema, découvert seulement au premier appel avant correctif.
+    #[derive(JsonSchema)]
+    #[allow(dead_code)]
+    enum Simple {
+        Alpha,
+        Beta,
+    }
+    let _ =
+        ServerBuilder::new("reg", "1.0")
+            .tool_typed("t", "t", from_schemars::<Simple>(), |_args| Ok(json!({})));
+}
+
+#[test]
+fn input_schema_racine_qui_admet_un_objet_reste_accepte() {
+    // Formes valides : `type` objet, tableau contenant `object`, `anyOf`
+    // d'objets, racine `$ref` vers un objet, racine sans `type`.
+    let documents = [
+        json!({ "type": "object" }),
+        json!({ "type": ["object", "null"] }),
+        json!({ "anyOf": [ { "type": "object", "properties": { "a": { "type": "integer" } } } ] }),
+        json!({ "$ref": "#/$defs/O", "$defs": { "O": { "type": "object" } } }),
+        json!({ "properties": { "a": { "type": "integer" } } }),
+    ];
+    for document in documents {
+        let _ = ServerBuilder::new("reg", "1.0").tool_typed(
+            "t",
+            "t",
+            from_json_schema(document.clone()),
+            |_args| Ok(json!({})),
+        );
+    }
 }

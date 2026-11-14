@@ -38,9 +38,11 @@
 //! });
 //!
 //! // Dispatch embarqué (l'app hôte possède sa propre route HTTP) ou socket
-//! // dédié : le snapshot courant sert la requête.
+//! // dédié : le snapshot courant sert la requête. Un corps nu ne passe pas
+//! // le profil strict — `dispatch_unchecked` est réservé aux appelants qui
+//! // garantissent déjà des corps MCP 2026-07-28 conformes.
 //! let snapshot = gw.snapshot();
-//! let _ = snapshot.dispatch(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+//! let _ = snapshot.dispatch_unchecked(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
 //! # Ok(())
 //! # }
 //! ```
@@ -247,9 +249,18 @@ impl Gateway {
     }
 
     /// Dispatch sur le snapshot courant — voir [`ServerCore::dispatch`].
-    /// `None` = notification (aucune réponse).
+    /// `None` = notification (aucune réponse). Le profil configuré
+    /// s'applique : en strict (défaut), un corps sans `_meta` est refusé en
+    /// `-32602`.
     pub fn dispatch(&self, body: &[u8]) -> Option<Vec<u8>> {
         self.snapshot().dispatch(body)
+    }
+
+    /// Dispatch sur le snapshot courant **sans contrôle de profil** — voir
+    /// [`ServerCore::dispatch_unchecked`]. Réservé aux appelants qui
+    /// garantissent déjà des corps conformes (tests, harnais de mesure).
+    pub fn dispatch_unchecked(&self, body: &[u8]) -> Option<Vec<u8>> {
+        self.snapshot().dispatch_unchecked(body)
     }
 
     /// Dispatch sur le snapshot courant, avec vérification des en-têtes de
@@ -440,15 +451,19 @@ mod tests {
     fn outil_ajoute_apres_construction_devient_servi() {
         let gw = Gateway::new(build("a"));
         // avant l'edit : un seul outil
-        let reply = gw.dispatch(rpc("tools/list", 1).as_bytes()).unwrap();
+        let reply = gw
+            .dispatch_unchecked(rpc("tools/list", 1).as_bytes())
+            .unwrap();
         assert_eq!(tool_names(&reply), vec!["a".to_string()]);
 
         gw.edit(|b| b.tool("b", "outil ajouté", |_args| Ok(json!({ "from": "b" }))));
 
         // après l'edit : les deux outils, et l'appel du nouveau réussit
-        let reply = gw.dispatch(rpc("tools/list", 2).as_bytes()).unwrap();
+        let reply = gw
+            .dispatch_unchecked(rpc("tools/list", 2).as_bytes())
+            .unwrap();
         assert_eq!(tool_names(&reply), vec!["a".to_string(), "b".to_string()]);
-        let reply = gw.dispatch(call("b", 3).as_bytes()).unwrap();
+        let reply = gw.dispatch_unchecked(call("b", 3).as_bytes()).unwrap();
         let v: Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(v["result"]["structuredContent"]["from"], "b");
     }
@@ -465,13 +480,15 @@ mod tests {
             b
         });
 
-        let reply = gw.dispatch(rpc("tools/list", 1).as_bytes()).unwrap();
+        let reply = gw
+            .dispatch_unchecked(rpc("tools/list", 1).as_bytes())
+            .unwrap();
         assert_eq!(tool_names(&reply), vec!["a".to_string()]);
-        let reply = gw.dispatch(call("b", 2).as_bytes()).unwrap();
+        let reply = gw.dispatch_unchecked(call("b", 2).as_bytes()).unwrap();
         let v: Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(v["error"]["code"], -32602, "outil retiré → Unknown tool");
         // l'outil restant continue d'être servi
-        let reply = gw.dispatch(call("a", 3).as_bytes()).unwrap();
+        let reply = gw.dispatch_unchecked(call("a", 3).as_bytes()).unwrap();
         let v: Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(v["result"]["structuredContent"]["from"], "a");
         // remove sur un absent → false, sans toucher au reste
@@ -490,7 +507,9 @@ mod tests {
             let b = b.annotate("y", crate::protocol::ToolAnnotations::new().read_only(true));
             b.tool("y", "avec annotation", |_args| Ok(json!({})))
         });
-        let reply = gw.dispatch(rpc("tools/list", 1).as_bytes()).unwrap();
+        let reply = gw
+            .dispatch_unchecked(rpc("tools/list", 1).as_bytes())
+            .unwrap();
         let v: Value = serde_json::from_slice(&reply).unwrap();
         let y = v["result"]["tools"]
             .as_array()
@@ -505,7 +524,9 @@ mod tests {
             b.remove_tool("y");
             b.tool("y", "sans annotation", |_args| Ok(json!({})))
         });
-        let reply = gw.dispatch(rpc("tools/list", 2).as_bytes()).unwrap();
+        let reply = gw
+            .dispatch_unchecked(rpc("tools/list", 2).as_bytes())
+            .unwrap();
         let v: Value = serde_json::from_slice(&reply).unwrap();
         let y = v["result"]["tools"]
             .as_array()
@@ -556,7 +577,9 @@ mod tests {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     // chaque lecture doit rendre une réponse complète : jamais
                     // un catalogue à moitié reconstruit
-                    let reply = gw.dispatch(rpc("tools/list", tours).as_bytes()).unwrap();
+                    let reply = gw
+                        .dispatch_unchecked(rpc("tools/list", tours).as_bytes())
+                        .unwrap();
                     let names = tool_names(&reply);
                     assert!(!names.is_empty(), "catalogue vide intercepté");
                     assert!(
@@ -597,7 +620,7 @@ mod tests {
         }
         // toutes les mutations sont passées : état final propre
         assert_eq!(gw.tool_count(), 1, "64 ajouts + 64 retraits → retour à 1");
-        let reply = gw.dispatch(call("a", 999).as_bytes()).unwrap();
+        let reply = gw.dispatch_unchecked(call("a", 999).as_bytes()).unwrap();
         let v: Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(v["result"]["structuredContent"]["from"], "a");
     }
@@ -702,7 +725,7 @@ mod tests {
         let _ = lecteur.join();
 
         let reply = gw
-            .dispatch(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+            .dispatch_unchecked(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
             .unwrap();
         let v: Value = serde_json::from_slice(&reply).unwrap();
         let noms: Vec<String> = v["result"]["tools"]
@@ -730,7 +753,9 @@ mod tests {
         }));
         assert!(outcome.is_err(), "le panic doit se propager à l'appelant");
         // le service continue sur l'ancien snapshot, inchangé
-        let reply = gw.dispatch(rpc("tools/list", 1).as_bytes()).unwrap();
+        let reply = gw
+            .dispatch_unchecked(rpc("tools/list", 1).as_bytes())
+            .unwrap();
         assert_eq!(tool_names(&reply), vec!["a".to_string()]);
         let after = gw.snapshot();
         assert!(
@@ -742,13 +767,22 @@ mod tests {
     #[test]
     fn dispatch_with_headers_transmis_au_snapshot() {
         let gw = Gateway::new(build("a"));
+        // Corps strict (profil par défaut) : `_meta` obligatoire, sinon le
+        // refus de profil précède le contrôle des en-têtes.
         let body = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": { "name": "a", "arguments": {} }
+            "params": {
+                "name": "a", "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
         })
         .to_string();
         // en-tête cohérent → réponse normale
         let headers = crate::server::McpHeaders {
+            protocol_version: Some("2026-07-28".to_string()),
             method: Some("tools/call".to_string()),
             name: Some("a".to_string()),
             ..Default::default()
@@ -759,6 +793,7 @@ mod tests {
         assert!(serde_json::from_slice::<Value>(&reply).unwrap()["result"].is_object());
         // en-tête incohérent → -32020 (mismatch)
         let headers = crate::server::McpHeaders {
+            protocol_version: Some("2026-07-28".to_string()),
             method: Some("ping".to_string()),
             name: None,
             ..Default::default()
@@ -781,7 +816,7 @@ mod tests {
                 Err(ToolError::rate_limited("quota").retry_after_ms(500))
             })
         });
-        let reply = gw.dispatch(call("rate", 1).as_bytes()).unwrap();
+        let reply = gw.dispatch_unchecked(call("rate", 1).as_bytes()).unwrap();
         let v: Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(v["result"]["isError"], true);
         assert_eq!(
@@ -806,14 +841,20 @@ mod tests {
                 Ok(vec![crate::protocol::PromptMessage::user("bonjour")])
             })
         });
-        let reply = gw.dispatch(rpc("resources/list", 1).as_bytes()).unwrap();
+        let reply = gw
+            .dispatch_unchecked(rpc("resources/list", 1).as_bytes())
+            .unwrap();
         let v: Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(v["result"]["resources"][0]["uri"], "mcp://etat");
-        let reply = gw.dispatch(rpc("prompts/list", 2).as_bytes()).unwrap();
+        let reply = gw
+            .dispatch_unchecked(rpc("prompts/list", 2).as_bytes())
+            .unwrap();
         let v: Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(v["result"]["prompts"][0]["name"], "salut");
         // et l'outil ajouté dans le MÊME edit est là aussi
-        let reply = gw.dispatch(rpc("tools/list", 3).as_bytes()).unwrap();
+        let reply = gw
+            .dispatch_unchecked(rpc("tools/list", 3).as_bytes())
+            .unwrap();
         assert!(tool_names(&reply).contains(&"a".to_string()));
     }
 

@@ -75,6 +75,11 @@ pub const MAX_DEPTH: usize = 128;
 pub struct Issues {
     items: Vec<String>,
     overflow: usize,
+    /// Erreur **interne** (schéma exécuteur indisponible) : la panne n'est
+    /// pas imputable au client — le noyau la rend en `-32603` avec un
+    /// message neutre, jamais en `-32602`, et le détail (URL, nom de
+    /// feature, message du compilateur de schéma) ne sort pas.
+    internal: bool,
 }
 
 impl Issues {
@@ -112,13 +117,33 @@ impl Issues {
 
     /// Au moins un problème ?
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty() && self.overflow == 0
+        self.items.is_empty() && self.overflow == 0 && !self.internal
+    }
+
+    /// Signale une **erreur interne** de schéma : le validateur exécuteur
+    /// n'a pas pu être compilé (document invalide côté dérivation, panne de
+    /// l'adaptateur). Le collecteur cesse d'être vide et le noyau rend
+    /// l'appel en `-32603` avec un message neutre — jamais en `-32602`
+    /// (ce n'est pas la faute du client) et sans détail interne.
+    pub fn mark_internal(&mut self) {
+        self.internal = true;
+    }
+
+    /// Le collecteur porte-t-il une **erreur interne** ?
+    #[must_use]
+    pub fn is_internal(&self) -> bool {
+        self.internal
     }
 
     /// Issues rendues : les premières stockées, plus — s'il y en a — un
-    /// récapitulatif des problèmes omis.
+    /// récapitulatif des problèmes omis, plus le marqueur neutre d'une
+    /// erreur interne (ni URL de schéma, ni nom de feature, ni message de
+    /// bibliothèque).
     pub fn render(&self) -> Vec<String> {
         let mut out = self.items.clone();
+        if self.internal {
+            out.push("internal error".to_string());
+        }
         if self.overflow > 0 {
             out.push(format!(
                 "… and {overflow} more issue(s) omitted",
@@ -513,6 +538,21 @@ struct Field {
     required: bool,
 }
 
+impl Field {
+    /// Le champ admet-il `null` ?
+    ///
+    /// `null` et l'absence valent « pas de valeur » : un champ est nullable
+    /// dès que son absence est couverte — optionnel ([`.opt`](Obj::opt))
+    /// **ou** porteur d'un défaut (`.default`, un champ requis avec défaut
+    /// sort de `required` : `Obj::json`). Le schéma publié porte alors
+    /// `type: [T, "null"]` **avec** le `default` conservé, et `null` reçoit
+    /// le défaut comme une absence ([`Obj::apply_defaults`]). Un champ
+    /// requis **sans** défaut reste `T` seul et refuse `null`.
+    fn nullable(&self) -> bool {
+        !self.required || self.schema.default_value().is_some()
+    }
+}
+
 /// Objet — équivalent de `z.object({ ... })`. Toujours la racine d'un
 /// schéma d'arguments d'outil.
 ///
@@ -549,7 +589,16 @@ impl Obj {
         self
     }
 
-    /// Ajoute un champ **optionnel** (peut être absent).
+    /// Ajoute un champ **optionnel** : absent, il est valide ; présent et
+    /// `null`, il l'est aussi.
+    ///
+    /// Le champ est publié avec `null` admis (`"type": [T, "null"]`, la
+    /// forme que `schemars` publie pour `Option<T>`) et validé comme tel :
+    /// `null` et l'absence valent tous deux « pas de valeur », par les
+    /// trois chemins (`#[tool] fn f(v: Option<T>)`, `.opt(..)`, et
+    /// `from_schemars`). Un champ qui porte une **valeur par défaut** suit
+    /// le même contrat : `null` vaut absence et **reçoit le défaut** (le
+    /// schéma publié garde `default` à côté du type nullable).
     ///
     /// **Panie de développement si le nom est déjà présent** (voir
     /// [`Obj::field`]).
@@ -595,12 +644,67 @@ impl Obj {
     }
 }
 
+/// Ajoute `null` au type publié d'un champ optionnel.
+///
+/// Forme retenue : `"type": [T, "null"]` — exactement ce que `schemars`
+/// publie pour un `Option<T>`, pour que les deux adaptateurs annoncent le
+/// même contrat (la parité est testée dans `tests/schema_defaults_parity.rs`).
+/// Un schéma sans `type` de premier niveau (`anyOf`, `$ref`, `enum`…) est
+/// enveloppé dans `anyOf` avec la branche `null` — forme JSON Schema
+/// 2020-12 canonique, le document publié dit alors exactement ce qui est
+/// validé.
+fn make_nullable(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        // Booléen : `true` accepte déjà `null` ; `false` n'admet rien, le
+        // rendre nullable changerait son sens — laissé tel quel.
+        return;
+    };
+    match object.get_mut("type") {
+        Some(Value::Array(kinds)) => {
+            if !kinds.iter().any(|kind| kind.as_str() == Some("null")) {
+                kinds.push(Value::String("null".to_string()));
+            }
+            return;
+        }
+        Some(Value::String(current)) => {
+            let current = current.clone();
+            if current != "null" {
+                object.insert("type".to_string(), json!([current, "null"]));
+            }
+            return;
+        }
+        // Forme `type` inattendue (nombre, objet) : ne pas mentir sur le
+        // contrat — la validation suit le schéma interne.
+        Some(_) => return,
+        None => {}
+    }
+    // Déjà nullable (`nullable(…)` publié en `anyOf` avec la branche
+    // `null`) : ne pas empiler une seconde enveloppe.
+    if object
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .is_some_and(|branches| {
+            branches
+                .iter()
+                .any(|branch| branch.get("type").and_then(Value::as_str) == Some("null"))
+        })
+    {
+        return;
+    }
+    let inner = std::mem::replace(schema, Value::Null);
+    *schema = json!({ "anyOf": [inner, { "type": "null" }] });
+}
+
 impl Schema for Obj {
     fn json(&self) -> Value {
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
         for field in &self.fields {
-            properties.insert(field.name.clone(), field.schema.json());
+            let mut published = field.schema.json();
+            if field.nullable() {
+                make_nullable(&mut published);
+            }
+            properties.insert(field.name.clone(), published);
             // Un champ **avec valeur par défaut** n'est pas `required` :
             // son absence est couverte par le défaut (publié dans le
             // `default` du schéma de la propriété).
@@ -651,6 +755,11 @@ impl Schema for Obj {
         path.depth += 1;
         for field in &self.fields {
             match map.get(&field.name) {
+                // `null` = « pas de valeur » pour un champ nullable : publié
+                // `type: [T, "null"]` (voir `Obj::json`), validé comme tel —
+                // le type interne n'est pas consulté. Un champ à défaut
+                // reçoit ce défaut à l'injection ([`Obj::apply_defaults`]).
+                Some(child) if field.nullable() && child.is_null() => {}
                 Some(child) => {
                     if issues.is_full() {
                         field.schema.validate(path, child, issues);
@@ -699,6 +808,17 @@ impl Schema for Obj {
             return;
         };
         for field in &self.fields {
+            // `null` ≡ absence (voir `Field::nullable`) : un champ à défaut
+            // reçoit le défaut, un champ sans défaut garde `null` (le handler
+            // le lit comme « pas de valeur »).
+            if field.nullable() && map.get(&field.name).is_some_and(Value::is_null) {
+                if let Some(default) = field.schema.default_value() {
+                    let mut injected = default.clone();
+                    field.schema.apply_defaults(&mut injected);
+                    map.insert(field.name.clone(), injected);
+                }
+                continue;
+            }
             match map.get_mut(&field.name) {
                 Some(child) => field.schema.apply_defaults(child),
                 None => {
@@ -2187,7 +2307,10 @@ mod tests {
                 "properties": {
                     // Les bornes publiées sont celles réellement appliquées.
                     "a": { "type": "integer", "minimum": i64::MIN, "maximum": i64::MAX },
-                    "b": { "type": "string", "maxLength": 8 }
+                    // Un champ optionnel publie `null` en plus du type
+                    // interne (M3 : `null` vaut absence, comme `Option<T>`
+                    // côté schemars) — publié = validé.
+                    "b": { "type": ["string", "null"], "maxLength": 8 }
                 },
                 "required": ["a"],
                 "additionalProperties": false

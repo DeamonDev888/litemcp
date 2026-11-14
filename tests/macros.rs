@@ -90,7 +90,7 @@ fn macro_parameter_default_is_published_and_applied() {
 }
 
 fn call(core: &litemcp::ServerCore, body: &str) -> Value {
-    let reply = core.dispatch(body.as_bytes()).unwrap();
+    let reply = core.dispatch_unchecked(body.as_bytes()).unwrap();
     serde_json::from_slice(&reply).unwrap()
 }
 
@@ -134,7 +134,14 @@ fn macro_derives_the_input_schema_from_parameter_types() {
         "Option<T> est optionnel, Vec<T> requis : {schema}"
     );
     assert_eq!(schema["properties"]["query"]["type"], "string");
-    assert_eq!(schema["properties"]["limit"]["type"], "integer");
+    // `Option<T>` publie `null` en plus du type interne (`type: [T, "null"]`),
+    // exactement comme `schemars` le fait pour `Option<T>` : `null` et
+    // l'absence valent tous deux « pas de valeur ».
+    assert_eq!(
+        schema["properties"]["limit"]["type"],
+        json!(["integer", "null"]),
+        "{schema}"
+    );
     assert_eq!(schema["properties"]["tags"]["type"], "array");
     assert_eq!(schema["properties"]["tags"]["items"]["type"], "string");
 
@@ -189,6 +196,42 @@ fn macro_tool_executes_with_validated_arguments() {
     );
     assert_eq!(v["result"]["structuredContent"]["celsius"], 21.5, "{v}");
     assert_eq!(v["result"]["structuredContent"]["actif"], true, "{v}");
+}
+
+#[test]
+fn option_accepte_null_comme_absent() {
+    // M3 : les trois chemins (`#[tool]`, `.opt()` de `zod`, `from_schemars`)
+    // rendent le MÊME verdict sur `null` — accepté, et équivalent à
+    // l'absence (le handler reçoit `None`). Avant correctif : `-32602`
+    // « expected an integer » par la macro, alors que `from_schemars`
+    // acceptait `null` pour le même `Option<T>`.
+    let core = ServerBuilder::new("m", "0.1.0")
+        .with_tool(register_recherche)
+        .core();
+
+    let v = call_tool(
+        &core,
+        1,
+        "recherche",
+        json!({ "query": "rust mcp", "limit": null, "tags": [] }),
+    );
+    assert!(
+        v.get("error").is_none(),
+        "`null` doit être accepté pour `Option<u64>` : {v}"
+    );
+    assert_eq!(
+        v["result"]["structuredContent"]["limit"], 10,
+        "`null` → None, exactement comme l'absence : {v}"
+    );
+
+    // Une valeur fournie reste validée (pas de relâchement du type interne).
+    let v = call_tool(
+        &core,
+        2,
+        "recherche",
+        json!({ "query": "rust mcp", "limit": -1, "tags": [] }),
+    );
+    assert_eq!(v["error"]["code"], -32602, "{v}");
 }
 
 #[test]

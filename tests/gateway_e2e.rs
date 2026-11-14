@@ -52,7 +52,7 @@ fn spawn_gateway(gateway: Arc<Gateway>) -> SocketAddr {
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 // Route du gateway : dispatch via le snapshot courant.
                 let body = request.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-                let reply = gw.dispatch(body.as_bytes()).unwrap_or_default();
+                let reply = gw.dispatch_unchecked(body.as_bytes()).unwrap_or_default();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     reply.len()
@@ -68,7 +68,7 @@ fn spawn_gateway(gateway: Arc<Gateway>) -> SocketAddr {
 
 /// Dispatch direct (sans HTTP) — le chemin embarqué.
 fn dispatch(gw: &Gateway, body: &str) -> Option<Value> {
-    let reply = gw.dispatch(body.as_bytes())?;
+    let reply = gw.dispatch_unchecked(body.as_bytes())?;
     Some(serde_json::from_slice(&reply).unwrap())
 }
 
@@ -531,7 +531,7 @@ fn edit_ne_contourne_pas_le_plafond_inflight_global() {
             let ancien = Arc::clone(&ancien);
             let req = req_bloque.clone();
             std::thread::spawn(move || {
-                let reply = ancien.dispatch(req.as_bytes()).unwrap();
+                let reply = ancien.dispatch_unchecked(req.as_bytes()).unwrap();
                 serde_json::from_slice::<Value>(&reply).unwrap()
             })
         })

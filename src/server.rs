@@ -42,6 +42,7 @@ pub type ToolResult = Result<Value, ToolError>;
 /// Statut d'un appel, tel qu'observé par un hook
 /// [`ServerBuilder::on_call`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CallStatus {
     /// Réponse de succès rendue (le handler — s'il y en avait un — a
     /// réussi).
@@ -65,6 +66,7 @@ pub enum CallStatus {
 /// échec) : compteurs par outil, latence, taux d'erreur se déduisent d'un
 /// unique callback.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CallEvent<'a> {
     /// Méthode JSON-RPC (`tools/call`, `resources/read`…).
     pub method: &'a str,
@@ -81,6 +83,7 @@ pub struct CallEvent<'a> {
 /// ([`ToolResult`]), un [`CallToolResult`] complet (contenus riches : image,
 /// audio, liens, ressources embarquées, contenus multiples) ou une demande
 /// d'entrée MRTR ([`ToolOutcome::InputRequired`]).
+#[non_exhaustive]
 pub enum ToolOutcome {
     /// Chemin historique : la valeur devient `structuredContent` (avec
     /// enveloppe `{ "result": … }` si non-objet) et le texte reflète
@@ -98,15 +101,15 @@ pub enum ToolOutcome {
 }
 
 type ToolFn = dyn Fn(&Value) -> Result<ToolOutcome, ToolFailure> + Send + Sync;
-type ResourceFn = dyn Fn() -> Result<ResourceData, String> + Send + Sync;
-type PromptFn = dyn Fn(&Value) -> Result<Vec<PromptMessage>, String> + Send + Sync;
+type ResourceFn = dyn Fn() -> Result<ResourceData, ToolError> + Send + Sync;
+type PromptFn = dyn Fn(&Value) -> Result<Vec<PromptMessage>, ToolError> + Send + Sync;
 /// Handler d'outil MRTR — reçoit les arguments **et** le contexte du tour
 /// ([`InputRound`]) : réponses du client (non fiables) et état vérifié.
 type MrtrToolFn = dyn Fn(&Value, &InputRound) -> Result<ToolOutcome, ToolError> + Send + Sync;
 /// Handler de ressource MRTR — `resources/read` supporte le MRTR (spec).
-type MrtrResourceFn = dyn Fn(&InputRound) -> Result<ResourceOutcome, String> + Send + Sync;
+type MrtrResourceFn = dyn Fn(&InputRound) -> Result<ResourceOutcome, ToolError> + Send + Sync;
 /// Handler de prompt MRTR — `prompts/get` supporte le MRTR (spec).
-type MrtrPromptFn = dyn Fn(&Value, &InputRound) -> Result<PromptOutcome, String> + Send + Sync;
+type MrtrPromptFn = dyn Fn(&Value, &InputRound) -> Result<PromptOutcome, ToolError> + Send + Sync;
 type CallHook = dyn Fn(&CallEvent<'_>) + Send + Sync;
 
 /// Sortie d'un passage MRTR d'un handler de prompt : les messages du prompt
@@ -184,7 +187,7 @@ impl InputRound {
 /// Fournisseur de complétion ([`ServerBuilder::completions`]) — reçoit la
 /// requête validée et rend les suggestions (au plus 100 : le noyau tronque
 /// au-delà et pose `hasMore`).
-type CompletionFn = dyn Fn(&CompletionRequest) -> Result<Completion, String> + Send + Sync;
+type CompletionFn = dyn Fn(&CompletionRequest) -> Result<Completion, ToolError> + Send + Sync;
 
 /// Objet vide partagé — utilisé quand `params` ou `arguments` sont absents,
 /// sans réallouer à chaque appel.
@@ -225,6 +228,22 @@ const MAX_ECHO_CHARS: usize = 128;
 /// cause précise reste exprimée dans `data.reason`. Les échecs d'outils,
 /// eux, restent des résultats `isError` (jamais des erreurs JSON-RPC).
 const HANDLER_FAILURE: i64 = ErrorObject::INTERNAL_ERROR;
+
+/// `data` d'un échec de handler ressource / prompt / complétion : la cause
+/// (`handler_failed`) puis la **classification** de l'erreur — mêmes champs
+/// machine-lisibles que le `structuredContent.error` des outils (`code`,
+/// `retryable`, `retryAfterMs` quand conseillé).
+fn handler_failure_data(error: &ToolError) -> Value {
+    let mut data = json!({
+        "reason": "handler_failed",
+        "code": error.code.as_str(),
+        "retryable": error.retryable,
+    });
+    if let Some(ms) = error.retry_after_ms {
+        data["retryAfterMs"] = json!(ms);
+    }
+    data
+}
 
 /// Neutralise les caractères de contrôle (ANSI, NUL, CR/LF) et tronque à
 /// [`MAX_ECHO_CHARS`] tout identifiant issu du client avant de l'inclure
@@ -367,7 +386,19 @@ fn extract_mcp_param_defs(schema: &Value) -> Result<Vec<McpParamDef>, String> {
                     "property `{prop_name}`: x-mcp-header `{header_str}` must be valid ASCII without spaces or colons"
                 ));
             }
-            let type_str = prop_val.get("type").and_then(Value::as_str).unwrap_or("");
+            // `type` peut être publié sous forme de tableau — `[T, "null"]`
+            // pour un champ optionnel (même contrat que `Option<T>`) : le
+            // paramètre de transport reste `T`, `null` n'ayant pas de valeur
+            // d'en-tête.
+            let type_str = match prop_val.get("type") {
+                Some(Value::String(kind)) => kind.as_str(),
+                Some(Value::Array(kinds)) => kinds
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find(|kind| *kind != "null")
+                    .unwrap_or(""),
+                _ => "",
+            };
             let param_type = match type_str {
                 "string" => McpParamType::String,
                 "integer" => McpParamType::Integer,
@@ -469,13 +500,139 @@ fn decode_mcp_header_value(raw: &str) -> Result<String, &'static str> {
 /// où JSON Schema les autorise — sous-schémas (`properties.*`, `items`…),
 /// `output_schema`, documents bruts — seul l'usage comme inputSchema racine
 /// d'un outil est refusé.
+///
+/// Le **type racine** est vérifié aussi : `CallToolRequestParams.arguments`
+/// est toujours un objet, donc un inputSchema dont la racine n'admet aucun
+/// objet (`{"type": "string"}`, `{"enum": ["a", "b"]}`, une énumération
+/// dérivée par schemars…) rendrait chaque appel fautif en `-32602`. C'est
+/// une erreur de programmation : elle est refusée au démarrage, pas
+/// découverte à l'usage.
 fn require_object_input_schema(tool: &str, schema: &dyn crate::zod::Schema) {
+    let document = schema.json();
     assert!(
-        schema.json().is_object(),
+        document.is_object(),
         "litemcp/server : l'inputSchema de l'outil `{tool}` doit être un objet JSON — \
          un schéma booléen racine (`true`/`false`) n'est pas un inputSchema MCP valide ; \
          les schémas booléens restent autorisés comme sous-schémas"
     );
+    let root = resolve_local_root(&document);
+    assert!(
+        root_admits_object(root, 0),
+        "litemcp/server : l'inputSchema de l'outil `{tool}` n'admet aucun objet à sa racine \
+         (type publié : {}) — les arguments d'un outil MCP sont toujours un objet JSON \
+         (`CallToolRequestParams.arguments`), un tel outil serait inutilisable (tout appel \
+         rendrait -32602)",
+        published_root_kind(root)
+    );
+}
+
+/// Résout les `$ref` **locaux** d'une racine de document (`#/…`) — même
+/// politique que l'adaptateur `schemars` : seuls les pointeurs internes sont
+/// suivis (aucune résolution réseau), une référence inconnue, distante ou
+/// cyclique laisse le nœud courant tel quel.
+fn resolve_local_root(document: &Value) -> &Value {
+    let mut current = document;
+    for _ in 0..16 {
+        let Some(reference) = current.get("$ref").and_then(Value::as_str) else {
+            break;
+        };
+        let Some(pointer) = reference.strip_prefix('#') else {
+            break;
+        };
+        let mut target = document;
+        let mut resolved = true;
+        for segment in pointer.split('/').filter(|segment| !segment.is_empty()) {
+            let segment = segment.replace("~1", "/").replace("~0", "~");
+            match target.get(&segment) {
+                Some(next) => target = next,
+                None => {
+                    resolved = false;
+                    break;
+                }
+            }
+        }
+        if !resolved || std::ptr::eq(target, current) {
+            break;
+        }
+        current = target;
+    }
+    current
+}
+
+/// La racine d'un `inputSchema` admet-elle un **objet** ?
+///
+/// Seuls les cas **prouvables** sont refusés : un `type` publié qui
+/// n'inclut pas `object`, un `enum`/`const` dont aucune valeur n'est un
+/// objet, ou des combinateurs dont aucune branche n'admet d'objet. Une
+/// racine sans `type` (mots-clés structurels seuls : `properties`,
+/// `$ref` non résolu, `not`…) est acceptée — rien ne prouve qu'elle exclut
+/// les objets.
+fn root_admits_object(node: &Value, depth: usize) -> bool {
+    if depth > 8 {
+        return true;
+    }
+    let Some(object) = node.as_object() else {
+        // Schéma booléen : `true` admet tout (déjà refusé comme racine
+        // d'inputSchema), toute autre forme n'est pas un schéma.
+        return node.as_bool().unwrap_or(true);
+    };
+    match object.get("type") {
+        Some(Value::String(kind)) => return kind == "object",
+        Some(Value::Array(kinds)) => {
+            return kinds.iter().any(|kind| kind.as_str() == Some("object"));
+        }
+        Some(_) => return true,
+        None => {}
+    }
+    if let Some(values) = object.get("enum").and_then(Value::as_array) {
+        return values.iter().any(Value::is_object);
+    }
+    if let Some(value) = object.get("const") {
+        return value.is_object();
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(branches) = object.get(key).and_then(Value::as_array) {
+            return branches
+                .iter()
+                .any(|branch| root_admits_object(branch, depth + 1));
+        }
+    }
+    if let Some(branches) = object.get("allOf").and_then(Value::as_array) {
+        return branches
+            .iter()
+            .all(|branch| root_admits_object(branch, depth + 1));
+    }
+    true
+}
+
+/// Description courte du type racine publié — pour le message d'erreur
+/// développeur (jamais renvoyée à un client).
+fn published_root_kind(root: &Value) -> String {
+    if let Some(kind) = root.get("type") {
+        return kind.to_string();
+    }
+    if root.get("enum").is_some() {
+        return "enum sans objet".to_string();
+    }
+    if root.get("const").is_some() {
+        return "const non objet".to_string();
+    }
+    "racine sans type".to_string()
+}
+
+/// Verdict d'une **erreur de schéma interne** (validateur exécuteur
+/// indisponible) : `-32603` avec un message neutre — jamais `-32602` (ce
+/// n'est pas la faute du client), jamais le détail interne (URL de schéma,
+/// nom de feature, message de bibliothèque) dans la réponse.
+fn internal_schema_failure(id: &Value, cap: usize) -> (BoundedReply, CallStatus) {
+    (
+        Outgoing::failure(
+            id.clone(),
+            ErrorObject::new(ErrorObject::INTERNAL_ERROR, "internal error"),
+        )
+        .to_bounded(cap),
+        CallStatus::ProtocolError(ErrorObject::INTERNAL_ERROR),
+    )
 }
 
 /// Handler d'outil — historique ([`ToolFn`]) ou MRTR ([`MrtrToolFn`]).
@@ -568,6 +725,7 @@ impl McpHeaders {
 
 /// Statut HTTP associé à une réponse de dispatch MCP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HttpStatus {
     Ok,
     BadRequest,
@@ -613,6 +771,7 @@ impl HttpStatus {
 
 /// Résultat structuré d'un dispatch (corps JSON-RPC sérialisé + statut HTTP).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DispatchResponse {
     /// Corps JSON-RPC (réponse succès ou erreur).
     pub body: Vec<u8>,
@@ -630,7 +789,8 @@ pub enum ProtocolProfile {
     #[default]
     Strict2026_07_28,
     /// Profil legacy `2025-11-25` explicite :
-    /// - Méthodes `initialize` et `ping` servies ;
+    /// - Méthodes `initialize` et `ping` servies ; `initialize` négocie la
+    ///   révision `2025-11-25` ([`protocol::LEGACY_PROTOCOL_VERSION`]) ;
     /// - Tolérance pour l'absence de `_meta` ;
     /// - Tolérance pour `id: null`.
     Legacy,
@@ -674,14 +834,15 @@ pub struct ServerCore {
     request_state_ttl: Duration,
     /// Catalogues sérialisés — immuables après construction (les registres
     /// ne bougent plus), servis **tels quels** : `tools/list`,
-    /// `resources/list`, `prompts/list`, `server/discover`, `initialize` et
-    /// `ping` ne resérialisent ni ne clonent leur arbre JSON à chaque requête.
+    /// `resources/list`, `prompts/list`, `server/discover` et `ping` ne
+    /// resérialisent ni ne clonent leur arbre JSON à chaque requête.
+    /// `initialize` a une entrée par révision legacy servie.
     tools_list_cache: std::sync::OnceLock<Value>,
     resources_list_cache: std::sync::OnceLock<Value>,
     templates_list_cache: std::sync::OnceLock<Value>,
     prompts_list_cache: std::sync::OnceLock<Value>,
     discover_cache: std::sync::OnceLock<Value>,
-    initialize_cache: std::sync::OnceLock<Value>,
+    initialize_cache: std::sync::OnceLock<BTreeMap<&'static str, Value>>,
     ping_cache: std::sync::OnceLock<Value>,
 }
 
@@ -772,21 +933,54 @@ impl ServerCore {
     /// Conforme MCP `2026-07-28` : `server/discover` est implémentée, chaque
     /// `result` porte `resultType`, et une version de protocole non supportée
     /// est refusée en `-32022`.
+    ///
+    /// **Le profil configuré s'applique** à tout ce qui ne dépend pas des
+    /// en-têtes HTTP : en profil strict (défaut), un corps sans `_meta` est
+    /// refusé en `-32602` (message `missing required _meta object in params`), une
+    /// version de protocole inconnue en `-32022`, un `id: null` en `-32600`.
+    /// C'est exactement le verdict de [`Self::dispatch_request`] appelé sans
+    /// en-têtes — un même noyau, un même corps, un même verdict. Les
+    /// contrôles qui n'ont de sens qu'avec un transport HTTP
+    /// (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) s'appliquent dès
+    /// que des en-têtes sont fournis ([`Self::dispatch_with_headers`],
+    /// [`Self::dispatch_request`]).
+    ///
+    /// Un hôte qui garantit déjà des corps strictement conformes (dispatch
+    /// embarqué d'un gateway, tests unitaires de handlers) dispose de
+    /// [`Self::dispatch_unchecked`] — nom explicite, jamais un défaut
+    /// silencieux.
     pub fn dispatch(&self, body: &[u8]) -> Option<Vec<u8>> {
-        self.dispatch_with_headers(body, None)
+        self.dispatch_request(body, None).map(|r| r.body)
     }
 
     /// Idem [`ServerCore::dispatch`], avec les en-têtes de routage MCP
     /// (SEP-2243) pour vérifier leur cohérence avec le corps de la requête.
     ///
-    /// Préserve une API de compatibilité pour les utilisateurs directs de `dispatch`
-    /// en tolérant l'absence de `_meta` lorsque non fourni.
+    /// Le profil configuré s'applique comme pour [`Self::dispatch`] ; les
+    /// en-têtes fournis sont en plus confrontés au corps (méthode, nom,
+    /// version). Sans en-têtes (`None`), seuls les contrôles de corps
+    /// s'appliquent.
     pub fn dispatch_with_headers(
         &self,
         body: &[u8],
         headers: Option<&McpHeaders>,
     ) -> Option<Vec<u8>> {
-        self.dispatch_internal(body, headers, false, None)
+        self.dispatch_request(body, headers).map(|r| r.body)
+    }
+
+    /// Traite un corps JSON-RPC **sans aucun contrôle de profil ni
+    /// d'en-tête** — ni `_meta`, ni version de protocole, ni `id: null`.
+    ///
+    /// Réservé aux appelants qui **garantissent** déjà des corps conformes
+    /// au profil strict `2026-07-28` : tests unitaires de handlers, dispatch
+    /// embarqué d'un gateway, harnais de mesure. Ne l'exposez jamais à une
+    /// entrée non fiable : c'est le seul point d'entrée qui n'applique pas
+    /// le profil configuré. Pour un corps de client, utilisez
+    /// [`Self::dispatch`] ou [`Self::dispatch_request`].
+    ///
+    /// Renvoie `None` pour une notification, comme [`Self::dispatch`].
+    pub fn dispatch_unchecked(&self, body: &[u8]) -> Option<Vec<u8>> {
+        self.dispatch_internal(body, None, false, None)
             .map(|r| r.body)
     }
 
@@ -836,7 +1030,7 @@ impl ServerCore {
         &self,
         body: &[u8],
         headers: Option<&McpHeaders>,
-        strict_meta: bool,
+        strict_profile: bool,
         progress_channel: Option<Arc<dyn crate::progress::ProgressChannel>>,
     ) -> Option<DispatchResponse> {
         // Canal de progression lié au fil du dispatch : les handlers
@@ -883,7 +1077,11 @@ impl ServerCore {
         // Cohérence des en-têtes de routage MCP (SEP-2243) : `MCP-Protocol-Version`,
         // `Mcp-Method`, `Mcp-Name` et `Mcp-Param-*`.
         let mut header_mismatch: Option<ErrorObject> = None;
-        let is_modern = strict_meta;
+        // Les contrôles d'en-têtes n'ont de sens que si des en-têtes sont
+        // fournis : `dispatch` (et `dispatch_request` sans en-têtes)
+        // n'applique que le profil de corps, pour qu'un même corps rende le
+        // même verdict quel que soit le point d'entrée.
+        let is_modern = strict_profile && headers.is_some();
 
         // 1. Validation de MCP-Protocol-Version
         let body_meta_version = params
@@ -1283,7 +1481,7 @@ impl ServerCore {
         }
 
         // 2. Validation des métadonnées obligatoires en mode strict MCP 2026-07-28
-        if strict_meta {
+        if strict_profile {
             if incoming.params.is_none() {
                 return Some(self.protocol_failure(
                     &id,
@@ -1447,7 +1645,7 @@ impl ServerCore {
                 CallStatus::Success,
             ),
             protocol::method::INITIALIZE if is_legacy => (
-                Outgoing::success_bounded(&id, self.initialize_json(), cap),
+                Outgoing::success_bounded(&id, self.initialize_json(params), cap),
                 CallStatus::Success,
             ),
             protocol::method::PING if is_legacy => (
@@ -1567,10 +1765,11 @@ impl ServerCore {
 
     /// Vérifie la version de protocole annoncée dans `_meta` (SEP-2575).
     ///
-    /// L'absence de version est tolérée (client legacy). Une version
-    /// explicite non supportée est refusée en `-32022`
-    /// (`UnsupportedProtocolVersionError`) avec la liste des versions
-    /// supportées.
+    /// Appelée en profil legacy (le profil strict exige `_meta` et valide la
+    /// version avant d'arriver ici) : l'absence de version y est tolérée
+    /// (client legacy). Une version explicite non supportée est refusée en
+    /// `-32022` (`UnsupportedProtocolVersionError`) avec la liste des
+    /// versions supportées.
     fn check_protocol_version(&self, params: &Value) -> Option<ErrorObject> {
         let requested = params
             .get("_meta")
@@ -1888,21 +2087,43 @@ impl ServerCore {
             .get_or_init(|| serde_json::to_value(self.discover()).unwrap_or(Value::Null))
     }
 
-    /// `initialize` sérialisé, calculé une fois puis servi tel quel.
-    fn initialize_json(&self) -> &Value {
-        self.initialize_cache.get_or_init(|| {
-            json!({
-                // `resultType` est obligatoire dans CHAQUE résultat
-                // (SEP-2322) — y compris sur ce résultat legacy.
-                "resultType": "complete",
-                "protocolVersion": protocol::PROTOCOL_VERSION,
-                "capabilities": self.capabilities(),
-                "serverInfo": ServerInfo {
-                    name: self.name.clone(),
-                    version: self.version.clone(),
-                },
-                "_meta": self.meta(),
-            })
+    /// `initialize` sérialisé — une entrée par révision legacy servie,
+    /// calculée une fois puis servie telle quelle.
+    ///
+    /// Négociation (révision `2025-11-25`, « Version Negotiation ») : la
+    /// révision demandée est renvoyée si le profil la sert, sinon la plus
+    /// récente révision legacy servie — jamais `2026-07-28`, qui ne définit
+    /// pas `initialize`.
+    fn initialize_json(&self, params: &Value) -> &Value {
+        let requested = params.get("protocolVersion").and_then(Value::as_str);
+        let version = protocol::negotiate_legacy_version(requested);
+        let results = self.initialize_cache.get_or_init(|| {
+            protocol::LEGACY_SUPPORTED_VERSIONS
+                .iter()
+                .map(|version| (*version, self.initialize_result(version)))
+                .collect()
+        });
+        results.get(version).unwrap_or_else(|| {
+            // Invariant : `negotiate_legacy_version` ne rend qu'une révision
+            // de `LEGACY_SUPPORTED_VERSIONS`, toutes matérialisées ci-dessus.
+            results
+                .get(protocol::LEGACY_PROTOCOL_VERSION)
+                .expect("LEGACY_SUPPORTED_VERSIONS doit contenir sa révision par défaut")
+        })
+    }
+
+    /// Corps d'un `InitializeResult` pour une révision legacy donnée
+    /// (`resultType` est obligatoire dans CHAQUE résultat, SEP-2322).
+    fn initialize_result(&self, protocol_version: &'static str) -> Value {
+        json!({
+            "resultType": "complete",
+            "protocolVersion": protocol_version,
+            "capabilities": self.capabilities(),
+            "serverInfo": ServerInfo {
+                name: self.name.clone(),
+                version: self.version.clone(),
+            },
+            "_meta": self.meta(),
         })
     }
 
@@ -1951,6 +2172,10 @@ impl ServerCore {
     fn discover(&self) -> DiscoverResult {
         DiscoverResult {
             result_type: ResultType::Complete,
+            // Mêmes indices de cache que `tools/list` : la page *Caching*
+            // les exige sur `server/discover` (SEP-2549).
+            ttl_ms: DEFAULT_LIST_TTL_MS,
+            cache_scope: CacheScope::Private,
             supported_versions: protocol::SUPPORTED_VERSIONS.to_vec(),
             capabilities: self.capabilities(),
             meta: self.meta(),
@@ -2127,7 +2352,7 @@ impl ServerCore {
                     ErrorObject::with_data(
                         HANDLER_FAILURE,
                         format!("Resource read failed: {message}"),
-                        json!({ "reason": "handler_failed" }),
+                        handler_failure_data(&message),
                     ),
                 )
                 .to_bounded(cap),
@@ -2204,6 +2429,10 @@ impl ServerCore {
             let mut issues = Issues::new();
             let mut path = Path::root("arguments");
             schema.validate(&mut path, arguments_for_validation, &mut issues);
+            // Schéma interne indisponible : erreur serveur neutre.
+            if issues.is_internal() {
+                return internal_schema_failure(id, cap);
+            }
             if !issues.is_empty() {
                 let rendered = issues.render();
                 return (
@@ -2268,7 +2497,7 @@ impl ServerCore {
                     ErrorObject::with_data(
                         HANDLER_FAILURE,
                         format!("Prompt failed: {message}"),
-                        json!({ "reason": "handler_failed" }),
+                        handler_failure_data(&message),
                     ),
                 )
                 .to_bounded(cap),
@@ -2422,7 +2651,7 @@ impl ServerCore {
                         ErrorObject::with_data(
                             HANDLER_FAILURE,
                             format!("Completion failed: {message}"),
-                            json!({ "reason": "handler_failed" }),
+                            handler_failure_data(&message),
                         ),
                     )
                     .to_bounded(cap),
@@ -2474,8 +2703,8 @@ impl ServerCore {
     /// est configuré ; traduit timeout/panique en erreur JSON-RPC.
     fn run_bounded<T: Send + 'static>(
         &self,
-        f: impl FnOnce() -> Result<T, String> + Send + 'static,
-    ) -> Result<Result<T, String>, ErrorObject> {
+        f: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
+    ) -> Result<Result<T, ToolError>, ErrorObject> {
         match self.tool_timeout {
             None => match std::panic::catch_unwind(AssertUnwindSafe(f)) {
                 Ok(result) => Ok(result),
@@ -2622,6 +2851,11 @@ impl ServerCore {
             let mut issues = Issues::new();
             let mut path = Path::root("arguments");
             schema.validate(&mut path, arguments_for_validation, &mut issues);
+            // Schéma interne indisponible : erreur serveur neutre (-32603),
+            // jamais -32602 imputée au client, jamais de détail interne.
+            if issues.is_internal() {
+                return internal_schema_failure(id, response_cap);
+            }
             if !issues.is_empty() {
                 let rendered = issues.render();
                 return (
@@ -3286,9 +3520,21 @@ impl ServerBuilder {
     /// Enregistre un prompt **MRTR** — même cycle que [`Self::tool_mrtr`]
     /// sur `prompts/get` (méthode supportée par la spec) : le handler rend
     /// [`PromptOutcome::Messages`] ou [`PromptOutcome::InputRequired`].
-    pub fn prompt_mrtr<F>(mut self, name: &str, description: &str, f: F) -> Self
+    pub fn prompt_mrtr<F>(self, name: &str, description: &str, f: F) -> Self
     where
         F: Fn(&Value, &InputRound) -> Result<PromptOutcome, String> + Send + Sync + 'static,
+    {
+        self.prompt_mrtr_with_error(name, description, move |args, round| {
+            f(args, round).map_err(ToolError::from)
+        })
+    }
+
+    /// Comme [`Self::prompt_mrtr`], avec une erreur **structurée**
+    /// ([`ToolError`]) : la classification part dans `error.data`.
+    #[must_use]
+    pub fn prompt_mrtr_with_error<F>(mut self, name: &str, description: &str, f: F) -> Self
+    where
+        F: Fn(&Value, &InputRound) -> Result<PromptOutcome, ToolError> + Send + Sync + 'static,
     {
         self.prompts.insert(
             name.to_string(),
@@ -3305,9 +3551,28 @@ impl ServerBuilder {
     /// sur `resources/read` (méthode supportée par la spec) : le handler
     /// rend [`ResourceOutcome::Data`] ou [`ResourceOutcome::InputRequired`].
     /// L'entrée apparaît dans `resources/list` comme les autres ressources.
-    pub fn resource_mrtr<F>(mut self, uri: &str, name: &str, description: &str, f: F) -> Self
+    pub fn resource_mrtr<F>(self, uri: &str, name: &str, description: &str, f: F) -> Self
     where
         F: Fn(&InputRound) -> Result<ResourceOutcome, String> + Send + Sync + 'static,
+    {
+        self.resource_mrtr_with_error(uri, name, description, move |round| {
+            f(round).map_err(ToolError::from)
+        })
+    }
+
+    /// Comme [`Self::resource_mrtr`], avec une erreur **structurée**
+    /// ([`ToolError`]) : la classification (`code`, `retryable`,
+    /// `retryAfterMs`) part dans `error.data`, comme pour les outils.
+    #[must_use]
+    pub fn resource_mrtr_with_error<F>(
+        mut self,
+        uri: &str,
+        name: &str,
+        description: &str,
+        f: F,
+    ) -> Self
+    where
+        F: Fn(&InputRound) -> Result<ResourceOutcome, ToolError> + Send + Sync + 'static,
     {
         self.resources.insert(
             uri.to_string(),
@@ -3572,9 +3837,20 @@ impl ServerBuilder {
     /// `uri`/`name`/`description` ; le `mimeType` vient du
     /// [`crate::protocol::ResourceContents`] rendu par le handler.
     #[must_use]
-    pub fn resource<F>(mut self, uri: &str, name: &str, description: &str, f: F) -> Self
+    pub fn resource<F>(self, uri: &str, name: &str, description: &str, f: F) -> Self
     where
         F: Fn() -> Result<ResourceContents, String> + Send + Sync + 'static,
+    {
+        self.resource_with_error(uri, name, description, move || f().map_err(ToolError::from))
+    }
+
+    /// Comme [`Self::resource`], avec une erreur **structurée**
+    /// ([`ToolError`]) : `code`, `retryable` et `retryAfterMs` partent dans
+    /// `error.data` — même niveau que les outils, sans parser de prose.
+    #[must_use]
+    pub fn resource_with_error<F>(mut self, uri: &str, name: &str, description: &str, f: F) -> Self
+    where
+        F: Fn() -> Result<ResourceContents, ToolError> + Send + Sync + 'static,
     {
         self.resources.insert(
             uri.to_string(),
@@ -3615,9 +3891,25 @@ impl ServerBuilder {
     /// # }
     /// ```
     #[must_use]
-    pub fn resource_data<F>(mut self, uri: &str, name: &str, description: &str, f: F) -> Self
+    pub fn resource_data<F>(self, uri: &str, name: &str, description: &str, f: F) -> Self
     where
         F: Fn() -> Result<ResourceData, String> + Send + Sync + 'static,
+    {
+        self.resource_data_with_error(uri, name, description, move || f().map_err(ToolError::from))
+    }
+
+    /// Comme [`Self::resource_data`], avec une erreur **structurée**
+    /// ([`ToolError`]) : la classification part dans `error.data`.
+    #[must_use]
+    pub fn resource_data_with_error<F>(
+        mut self,
+        uri: &str,
+        name: &str,
+        description: &str,
+        f: F,
+    ) -> Self
+    where
+        F: Fn() -> Result<ResourceData, ToolError> + Send + Sync + 'static,
     {
         self.resources.insert(
             uri.to_string(),
@@ -3693,9 +3985,19 @@ impl ServerBuilder {
     /// # }
     /// ```
     #[must_use]
-    pub fn completions<F>(mut self, f: F) -> Self
+    pub fn completions<F>(self, f: F) -> Self
     where
         F: Fn(&CompletionRequest) -> Result<Completion, String> + Send + Sync + 'static,
+    {
+        self.completions_with_error(move |request| f(request).map_err(ToolError::from))
+    }
+
+    /// Comme [`Self::completions`], avec une erreur **structurée**
+    /// ([`ToolError`]) : la classification part dans `error.data`.
+    #[must_use]
+    pub fn completions_with_error<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&CompletionRequest) -> Result<Completion, ToolError> + Send + Sync + 'static,
     {
         self.completions = Some(Arc::new(f));
         self
@@ -3710,9 +4012,21 @@ impl ServerBuilder {
     /// Réenregistrer un nom existant remplace silencieusement la
     /// définition.
     #[must_use]
-    pub fn prompt<F>(mut self, name: &str, description: &str, f: F) -> Self
+    pub fn prompt<F>(self, name: &str, description: &str, f: F) -> Self
     where
         F: Fn(&Value) -> Result<Vec<PromptMessage>, String> + Send + Sync + 'static,
+    {
+        self.prompt_with_error(name, description, move |args| {
+            f(args).map_err(ToolError::from)
+        })
+    }
+
+    /// Comme [`Self::prompt`], avec une erreur **structurée**
+    /// ([`ToolError`]) : la classification part dans `error.data`.
+    #[must_use]
+    pub fn prompt_with_error<F>(mut self, name: &str, description: &str, f: F) -> Self
+    where
+        F: Fn(&Value) -> Result<Vec<PromptMessage>, ToolError> + Send + Sync + 'static,
     {
         self.prompts.insert(
             name.to_string(),
@@ -3731,10 +4045,28 @@ impl ServerBuilder {
     /// liste des problèmes dans `error.data.issues`, le handler ne tourne
     /// jamais. C'est la variante utilisée par la macro `#[prompt]` (feature
     /// `macros`).
-    pub fn prompt_typed<S, F>(mut self, name: &str, description: &str, schema: S, f: F) -> Self
+    pub fn prompt_typed<S, F>(self, name: &str, description: &str, schema: S, f: F) -> Self
     where
         S: Schema + 'static,
         F: Fn(&Value) -> Result<Vec<PromptMessage>, String> + Send + Sync + 'static,
+    {
+        self.prompt_typed_with_error(name, description, schema, move |args| {
+            f(args).map_err(ToolError::from)
+        })
+    }
+
+    /// Comme [`Self::prompt_typed`], avec une erreur **structurée**
+    /// ([`ToolError`]) : la classification part dans `error.data`.
+    pub fn prompt_typed_with_error<S, F>(
+        mut self,
+        name: &str,
+        description: &str,
+        schema: S,
+        f: F,
+    ) -> Self
+    where
+        S: Schema + 'static,
+        F: Fn(&Value) -> Result<Vec<PromptMessage>, ToolError> + Send + Sync + 'static,
     {
         self.prompts.insert(
             name.to_string(),
@@ -4452,7 +4784,7 @@ mod tests_codes_erreurs_2026_11_10 {
             std::sync::atomic::Ordering::Release,
         );
         let reply = core
-            .dispatch(
+            .dispatch_unchecked(
                 br#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"mem://x"}}"#,
             )
             .expect("resources/read doit répondre");

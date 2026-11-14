@@ -245,14 +245,14 @@ fn m3_notification_inconnue_refusee_explicitement() {
 
     // `notifications/*` : acceptée et ignorée (202, aucune réponse).
     assert!(
-        core.dispatch(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+        core.dispatch_unchecked(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
             .is_none(),
         "une notification de protocole doit rester sans réponse"
     );
 
     // Méthode inconnue en notification : refus explicite.
     let reply = core
-        .dispatch(br#"{"jsonrpc":"2.0","method":"foo/bar"}"#)
+        .dispatch_unchecked(br#"{"jsonrpc":"2.0","method":"foo/bar"}"#)
         .expect("une notification inconnue doit produire une réponse d\'erreur");
     let v: serde_json::Value = serde_json::from_slice(&reply).unwrap();
     assert_eq!(
@@ -325,7 +325,7 @@ fn m1_plafond_de_reponse_configurable() {
         .max_response_bytes(1000)
         .core();
     let reply = core
-        .dispatch(
+        .dispatch_unchecked(
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"gros","arguments":{}}}"#,
         )
         .unwrap();

@@ -4,7 +4,7 @@ use litemcp::prelude::*;
 use serde_json::json;
 
 fn call(core: &litemcp::ServerCore, body: &str) -> serde_json::Value {
-    let reply = core.dispatch(body.as_bytes()).unwrap();
+    let reply = core.dispatch_unchecked(body.as_bytes()).unwrap();
     serde_json::from_slice(&reply).unwrap()
 }
 
@@ -233,7 +233,7 @@ fn protocol_notification_is_still_accepted_and_ignored() {
     ] {
         let body = format!(r#"{{"jsonrpc":"2.0","method":"{method}"}}"#);
         assert!(
-            core.dispatch(body.as_bytes()).is_none(),
+            core.dispatch_unchecked(body.as_bytes()).is_none(),
             "{method} doit rester acceptée et ignorée (aucune réponse)"
         );
     }

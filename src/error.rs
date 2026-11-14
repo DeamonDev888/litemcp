@@ -41,6 +41,13 @@
 //! (via `From<&str>`/`From<String>`) — l'erreur est alors `unclassified`,
 //! non retentable par défaut. Le texte du `content` reste exactement le
 //! message.
+//!
+//! **Toutes les surfaces de handler** partagent ce type : les outils
+//! (`ToolResult`), les ressources, les prompts et les complétions via leurs
+//! méthodes `*_with_error` ([`crate::server::ServerBuilder`]) — la
+//! classification, la politique de retente et `retryAfterMs` partent dans
+//! `error.data` pour les trois surfaces non-outils, comme
+//! `structuredContent.error` pour un outil.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -57,6 +64,7 @@ use serde_json::{Value, json};
 ///   l'auteur du serveur connaît la cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ErrorCode {
     /// Limite de débit ou quota atteint — retenter après un délai.
     RateLimited,
@@ -110,6 +118,7 @@ impl std::fmt::Display for ErrorCode {
 /// humain ou un LLM) ; le reste alimente `structuredContent.error`
 /// (lisible par un programme). Voir le [module](self) pour la forme fil.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolError {
     /// Classification de l'échec.
     pub code: ErrorCode,

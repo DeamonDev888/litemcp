@@ -5,6 +5,12 @@
 //! Le serveur sert le même outil ; le client mesure la latence
 //! request/response sur N appels séquentiels en keep-alive (moyenne, p50,
 //! p99 après warmup), puis en connexions neuves (conn/s).
+//!
+//! Chaque requête porte l'enveloppe du **profil strict** (défaut depuis
+//! 0.10.6) : `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` et les deux
+//! clés `_meta` — exactement le `curl` du README. Le profil tolérant
+//! (`.legacy(true)`, corps nu) n'est pas utilisé : ce qui est mesuré est le
+//! chemin qu'un client MCP emprunte réellement.
 
 use litemcp::prelude::*;
 use std::io::{Read, Write};
@@ -15,6 +21,12 @@ const WARMUP: usize = 200;
 const N_KEEPALIVE: usize = 2_000;
 const N_FRESH: usize = 300;
 
+/// Révision servie par le profil strict.
+const PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// `tools/call` sur `add`, avec l'enveloppe `_meta` exigée en profil strict.
+const CALL_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"add","arguments":{"a":2,"b":3}}}"#;
+
 fn build() -> ServerBuilder {
     ServerBuilder::new("bench", "0.5.1").tool("add", "Additionne deux entiers", |args| {
         let a = args["a"].as_i64().unwrap_or(0);
@@ -23,9 +35,9 @@ fn build() -> ServerBuilder {
     })
 }
 
-fn http_request(body: &str, close: bool) -> String {
+fn http_request(port: u16, body: &str, close: bool) -> String {
     format!(
-        "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{body}",
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {PROTOCOL_VERSION}\r\nMcp-Method: tools/call\r\nMcp-Name: add\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n{body}",
         body.len(),
         if close { "close" } else { "keep-alive" }
     )
@@ -64,11 +76,25 @@ fn read_one_response(stream: &mut TcpStream) -> std::io::Result<usize> {
     }
 }
 
+/// Contrôle avant mesure : l'enveloppe stricte doit rendre `200` **et** le
+/// résultat du handler. Sans lui, un refus `400` se lirait comme une latence.
+fn preflight(port: u16) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.write_all(http_request(port, CALL_BODY, true).as_bytes())?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw)?;
+    assert!(
+        raw.starts_with("HTTP/1.1 200 OK"),
+        "enveloppe stricte refusée : {raw:?}"
+    );
+    assert!(raw.contains("\"somme\":5"), "handler non atteint : {raw:?}");
+    Ok(())
+}
+
 /// Latences ms (moyenne, p50, p99) sur N requêtes keep-alive, warmup déduit.
 fn bench_keep_alive(port: u16, n: usize) -> std::io::Result<(f64, f64, f64)> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
-    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}"#;
-    let request = http_request(body, false);
+    let request = http_request(port, CALL_BODY, false);
     // Warmup : TCP slow start, caches, allocations — pas compté.
     for _ in 0..WARMUP {
         stream.write_all(request.as_bytes())?;
@@ -89,15 +115,14 @@ fn bench_keep_alive(port: u16, n: usize) -> std::io::Result<(f64, f64, f64)> {
 }
 
 fn bench_fresh_conn(port: u16, n: usize) -> std::io::Result<f64> {
-    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}"#;
-    let request = http_request(body, true);
+    let request = http_request(port, CALL_BODY, true);
     let start = Instant::now();
     for _ in 0..n {
         let mut stream = TcpStream::connect(("127.0.0.1", port))?;
         stream.write_all(request.as_bytes())?;
         let mut raw = String::new();
         stream.read_to_string(&mut raw)?;
-        assert!(raw.contains("HTTP/1.1 200 OK"), "{raw:?}");
+        assert!(raw.starts_with("HTTP/1.1 200 OK"), "{raw:?}");
     }
     let elapsed = start.elapsed().as_secs_f64();
     Ok(n as f64 / elapsed) // conn/s
@@ -105,10 +130,12 @@ fn bench_fresh_conn(port: u16, n: usize) -> std::io::Result<f64> {
 
 fn main() -> std::io::Result<()> {
     println!("=== litemcp — bench route maison (release) ===");
+    println!("profil strict {PROTOCOL_VERSION} : 3 en-têtes + 2 clés `_meta` par requête");
 
     let bound = build().bind("127.0.0.1:0")?;
     let port = bound.local_addr()?.port();
     let handle = std::thread::spawn(move || bound.serve().unwrap());
+    preflight(port)?;
     let (mean, p50, p99) = bench_keep_alive(port, N_KEEPALIVE)?;
     let fresh = bench_fresh_conn(port, N_FRESH)?;
     println!(

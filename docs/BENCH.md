@@ -1,8 +1,10 @@
 # Banc MCP — méthode, chiffres et limites
 
-> Règle de la maison : **jamais d'adjectif sans chiffre.** Tout ce qui suit est
-> reproductible depuis ce dépôt (`examples/bench_backends`, `examples/slo`) et depuis
-> `litemcp-it` (client neutre, serveurs de démonstration, campagne et agrégation).
+> Règle de la maison : **jamais d'adjectif sans chiffre.** La route maison se rejoue
+> depuis ce dépôt (`examples/bench_backends`, `examples/slo`, qui envoient l'enveloppe
+> stricte) ; l'arène à 9 frameworks — latences comparées, mémoire `WorkingSet`, tailles
+> de binaire — vient de `litemcp-it` (client neutre, serveurs de démonstration, campagne
+> et agrégation) et ne sort pas de ces deux exemples.
 
 Campagne de référence : **2026-10-25**, Windows 11, `rustc 1.99.1`, loopback, 9 frameworks MCP
 (un serveur de démo identique construit avec chacun), mis à jour le jour même. Journal brut : `litemcp-it/bench-arena-2026-10-25.log`.
@@ -19,7 +21,7 @@ Campagne de référence : **2026-10-25**, Windows 11, `rustc 1.99.1`, loopback, 
 | **p50 / p99** | mêmes mesures triées, médiane et 99ᵉ centile (le p99 est ce que l'agent ressent sur les appels lents) |
 | **connexions réutilisées** | nombre d'appels où la connexion TCP a pu servir une seconde requête (`Content-Length` + flux clos) sur 2 000 |
 | **neuves (conn/s)** | 300 `connect()` + requête + réponse, en série, sans réutilisation |
-| **mémoire** | `WorkingSet` du processus qui écoute (+ processus enfants), mesuré **après** la campagne, soit ≈6 900 requêtes par serveur |
+| **mémoire** | `WorkingSet` du processus qui écoute (+ processus enfants), mesuré **après** la campagne, soit ≈6 900 requêtes par serveur — par le harnais `litemcp-it` ; `examples/slo` ne rend que le `VmRSS` Linux (`n/a` sous Windows) |
 
 Le client ne fait aucune supposition sur le serveur : il accepte les trois styles de réponse
 rencontrés en pratique — `Content-Length`, SSE encadré en `chunked`, fermeture de connexion.
@@ -38,7 +40,10 @@ rencontrés en pratique — `Content-Length`, SSE encadré en `chunked`, fermetu
   (drainage du pool de ports éphémères).
 - **Deux modes** : `bare` (un `tools/call` nu, protocole stateless) et `strict`
   (en-têtes `MCP-Protocol-Version: 2026-07-28`, `Mcp-Method`, `Mcp-Name` + `_meta`), imposé
-  par `rmcp` et `rust-mcp-sdk` qui refusent un appel sans session.
+  par `rmcp` et `rust-mcp-sdk` qui refusent un appel sans session. Depuis LiteMCP 0.10.6 le
+  profil **strict est le défaut** : un corps nu rend `400 -32020`, et `examples/bench_backends`
+  mesure ce mode. La ligne LiteMCP du §3 est donc historique — 0.7.0 en `bare`, rejouable
+  seulement avec `.legacy(true)`.
 
 ## 3. Résultats — keep-alive
 
@@ -60,7 +65,7 @@ Médiane des 3 passes, écart avec LiteMCP : **×2,1** tower-mcp · **×2,2** mc
 
 ## 4. Résultats — mémoire et binaire
 
-| Framework | WorkingSet après ≈6 900 req. | Binaire (release, non strippé) |
+| Framework | WorkingSet après ≈6 900 req. (harnais `litemcp-it`) | Binaire (release, non strippé, artefacts de la campagne) |
 |---|---|---|
 | **LiteMCP** | **5,1 Mo** | **0,81 Mo** (démo 4 outils) |
 | rust-mcp-sdk | 8,5 Mo | 6,70 Mo |
@@ -70,6 +75,11 @@ Médiane des 3 passes, écart avec LiteMCP : **×2,1** tower-mcp · **×2,2** mc
 | FastMCP | 113,4 Mo | n/a (interprété) |
 | tower-mcp | 144–183 Mo ⚠ | 5,50 Mo |
 | vitemcp (JSON / SSE) | 191,2 / 191,7 Mo | n/a (interprété) |
+
+Les tailles de binaire ne se reproduisent pas depuis ce dépôt : `[profile.release]` y pose
+`strip = true` (binaires strippés). La re-mesure du 2026-11-13 consignée dans
+[`MESURES.md`](MESURES.md) donne 961–992 Kio pour un serveur à un outil et pour `hello` —
+d'une autre version que la campagne, donc non comparable aux 0,81 Mo ci-dessus.
 
 ⚠ **tower-mcp croît avec le volume de requêtes** : 5,8 Mo à froid, 13,9 Mo après 350
 requêtes, 144–183 Mo après ≈7 000 — croissance reproduite deux fois. C'est un fait de
@@ -200,7 +210,9 @@ Ne sont **pas** établis par cette campagne :
 - la latence **Linux**, qui est la référence serveur (campagnes du 2026-10-24 : 0,031–0,033 ms
   de moyenne, p99 0,048–0,065 ms) — l'arène est une mesure Windows.
 
-Autrement dit : **meilleur des neuf mesurés, dans des conditions figées et reproductibles.**
+Autrement dit : **meilleur des neuf mesurés, dans des conditions figées.** La campagne se
+rejoue depuis `litemcp-it` ; depuis ce dépôt, seuls les deux exemples de la route maison se
+mesurent (profil strict).
 Toute phrase plus large demande une campagne de plus.
 
 ## 8. Reproduire
@@ -217,10 +229,20 @@ cd mcp-bench-arena/rust-rmcp && ./target/release/bench-rmcp.exe 18200
 bash litemcp-it/bench_arena.sh
 python litemcp-it/arena_aggregate.py
 
-# 3. la route maison seule, hors arène
+# 3. la route maison seule, hors arène — les deux envoient l'enveloppe stricte
+#    (MCP-Protocol-Version, Mcp-Method, Mcp-Name + les deux clés _meta)
 cargo run --release --example bench_backends   # keep-alive, p50/p99, conn/s
-cargo run --release --example slo              # démarrage, RSS via /proc (Linux)
+cargo run --release --example slo              # démarrage, débit, RSS via /proc (Linux ; « n/a » sous Windows)
 ```
+
+**Mesure de contrôle (2026-11-13, Windows 11, `rustc 1.99.1`)** — cinq passages courts de
+chaque exemple sur machine partagée, la plupart sous charge (CPU 100 %, autres compilations) :
+`bench_backends` rend 0,093–0,135 ms de moyenne (p50 0,080–0,100, p99 0,26–0,98 ms) et
+169–1 411 conn/s — métrique des connexions neuves très sensible à la charge ; `slo` rend
+5,3–12,4 ms de démarrage et 0,086–0,120 ms/req, `VmRSS` `n/a` (Windows). Les bornes basses
+sont obtenues machine au repos — du même ordre que le tableau du §3. Ce passage prouve que
+les commandes tournent et rendent des chiffres cohérents ; il ne remplace pas la campagne à
+3 passes, mesurée en `bare` sur 0.7.0.
 
 Détail des ports, des modes et des pièges : skill `mcp-bench-arena`.
 

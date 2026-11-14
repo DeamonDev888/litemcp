@@ -35,16 +35,29 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --workspace --all-features
+      # La configuration par defaut (`default = ["macros"]`) est celle que
+      # recoivent tous les utilisateurs : `--all-features` ne la prouve pas.
+      - name: Tests (configuration par defaut)
+        run: cargo test --workspace
       # Matrice de features : `--all-features` ne prouve rien des configurations
       # servies aux utilisateurs. Tests complets sans les features par défaut,
-      # puis CHAQUE feature isolée (surface publique séparée). Le gate de
-      # release (`scripts/release.ps1 verify`) exécute les mêmes commandes.
+      # puis CHAQUE feature isolée : testée, pas seulement compilée (une cible
+      # de test cassée sous `--features schemars` seule passait la CI). Le gate
+      # de release (`scripts/release.ps1 verify`) exécute les mêmes commandes.
       - name: Tests (sans features par defaut)
         run: cargo test --workspace --no-default-features
       - name: Feature macros isolee
         run: cargo check -p litemcp --no-default-features --features macros
+      - name: Tests feature macros isolee
+        run: cargo test -p litemcp --no-default-features --features macros
       - name: Feature schemars isolee
         run: cargo check -p litemcp --no-default-features --features schemars
+      - name: Tests feature schemars isolee
+        run: cargo test -p litemcp --no-default-features --features schemars
+      # Les exemples sont la porte d'entree du README (`cargo run --example
+      # hello`) : ils doivent compiler dans la configuration la plus large.
+      - name: Exemples (toutes features)
+        run: cargo build --examples --all-features
       # Les garde-fous du pipeline de publication (scripts/release-tests.ps1 :
       # tag incohérent, tests rouges, version déjà publiée, réseau
       # indisponible, contenu des paquets) tournent aussi sur chaque PR —
@@ -66,6 +79,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@ccc8c1f930153b792217f06c65a38f23a882993a # 1.85
       - name: Check MSRV
         run: cargo check --workspace --all-targets --all-features
+
+  windows:
+    # Le crate fait du TCP/HTTP brut et de l'annonce de registre : la
+    # sémantique socket et les ACL de fichiers diffèrent de Linux, et Windows
+    # est la plateforme de développement. Suite par défaut au minimum.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Tests (configuration par defaut)
+        run: cargo test --workspace
 
   advisories:
     # Chaîne d'approvisionnement : échoue sur tout advisory RustSec connu.

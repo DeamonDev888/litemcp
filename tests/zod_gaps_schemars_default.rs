@@ -78,7 +78,7 @@ fn schemars_default_est_publie_et_injecte() {
         })
         .core();
     let reply = core
-        .dispatch(
+        .dispatch_unchecked(
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"name":"x"}}}"#,
         )
         .unwrap();
@@ -104,7 +104,7 @@ fn schemars_default_est_publie_et_injecte() {
             Ok(json!({}))
         })
         .core();
-    let _ = core2.dispatch(
+    let _ = core2.dispatch_unchecked(
         br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"t","arguments":{"name":"y","count":42}}}"#,
     );
     let vu2 = seen3
@@ -138,7 +138,7 @@ fn schemars_default_imbrique_est_injecte_recursivement() {
     // `inner` est PRÉSENT mais vide : le défaut imbriqué (`depth`) doit
     // être injecté — le sous-document est derrière un `$ref` local
     // (`#/$defs/Nested`), résolu sans réseau.
-    let _ = core.dispatch(
+    let _ = core.dispatch_unchecked(
         br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"inner":{}}}}"#,
     );
     let vu = seen
@@ -165,7 +165,7 @@ fn schemars_sans_default_publie_ne_laisse_passer_rien() {
             Ok(json!({}))
         })
         .core();
-    let _ = core.dispatch(
+    let _ = core.dispatch_unchecked(
         br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{}}}"#,
     );
     let vu = seen

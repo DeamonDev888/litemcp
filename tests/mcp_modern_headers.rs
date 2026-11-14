@@ -627,11 +627,17 @@ fn modern_profile_custom_headers_explicit_null_argument() {
         status, 200,
         "argument null sans header doit être accepté : {val}"
     );
-    assert!(
-        val["result"]["structuredContent"]
-            .get("opt_param")
-            .is_none(),
-        "le null reste absent des arguments transmis : {val}"
+    // M3 : `null` est une valeur **légitime** d'un champ optionnel (il vaut
+    // absence), donc l'appel réussit et le handler reçoit la valeur telle
+    // quelle. Avant le correctif, `null` était refusé par le schéma et
+    // cette assertion ne vérifiait rien : la réponse était un `-32602` sans
+    // `result`, et `val["result"]["structuredContent"].get(..)` valait
+    // trivialement `None`.
+    assert!(val.get("error").is_none(), "l'appel doit réussir : {val}");
+    assert_eq!(
+        val["result"]["structuredContent"]["opt_param"],
+        Value::Null,
+        "le null optionnel est transmis tel quel (le handler le lit comme absence) : {val}"
     );
 }
 
