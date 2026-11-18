@@ -67,7 +67,11 @@ pub fn registry_dir() -> PathBuf {
 /// acceptable, l'annonce est une commodité et jamais une condition de
 /// fonctionnement. La borne de longueur garde le nom final (nom + `.json`)
 /// sous la limite de 255 octets des systèmes de fichiers usuels.
-fn is_safe_name(name: &str) -> bool {
+///
+/// `pub(crate)` : le sweep anti-zombie l'utilise pour reconnaître LE nommage
+/// d'annonce — `sweep_dir` ne détruit que les fichiers qui y correspondent
+/// (voir [`crate::antizombie::sweep_dir`]).
+pub(crate) fn is_safe_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name.len() <= 100
@@ -101,7 +105,31 @@ pub fn announce(name: &str, version: &str, port: u16) -> u64 {
 /// L'écriture est sérialisée par le verrou du nom (voir `with_name_lock`)
 /// : un retrait concurrent ne peut plus détruire l'annonce qui vient d'être
 /// écrite.
+///
+/// Forme **historique** : l'annonce ne dit rien de l'authentification
+/// (équivalent à [`announce_at_with`] avec `auth_required = false` et aucune
+/// empreinte). Un serveur qui active l'autorisation publie la variante
+/// complète.
 pub fn announce_at(name: &str, version: &str, addr: SocketAddr, instance: u64) {
+    announce_at_with(name, version, addr, instance, false, None);
+}
+
+/// Écrit l'annonce avec l'état d'authentification — voir [`announce_at`].
+///
+/// `auth_required` devient `"authRequired"` (booléen) et
+/// `certificate_fingerprint` — l'empreinte TLS du certificat servi
+/// (`sha256:` + hex) — devient `"certificateFingerprint"` quand elle existe.
+/// **Aucun secret** n'est publié : une empreinte de certificat public est une
+/// identité, pas une clé ; le serveur n'a du reste aucune clé privée
+/// d'authentification (le modèle est « le client signe », `docs/auth.md` §1).
+pub fn announce_at_with(
+    name: &str,
+    version: &str,
+    addr: SocketAddr,
+    instance: u64,
+    auth_required: bool,
+    certificate_fingerprint: Option<&str>,
+) {
     if !is_safe_name(name) || addr.port() == 0 || instance == 0 {
         return;
     }
@@ -117,12 +145,13 @@ pub fn announce_at(name: &str, version: &str, addr: SocketAddr, instance: u64) {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let doc = serde_json::json!({
+    let mut doc = serde_json::json!({
         "name": name,
         "version": version,
         "addr": addr.to_string(),
         "port": addr.port(),
         "instance": instance,
+        "authRequired": auth_required,
         "pid": std::process::id(),
         "exe": exe.to_string_lossy(),
         "args": args,
@@ -132,6 +161,12 @@ pub fn announce_at(name: &str, version: &str, addr: SocketAddr, instance: u64) {
             .map(|d| d.as_secs())
             .unwrap_or(0),
     });
+    if let (Some(fingerprint), Some(object)) = (certificate_fingerprint, doc.as_object_mut()) {
+        object.insert(
+            "certificateFingerprint".to_string(),
+            serde_json::Value::String(fingerprint.to_string()),
+        );
+    }
     let dir = registry_dir();
     if create_private_dir(&dir).is_err() {
         return;
@@ -273,7 +308,10 @@ pub(crate) fn with_name_lock_for<T>(
         return None;
     }
     let lock = registry_dir().join(format!("{name}.lock"));
-    let deadline = Instant::now() + LOCK_ACQUIRE_TIMEOUT;
+    // `checked_add` : une constante de péremption démesurée ne peut pas
+    // paniquer ; `None` = aucune échéance (l'attente reste bornée par les
+    // verrous frais, jamais par un `+` qui déborde).
+    let deadline = Instant::now().checked_add(LOCK_ACQUIRE_TIMEOUT);
     loop {
         match fs::create_dir(&lock) {
             Ok(()) => break, // verrou pris
@@ -287,7 +325,7 @@ pub(crate) fn with_name_lock_for<T>(
                 if lock_is_stale(&lock, stale_after) && fs::remove_dir_all(&lock).is_ok() {
                     continue; // nouvelle tentative immédiate
                 }
-                if Instant::now() >= deadline {
+                if deadline.is_some_and(|echeance| Instant::now() >= echeance) {
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(2));

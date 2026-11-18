@@ -91,14 +91,12 @@ use std::sync::{Mutex, OnceLock};
 /// autre forme — et tout document qui ne **compile pas** — est refusé à la
 /// construction (erreur de programmation).
 pub struct FromJsonSchema {
-    document: Value,
+    /// Document publié **et** branches déjà compilées (voir [`Prepared`]).
+    prepared: Prepared,
     /// Validateur compilé **une fois, à la construction** : un document
     /// invalide ne peut plus être enregistré puis transformé en erreur
     /// `-32602` à chaque appel.
     validator: Validator,
-    /// Branches `anyOf`/`oneOf` déjà compilées (sélection avant injection,
-    /// voir [`branch_accepts`]) — clé = adresse du nœud publié.
-    branch_validators: OnceLock<BranchCache>,
 }
 
 /// Validateur compilé — ou le diagnostic d'échec de compilation.
@@ -145,9 +143,8 @@ pub fn from_json_schema(document: Value) -> FromJsonSchema {
         .build(&document)
     {
         Ok(validator) => FromJsonSchema {
-            document,
+            prepared: Prepared::new(document),
             validator: Validator::Compiled(validator),
-            branch_validators: OnceLock::new(),
         },
         Err(error) => panic!(
             "litemcp/schemars : document JSON Schema invalide — il doit compiler pour être \
@@ -160,13 +157,24 @@ impl FromJsonSchema {
     /// Le document JSON Schema publié.
     #[must_use]
     pub fn document(&self) -> &Value {
-        &self.document
+        &self.prepared.document
+    }
+
+    /// Nombre de branches `anyOf`/`oneOf` déjà compilées **hors requête**
+    /// (diagnostic et tests : elles sont compilées à la construction).
+    #[must_use]
+    pub fn branches_compilees(&self) -> usize {
+        self.prepared
+            .branches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 }
 
 impl Schema for FromJsonSchema {
     fn json(&self) -> Value {
-        self.document.clone()
+        self.document().clone()
     }
 
     // **Le défaut publié est APPLIÉ** — exactement la même politique que
@@ -181,30 +189,36 @@ impl Schema for FromJsonSchema {
     // publié mais jamais appliqué — la promesse « publié = appliqué » était
     // rompue sur cette voie.
     fn default_value(&self) -> Option<&Value> {
-        effective_root(&self.document).get("default")
+        effective_root(&self.prepared.document).get("default")
     }
 
     fn apply_defaults(&self, value: &mut Value) {
-        let branch_validators = self.branch_validators.get_or_init(BranchCache::default);
+        let branches = &self.prepared.branches;
         apply_node_defaults(
-            &self.document,
-            &self.document,
+            &self.prepared.document,
+            &self.prepared.document,
             value,
             0,
-            &|branch, instance| branch_accepts(branch_validators, &self.document, branch, instance),
+            &|branch, instance| branch_accepts(branches, &self.prepared.document, branch, instance),
         );
     }
 
     fn has_defaults(&self) -> bool {
-        schema_has_default(&self.document, &self.document, 0, &mut Vec::new())
+        self.prepared.defaults
     }
 
     fn has_integers(&self) -> bool {
-        schema_has_integer(&self.document, &self.document, 0, &mut Vec::new())
+        self.prepared.integers
     }
 
     fn normalize_integers(&self, value: &mut Value) {
-        normalize_node_integers(&self.document, &self.document, value, 0, &mut Vec::new());
+        normalize_node_integers(
+            &self.prepared.document,
+            &self.prepared.document,
+            value,
+            0,
+            &mut Vec::new(),
+        );
     }
 
     fn validate(&self, path: &mut Path, value: &Value, issues: &mut Issues) {
@@ -240,16 +254,14 @@ pub struct FromSchemars<T: ?Sized> {
     /// `fn() -> T` : rend l'adaptateur `Send + Sync + 'static` sans exiger
     /// `T: Send + Sync`.
     _type: PhantomData<fn() -> T>,
-    /// Schéma JSON dérivé par schemars — calculé une fois.
-    document: OnceLock<Value>,
+    /// Schéma JSON dérivé par schemars **et** état dérivé (branches
+    /// compilées, présence de défauts/d'entiers) — calculés une fois.
+    prepared: OnceLock<Prepared>,
     /// Validateur compilé **avec les `format` activés** — calculé une fois.
     /// `format` est une annotation en JSON Schema 2020-12 : sans
     /// activation explicite, le validateur l'ignore et le schéma
     /// publié ne serait pas appliqué (promesse « exécuteur » rompue).
     validator_with_formats: OnceLock<Validator>,
-    /// Branches `anyOf`/`oneOf` déjà compilées (sélection avant injection,
-    /// voir [`branch_accepts`]) — clé = adresse du nœud publié.
-    branch_validators: OnceLock<BranchCache>,
 }
 
 /// Adapte un type `#[derive(JsonSchema)]` en schéma exécuteur LiteMCP.
@@ -268,14 +280,18 @@ impl<T: ::schemars::JsonSchema + 'static> FromSchemars<T> {
     pub fn new() -> Self {
         Self {
             _type: PhantomData,
-            document: OnceLock::new(),
+            prepared: OnceLock::new(),
             validator_with_formats: OnceLock::new(),
-            branch_validators: OnceLock::new(),
         }
     }
 
-    fn document(&self) -> &Value {
-        self.document.get_or_init(|| {
+    /// Document publié **et** état dérivé, matérialisés une seule fois.
+    ///
+    /// Les branches `anyOf`/`oneOf` sont compilées **ici** (pas à la première
+    /// requête) : dès que le schéma est matérialisé, tout le travail de
+    /// schéma est fait — une requête ne fait plus que valider et injecter.
+    fn prepared(&self) -> &Prepared {
+        self.prepared.get_or_init(|| {
             let mut document = serde_json::to_value(::schemars::schema_for!(T))
                 .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
             // `schemars` publie les `format` entiers en omettant certaines
@@ -284,8 +300,23 @@ impl<T: ::schemars::JsonSchema + 'static> FromSchemars<T> {
             // réellement appliqué (sinon une valeur hors plage Rust passait
             // puis cassait à la désérialisation).
             publish_integer_bounds(&mut document);
-            document
+            Prepared::new(document)
         })
+    }
+
+    fn document(&self) -> &Value {
+        &self.prepared().document
+    }
+
+    /// Nombres de branches `anyOf`/`oneOf` déjà compilées **hors requête**
+    /// (diagnostic et tests).
+    #[must_use]
+    pub fn branches_compilees(&self) -> usize {
+        self.prepared()
+            .branches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Recompile le validateur avec l'**activation des `format`**.
@@ -345,24 +376,24 @@ impl<T: ::schemars::JsonSchema + 'static> Schema for FromSchemars<T> {
     }
 
     fn apply_defaults(&self, value: &mut Value) {
-        let branch_validators = self.branch_validators.get_or_init(BranchCache::default);
+        let prepared = self.prepared();
         apply_node_defaults(
-            self.document(),
-            self.document(),
+            &prepared.document,
+            &prepared.document,
             value,
             0,
             &|branch, instance| {
-                branch_accepts(branch_validators, self.document(), branch, instance)
+                branch_accepts(&prepared.branches, &prepared.document, branch, instance)
             },
         );
     }
 
     fn has_defaults(&self) -> bool {
-        schema_has_default(self.document(), self.document(), 0, &mut Vec::new())
+        self.prepared().defaults
     }
 
     fn has_integers(&self) -> bool {
-        schema_has_integer(self.document(), self.document(), 0, &mut Vec::new())
+        self.prepared().integers
     }
 
     fn normalize_integers(&self, value: &mut Value) {
@@ -533,6 +564,83 @@ fn compile_branch(document: &Value, branch: &Value) -> Option<::jsonschema::Vali
         .should_validate_formats(true)
         .build(&wrapper)
         .ok()
+}
+
+/// Recense et **compile immédiatement** les branches `anyOf`/`oneOf` du
+/// document publié, en remplissant le cache avec les mêmes clés que
+/// [`branch_accepts`] (adresse du nœud publié).
+///
+/// Sans cette passe, la première injection de défauts compilait les branches
+/// de la requête en cours — du travail de schéma sur le chemin chaud, et une
+/// compilation par branche rencontrée au fil des appels. Ici, tout ce qui
+/// peut être compilé l'est **à la construction**, pour les documents qui
+/// portent des défauts (seul cas où la sélection de branche sert).
+fn precompiler_branches(document: &Value, cache: &BranchCache) {
+    let mut compilations = std::collections::HashMap::new();
+    let mut pile = vec![document];
+    while let Some(noeud) = pile.pop() {
+        match noeud {
+            Value::Object(objet) => {
+                for cle in ["anyOf", "oneOf"] {
+                    if let Some(Value::Array(branches)) = objet.get(cle) {
+                        for branch in branches {
+                            compilations
+                                .entry(node_address(branch))
+                                .or_insert_with(|| compile_branch(document, branch));
+                            pile.push(branch);
+                        }
+                    }
+                }
+                for (_, valeur) in objet.iter() {
+                    pile.push(valeur);
+                }
+            }
+            Value::Array(elements) => pile.extend(elements.iter()),
+            _ => {}
+        }
+    }
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (cle, validateur) in compilations {
+        cache.entry(cle).or_insert(validateur);
+    }
+}
+
+/// Document publié **et** état dérivé calculé une seule fois : branches
+/// `anyOf`/`oneOf` compilées et présence de défauts/d'entiers.
+///
+/// Le document et son cache de branches vivent dans la **même** allocation
+/// logique : les adresses des nœuds utilisées comme clés restent valides
+/// tant que le `Prepared` n'est pas déplacé — il l'est une fois, à la
+/// construction (ou au premier usage pour `schemars`), jamais par requête.
+struct Prepared {
+    document: Value,
+    branches: BranchCache,
+    /// Le document porte-t-il au moins un `default` (injection à faire) ?
+    defaults: bool,
+    /// Le document porte-t-il des entiers à normaliser ?
+    integers: bool,
+}
+
+impl Prepared {
+    fn new(document: Value) -> Self {
+        let defaults = schema_has_default(&document, &document, 0, &mut Vec::new());
+        let integers = schema_has_integer(&document, &document, 0, &mut Vec::new());
+        let branches = BranchCache::default();
+        // Les branches ne servent qu'à choisir la branche à injecter : sans
+        // défaut, aucune compilation n'est utile (et un document `anyOf`
+        // sans défaut ne doit rien payer au démarrage).
+        if defaults {
+            precompiler_branches(&document, &branches);
+        }
+        Self {
+            document,
+            branches,
+            defaults,
+            integers,
+        }
+    }
 }
 
 /// Bornes exactes du type Rust que `schemars` désigne par son `format`.

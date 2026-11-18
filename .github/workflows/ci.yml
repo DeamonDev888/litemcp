@@ -33,6 +33,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Configuration minimale servie par `default-features = false` : le noyau
+      # (serde + serde_json) doit être clippy-propre sans aucune feature.
+      - name: Clippy (sans features par defaut)
+        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
       - name: Tests
         run: cargo test --workspace --all-features
       # La configuration par defaut (`default = ["macros"]`) est celle que
@@ -54,6 +58,18 @@ jobs:
         run: cargo check -p litemcp --no-default-features --features schemars
       - name: Tests feature schemars isolee
         run: cargo test -p litemcp --no-default-features --features schemars
+      # Features d'authentification, ajoutees en 0.12.0 : `auth-sign`
+      # (ed25519-dalek) et `tls` (rustls + ring + rcgen) tirent des crates que
+      # `--all-features` compile avec le reste ; testees seules, elles prouvent
+      # que le crate et ses suites tiennent sans les autres features.
+      - name: Feature auth-sign isolee
+        run: cargo check -p litemcp --no-default-features --features auth-sign
+      - name: Tests feature auth-sign isolee
+        run: cargo test -p litemcp --no-default-features --features auth-sign
+      - name: Feature tls isolee
+        run: cargo check -p litemcp --no-default-features --features tls
+      - name: Tests feature tls isolee
+        run: cargo test -p litemcp --no-default-features --features tls
       # Les exemples sont la porte d'entree du README (`cargo run --example
       # hello`) : ils doivent compiler dans la configuration la plus large.
       - name: Exemples (toutes features)
@@ -83,13 +99,30 @@ jobs:
   windows:
     # Le crate fait du TCP/HTTP brut et de l'annonce de registre : la
     # sémantique socket et les ACL de fichiers diffèrent de Linux, et Windows
-    # est la plateforme de développement. Suite par défaut au minimum.
+    # est la plateforme de développement. Suite par défaut ET toutes features
+    # (TLS via `ring`, sans cmake ni NASM : vérifié sur Windows 11, rustc 1.99.1).
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Tests (configuration par defaut)
         run: cargo test --workspace
+      - name: Tests (toutes features)
+        run: cargo test --workspace --all-features
+
+  macos:
+    # Même raison que pour Windows, autre système : le crate fait du TCP/HTTP
+    # brut et de l'annonce de registre, dont la sémantique socket (SIGPIPE,
+    # réutilisation d'adresses, chemins de fichiers temporaires) diffère de
+    # Linux. Suite par défaut ET toutes features, comme pour Windows.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Tests (configuration par defaut)
+        run: cargo test --workspace
+      - name: Tests (toutes features)
+        run: cargo test --workspace --all-features
 
   advisories:
     # Chaîne d'approvisionnement : échoue sur tout advisory RustSec connu.

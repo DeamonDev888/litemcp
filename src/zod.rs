@@ -374,6 +374,27 @@ fn assert_ordered<T: PartialOrd + std::fmt::Debug>(min: &T, max: &T, quoi: &str)
     );
 }
 
+/// Valide une valeur par défaut **à la construction** — même politique que
+/// [`assert_ordered`] et la garde de finitude des bornes : un défaut
+/// incohérent avec son schéma (ou non représentable en JSON — NaN/±∞,
+/// dégradés en `null` par serde_json) est une erreur de programmation,
+/// panique au démarrage ; il serait sinon publié tel quel et ferait échouer
+/// chaque appel vide en `-32602` (audit 2026-11-13, m6).
+fn assert_default_valid<S: Schema>(schema: &S, default: &Value) {
+    let mut path = Path::root("défaut");
+    let mut issues = Issues::new();
+    schema.validate(&mut path, default, &mut issues);
+    assert!(
+        issues.is_empty(),
+        "litemcp/zod : valeur par défaut invalide pour le schéma — {} — \
+         le défaut doit être une valeur valide du schéma interne (les valeurs \
+         non représentables en JSON — NaN/±∞ — sont dégradées en `null` par \
+         serde_json et donc refusées ; `nullable(s)` est la forme correcte \
+         pour un défaut `null`)",
+        issues.render().join(" ; ")
+    );
+}
+
 /// Un schéma porteur d'une **valeur par défaut**.
 ///
 /// Le défaut est **publié** (mot-clé `default` du JSON Schema) **et
@@ -388,6 +409,10 @@ fn assert_ordered<T: PartialOrd + std::fmt::Debug>(min: &T, max: &T, quoi: &str)
 ///     .opt("limit", zod::integer().default(10));
 /// // "limit" est publié avec `default: 10` et injecté si absent.
 /// ```
+///
+/// Un défaut qui n'est **pas** une valeur valide du schéma interne est une
+/// erreur de programmation : [`Defaulted::new`] panique à la construction
+/// (voir sa section `# Panics`) — rien d'incohérent n'est publié.
 #[derive(Clone)]
 pub struct Defaulted<S> {
     inner: S,
@@ -395,16 +420,32 @@ pub struct Defaulted<S> {
 }
 
 impl<S> Defaulted<S> {
-    /// Attache une valeur par défaut à un schéma.
-    #[must_use]
-    pub fn new(inner: S, default: Value) -> Self {
-        Self { inner, default }
-    }
-
     /// Associe un nom d'en-tête de transport personnalisé `x-mcp-header` (SEP-2243).
     #[must_use]
     pub fn header(self, name: &str) -> WithHeader<Self> {
         WithHeader::new(self, name)
+    }
+}
+
+impl<S: Schema> Defaulted<S> {
+    /// Attache une valeur par défaut à un schéma.
+    ///
+    /// # Panics
+    ///
+    /// Panique si `default` n'est **pas une valeur valide** du schéma
+    /// interne — même politique que `assert_ordered` et la garde de
+    /// finitude des bornes : l'erreur de programmation est refusée au
+    /// démarrage plutôt que publiée puis rendue en `-32602` à chaque appel
+    /// vide (`string().default(null)`, `integer().max(5).default(9)`,
+    /// `number().default(f64::NAN)`). Les valeurs non représentables en
+    /// JSON (NaN/±∞) sont dégradées en `null` par serde_json et donc
+    /// refusées : `nullable(s)` est la forme correcte pour un défaut
+    /// `null` — le contrat « `null` = absence » vaut pour la **valeur du
+    /// champ** à défaut, le défaut lui-même doit rester valide.
+    #[must_use]
+    pub fn new(inner: S, default: Value) -> Self {
+        assert_default_valid(&inner, &default);
+        Self { inner, default }
     }
 }
 
@@ -478,9 +519,16 @@ impl<S> WithHeader<S> {
             header: header.to_string(),
         }
     }
+}
 
+impl<S: Schema> WithHeader<S> {
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
@@ -632,6 +680,11 @@ impl Obj {
 
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
@@ -773,8 +826,9 @@ impl Schema for Obj {
                 // Champ absent **avec valeur par défaut** : pas une
                 // erreur — le défaut sera injecté (voir
                 // [`Schema::apply_defaults`]). Le défaut lui-même est
-                // validé : un défaut incohérent avec le schéma est une
-                // erreur de programmation.
+                // validé dès sa construction ([`Defaulted::new`]) : un
+                // défaut incohérent avec le schéma panique au démarrage —
+                // cette re-vérification n'est que défensive.
                 None if field.schema.default_value().is_some() => {
                     if let Some(default) = field.schema.default_value() {
                         if issues.is_full() {
@@ -1211,6 +1265,11 @@ impl Str {
 
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
@@ -1338,6 +1397,11 @@ impl Int {
 
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
@@ -1468,6 +1532,11 @@ impl Uint {
 
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
@@ -1652,6 +1721,11 @@ impl Num {
 
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
@@ -1707,6 +1781,11 @@ pub fn boolean() -> Bool {
 impl Bool {
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
@@ -1819,6 +1898,11 @@ impl Enum {
 
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
@@ -1924,6 +2008,11 @@ impl Record {
 
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
@@ -2047,6 +2136,11 @@ impl Arr {
 
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
@@ -2161,6 +2255,11 @@ pub fn nullable(inner: impl Schema + 'static) -> Nullable {
 impl Nullable {
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())
@@ -2236,6 +2335,11 @@ pub fn describe(description: &str, inner: impl Schema + 'static) -> Described {
 impl Described {
     /// Valeur par défaut (publiée **et appliquée** — voir
     /// [`Defaulted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panique si `value` n'est pas une valeur valide du schéma (erreur de
+    /// programmation — voir [`Defaulted::new`]).
     #[must_use]
     pub fn default(self, value: impl Into<Value>) -> Defaulted<Self> {
         Defaulted::new(self, value.into())

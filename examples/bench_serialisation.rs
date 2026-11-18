@@ -32,10 +32,12 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use litemcp::{ServerBuilder, ServerCore};
+use litemcp::auth::{AuthContext, AuthError, ProofMethod, VerifiedRequest, Verifier};
+use litemcp::{ServerBuilder, ServerCore, zod};
 use serde_json::{Value, json};
 
 /// Plafond de la campagne : 1 Mio (configurable, le défaut du crate est 16
@@ -294,6 +296,225 @@ fn afficher(nom: &str, mode: &str, m: &Mesure) {
     );
 }
 
+// ------------------------------------------------------------------
+// Catalogues : 50 et 200 outils, chemin ouvert et chemin filtré.
+// ------------------------------------------------------------------
+
+/// Tailles de catalogue mesurées.
+const CATALOGUES: [usize; 2] = [50, 200];
+
+/// Droits du catalogue de mesure : l'outil `i` exige `groupe{i % 2}`.
+const GROUPES: [&str; 2] = ["groupe0", "groupe1"];
+
+/// Vérificateur de la campagne : la clé est l'en-tête `x-cle`, les droits
+/// sont fixes — aucun coût de signature, la mesure porte sur le catalogue.
+struct VerificateurDeBench;
+
+impl Verifier for VerificateurDeBench {
+    fn verify(&self, request: &VerifiedRequest<'_>) -> Result<AuthContext, AuthError> {
+        let Some((_, cle)) = request
+            .headers
+            .iter()
+            .find(|(nom, _)| nom.eq_ignore_ascii_case("x-cle"))
+        else {
+            return Err(AuthError::new("cle_absente"));
+        };
+        match *cle {
+            // Deux clés aux droits différents : la large voit les deux
+            // groupes, l'étroite un seul (la moitié du catalogue).
+            "large" => Ok(AuthContext::new("large", ProofMethod::Application).with_rights(GROUPES)),
+            "etroite" => {
+                Ok(AuthContext::new("etroite", ProofMethod::Application).with_rights([GROUPES[0]]))
+            }
+            _ => Err(AuthError::new("cle_inconnue")),
+        }
+    }
+}
+
+/// Catalogue de `n` outils à schéma zod, droits alternés ; le vérificateur
+/// n'est installé que pour le chemin filtré (sans lui, `dispatch` refuse).
+fn constructeur_catalogue(n: usize, avec_verificateur: bool) -> ServerBuilder {
+    let mut builder = ServerBuilder::new("bench-catalogue", "1.0").legacy(true);
+    if avec_verificateur {
+        builder = builder.verifier(Arc::new(VerificateurDeBench));
+    }
+    for index in 0..n {
+        let nom: &'static str = Box::leak(format!("outil_{index:03}").into_boxed_str());
+        let description: &'static str = Box::leak(
+            format!("Outil numero {index} du catalogue de mesure des chemins chauds")
+                .into_boxed_str(),
+        );
+        builder = builder
+            .tool_typed(
+                nom,
+                description,
+                zod::object()
+                    .field("query", zod::string().min(2).max(64))
+                    .opt("limit", zod::integer().min(1).max(100))
+                    .strict(),
+                |args| {
+                    let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                    Ok(json!({ "echo": query }))
+                },
+            )
+            .require_right(nom, GROUPES[index % 2]);
+    }
+    builder.max_response_bytes(16 * 1024 * 1024)
+}
+
+/// Nombre d'éléments publiés par un `tools/list` sérialisé.
+fn nombre_outils(reponse: &[u8]) -> usize {
+    let value: Value = serde_json::from_slice(reponse).expect("JSON de catalogue");
+    value
+        .get("result")
+        .and_then(|result| result.get("tools"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+/// Mesure les catalogues ouvert et filtré par appelant (mode `dispatch`).
+fn catalogues() {
+    let corps = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_vec();
+    for taille in CATALOGUES {
+        let coeur_ouvert = constructeur_catalogue(taille, false).core();
+        let coeur = constructeur_catalogue(taille, true).core();
+        let entetes_large = [("x-cle", "large")];
+        let entetes_etroite = [("x-cle", "etroite")];
+
+        // Sanitaires : le nombre d'outils publiés est celui attendu, et les
+        // deux clés ne voient pas la même chose.
+        let ouverte = coeur_ouvert.dispatch(&corps).expect("dispatch catalogue");
+        let large = coeur.dispatch_verified(&VerifiedRequest::new(
+            "POST",
+            "/mcp",
+            "bench",
+            &entetes_large,
+            &corps,
+        ));
+        let etroite = coeur.dispatch_verified(&VerifiedRequest::new(
+            "POST",
+            "/mcp",
+            "bench",
+            &entetes_etroite,
+            &corps,
+        ));
+        assert_eq!(nombre_outils(&ouverte), taille, "catalogue ouvert");
+        assert_eq!(nombre_outils(&large.body), taille, "clé large");
+        assert_eq!(
+            nombre_outils(&etroite.body),
+            taille.div_ceil(2),
+            "clé étroite"
+        );
+
+        let marqueur = match taille {
+            50 => "tools/list 50",
+            200 => "tools/list 200",
+            _ => "tools/list ?",
+        };
+        let m = mesurer(1_000, 100, || {
+            let reponse = coeur_ouvert.dispatch(&corps).expect("dispatch catalogue");
+            black_box(reponse.len());
+        });
+        afficher(marqueur, "ouvert", &m);
+        let m = mesurer(500, 50, || {
+            let reponse = coeur.dispatch_verified(&VerifiedRequest::new(
+                "POST",
+                "/mcp",
+                "bench",
+                &entetes_large,
+                &corps,
+            ));
+            black_box(reponse.body.len());
+        });
+        afficher(marqueur, "filtre-large", &m);
+        let m = mesurer(500, 50, || {
+            let reponse = coeur.dispatch_verified(&VerifiedRequest::new(
+                "POST",
+                "/mcp",
+                "bench",
+                &entetes_etroite,
+                &corps,
+            ));
+            black_box(reponse.body.len());
+        });
+        afficher(marqueur, "filtre-etroit", &m);
+    }
+}
+
+/// Schéma `schemars` volumineux : le parcours de détection des défauts et
+/// des entiers (`has_defaults`/`has_integers`) était refait à chaque appel.
+/// 120 propriétés, la moitié avec défaut, quelques-unes entières.
+#[cfg(feature = "schemars")]
+fn schema_schemars(avec_defauts: bool, etiquette: &str) {
+    use litemcp::schemars::from_json_schema;
+
+    let mut proprietes = serde_json::Map::new();
+    let mut arguments = serde_json::Map::new();
+    for index in 0..120 {
+        let nom = format!("champ_{index:03}");
+        let mut schema = if index % 2 == 0 {
+            json!({ "type": "integer", "minimum": 0, "maximum": 1000 })
+        } else {
+            json!({ "type": "string", "minLength": 1 })
+        };
+        if avec_defauts {
+            schema["default"] = if index % 2 == 0 {
+                json!(index)
+            } else {
+                json!("v")
+            };
+        }
+        proprietes.insert(nom.clone(), schema);
+        if index % 3 == 0 {
+            arguments.insert(
+                nom,
+                if index % 2 == 0 {
+                    json!(index)
+                } else {
+                    json!("v")
+                },
+            );
+        }
+    }
+    let document = json!({
+        "type": "object",
+        "properties": proprietes,
+        "additionalProperties": false,
+    });
+    let schema = from_json_schema(document);
+    let defauts = {
+        use litemcp::zod::Schema;
+        schema.has_defaults()
+    };
+    assert_eq!(defauts, avec_defauts, "défauts publiés : {etiquette}");
+    let coeur = ServerBuilder::new("bench-schema", "1.0")
+        .legacy(true)
+        .tool_typed("doc", "Outil à schéma volumineux", schema, |args| {
+            Ok(json!({ "champs": args.as_object().map_or(0, serde_json::Map::len) }))
+        })
+        .max_response_bytes(1024 * 1024)
+        .core();
+    let corps = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "doc", "arguments": arguments },
+    })
+    .to_string()
+    .into_bytes();
+    let reply = coeur.dispatch(&corps).expect("dispatch schéma");
+    let value: Value = serde_json::from_slice(&reply).expect("JSON");
+    assert!(
+        value.get("result").is_some(),
+        "appel conforme attendu : {value}"
+    );
+    let m = mesurer(2_000, 200, || {
+        let reply = coeur.dispatch(&corps).expect("dispatch schéma");
+        black_box(reply.len());
+    });
+    afficher(etiquette, "dispatch", &m);
+}
+
 fn main() {
     println!("=== litemcp — bench sérialisation / plafond de réponse (release) ===");
     println!(
@@ -480,4 +701,49 @@ fn main() {
         "\nReproductibilité : itérations/échauffements figés, compilation release identique, \
          machine au repos conseillée — comparer les deltas avant/après sur la même machine."
     );
+
+    // Catalogues (point 1 du lot L4) : mêmes réserves de mesure, mode `dispatch`.
+    println!("\nCatalogues — droits alternés par outil, vérificateur sans coût de signature :");
+    catalogues();
+
+    // Schéma volumineux (point 3) : détection défauts/entiers hors requête.
+    #[cfg(feature = "schemars")]
+    {
+        println!("\nSchéma `schemars` volumineux — détection des défauts/entiers :");
+        schema_schemars(false, "tools/call schéma 120");
+        schema_schemars(true, "tools/call schéma+défauts");
+    }
+
+    // Attribution du coût de `tool_timeout` (point 0) : le chemin borné passe
+    // par un fil de handler ; `.no_tool_timeout()` exécute dans le fil de
+    // connexion, comme la 0.11.0. Même outil, même corps, même transport.
+    {
+        println!("\nCoût de `tool_timeout` — même outil, chemin non borné :");
+        let sans_borne = constructeur(PLAFOND).no_tool_timeout().core();
+        let corps_appel = corps(100);
+        let reponse = sans_borne.dispatch(&corps_appel).expect("dispatch");
+        assert!(chercher(&reponse, b"\"result\"").is_some());
+        let m = mesurer(3_000, 300, || {
+            let reponse = sans_borne.dispatch(&corps_appel).expect("dispatch");
+            black_box(reponse.len());
+        });
+        afficher("tools/call petit", "dispatch", &m);
+        let serveur_sans_borne = constructeur(PLAFOND).no_tool_timeout();
+        let lie = serveur_sans_borne.bind("127.0.0.1:0").expect("bind");
+        let adresse = lie.local_addr().expect("adresse");
+        std::thread::spawn(move || {
+            let _ = lie.serve();
+        });
+        let mut flux = TcpStream::connect(adresse).expect("connexion");
+        flux.set_nodelay(true).expect("nodelay");
+        let mut tampon = Vec::with_capacity(4096);
+        let requete = enveloppe_json(&corps_appel);
+        echange_json(&mut flux, &requete, &mut tampon);
+        assert!(tampon.starts_with(b"HTTP/1.1 200"));
+        let m = mesurer(3_000, 300, || {
+            echange_json(&mut flux, &requete, &mut tampon);
+            black_box(tampon.len());
+        });
+        afficher("tools/call petit", "http-json-sans-borne", &m);
+    }
 }

@@ -252,36 +252,125 @@ impl Gateway {
     /// `None` = notification (aucune réponse). Le profil configuré
     /// s'applique : en strict (défaut), un corps sans `_meta` est refusé en
     /// `-32602`.
+    ///
+    /// **Garde de récursion** : un handler qui re-dispatche est coupé
+    /// au-delà de `MAX_DISPATCH_DEPTH` dispatchs imbriqués sur le thread
+    /// courant (tous gateways confondus) par une erreur `-32603` — voir
+    /// `recursion_limit_response`.
     pub fn dispatch(&self, body: &[u8]) -> Option<Vec<u8>> {
+        let Some(_garde) = Self::enter_dispatch() else {
+            return recursion_limit_response(body).map(|(corps, _)| corps);
+        };
         self.snapshot().dispatch(body)
     }
 
     /// Dispatch sur le snapshot courant **sans contrôle de profil** — voir
     /// [`ServerCore::dispatch_unchecked`]. Réservé aux appelants qui
     /// garantissent déjà des corps conformes (tests, harnais de mesure).
+    ///
+    /// **Garde de récursion** : identique à [`Gateway::dispatch`].
     pub fn dispatch_unchecked(&self, body: &[u8]) -> Option<Vec<u8>> {
+        let Some(_garde) = Self::enter_dispatch() else {
+            return recursion_limit_response(body).map(|(corps, _)| corps);
+        };
         self.snapshot().dispatch_unchecked(body)
     }
 
     /// Dispatch sur le snapshot courant, avec vérification des en-têtes de
     /// routage MCP (SEP-2243) — voir
     /// [`ServerCore::dispatch_with_headers`].
+    ///
+    /// **Garde de récursion** : identique à [`Gateway::dispatch`].
     pub fn dispatch_with_headers(
         &self,
         body: &[u8],
         headers: Option<&McpHeaders>,
     ) -> Option<Vec<u8>> {
+        let Some(_garde) = Self::enter_dispatch() else {
+            return recursion_limit_response(body).map(|(corps, _)| corps);
+        };
         self.snapshot().dispatch_with_headers(body, headers)
     }
 
     /// Dispatch sur le snapshot courant avec statut structuré — voir
     /// [`ServerCore::dispatch_request`].
+    ///
+    /// **Garde de récursion** : identique à [`Gateway::dispatch`] — le
+    /// `-32603` porte le statut canonique du noyau pour ce code
+    /// (`HttpStatus::from_error_code`).
     pub fn dispatch_request(
         &self,
         body: &[u8],
         headers: Option<&McpHeaders>,
     ) -> Option<crate::server::DispatchResponse> {
+        let Some(_garde) = Self::enter_dispatch() else {
+            // Le statut suit le corps rendu : `-32603` d'ordinaire, `-32700`
+            // (400) quand le corps de la requête était illisible.
+            return recursion_limit_response(body).map(|(corps, code)| {
+                crate::server::DispatchResponse {
+                    body: corps,
+                    status: crate::server::HttpStatus::from_error_code(code),
+                }
+            });
+        };
         self.snapshot().dispatch_request(body, headers)
+    }
+
+    /// Dispatch sur le snapshot courant avec une identité **déjà établie** —
+    /// voir [`ServerCore::dispatch_authenticated`].
+    ///
+    /// L'autorisation s'applique au **snapshot courant** : un `edit` qui
+    /// échange le catalogue pendant qu'une requête s'exécute ne vaut que pour
+    /// le dispatch suivant (la requête en cours garde le snapshot où elle a
+    /// commencé). Un dispatch **imbriqué** (handler appelant
+    /// [`Gateway::dispatch`]) hérite de l'identité du fil, comme
+    /// [`crate::progress`] et [`crate::cancel`] pour leurs canaux.
+    ///
+    /// **Garde de récursion** : identique à [`Gateway::dispatch`] — le
+    /// `-32603` porte le statut canonique du noyau pour ce code
+    /// (`HttpStatus::from_error_code`).
+    pub fn dispatch_authenticated(
+        &self,
+        body: &[u8],
+        headers: Option<&McpHeaders>,
+        context: &crate::auth::AuthContext,
+    ) -> Option<crate::server::DispatchResponse> {
+        let Some(_garde) = Self::enter_dispatch() else {
+            return recursion_limit_response(body).map(|(corps, code)| {
+                crate::server::DispatchResponse {
+                    body: corps,
+                    status: crate::server::HttpStatus::from_error_code(code),
+                }
+            });
+        };
+        self.snapshot()
+            .dispatch_authenticated(body, headers, context)
+    }
+
+    /// **Vérifie puis dispatche** sur le snapshot courant — voir
+    /// [`ServerCore::dispatch_verified`] (contrat C8).
+    ///
+    /// C'est le point d'entrée d'une passerelle qui reçoit des requêtes
+    /// brutes : la vérification et la décision d'autorisation portent sur le
+    /// **snapshot courant**, comme [`Gateway::dispatch_authenticated`] — un
+    /// `edit` concurrent ne vaut que pour le dispatch suivant.
+    pub fn dispatch_verified(
+        &self,
+        request: &crate::auth::VerifiedRequest<'_>,
+    ) -> crate::auth::AuthResponse {
+        let Some(_garde) = Self::enter_dispatch() else {
+            return recursion_limit_response(request.body).map_or_else(
+                || crate::auth::AuthResponse::new(500, Vec::new(), Vec::new()),
+                |(corps, code)| {
+                    crate::auth::AuthResponse::new(
+                        crate::server::HttpStatus::from_error_code(code).code(),
+                        Vec::new(),
+                        corps,
+                    )
+                },
+            );
+        };
+        self.snapshot().dispatch_verified(request)
     }
 
     fn read_current(&self) -> Arc<ServerCore> {
@@ -292,6 +381,130 @@ impl Gateway {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
     }
+}
+
+// Garde **anti-récursion** des dispatchs d'un gateway.
+//
+// Un handler qui re-dispatche sur le **même** gateway (`gw.dispatch` appelé
+// depuis un outil) crée une récursion : chaque niveau empile dispatch →
+// noyau → handler → dispatch. Au-delà de quelques dizaines de niveaux, la
+// pile du thread déborde — et un débordement de pile n'est **pas** une
+// panique : `catch_unwind` du transport ne l'attrape pas, tout le process
+// meurt (audit 2026-11-13, § 6.2 — mesuré : exit `0xC00000FD` /
+// `-1073741571`, `thread 'main' has overflowed its stack`).
+//
+// Détection : un compteur **thread-local** porte le nombre de dispatchs
+// Gateway empilés sur le thread courant (même patron que `HELD_LOCK` :
+// compteur thread-local, aucun `unsafe`, restauré par un garde au `Drop` —
+// panique incluse). Au-delà de la borne, le niveau qui dépasserait rend une
+// erreur `-32603` au lieu de continuer : l'appelant reçoit une enveloppe
+// JSON-RPC propre et le process survit.
+/// Profondeur maximale d'imbrication des dispatchs de gateway sur un thread
+/// — le 33ᵉ niveau imbriqué est refusé en `-32603`. Largement au-dessus de tout
+/// enchaînement légitime (un gateway qui relaie vers un autre serveur via
+/// un outil ajoute un niveau par saut volontaire) et très en dessous du
+/// débordement de pile réel.
+const MAX_DISPATCH_DEPTH: usize = 32;
+
+thread_local! {
+    /// Nombre de dispatchs Gateway actuellement empilés sur le thread
+    /// courant (`0` = aucun).
+    static DISPATCH_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Restaure le compteur de profondeur à la sortie du dispatch (panique
+/// incluse).
+struct DispatchDepthGuard;
+
+impl Drop for DispatchDepthGuard {
+    fn drop(&mut self) {
+        DISPATCH_DEPTH.set(DISPATCH_DEPTH.get() - 1);
+    }
+}
+
+/// Profondeur de dispatch d'un gateway sur ce fil (`0` hors dispatch).
+///
+/// Le noyau (`src/server.rs`) la lit avant de lancer un handler borné par
+/// `tool_timeout` et la réinstalle dans le fil du handler : la garde de
+/// récursion est **thread-locale**, un fil neuf repartirait de `0` et
+/// l'auto-appel d'un gateway gagnerait un niveau par saut de fil.
+pub(crate) fn dispatch_depth() -> usize {
+    DISPATCH_DEPTH.get()
+}
+
+/// Restaure la profondeur du fil appelant au `Drop`.
+pub(crate) struct DepthBinding(usize);
+
+impl Drop for DepthBinding {
+    fn drop(&mut self) {
+        DISPATCH_DEPTH.set(self.0);
+    }
+}
+
+/// Installe `depth` comme profondeur courante sur ce fil — voir
+/// [`dispatch_depth`].
+pub(crate) fn bind_dispatch_depth(depth: usize) -> DepthBinding {
+    DepthBinding(DISPATCH_DEPTH.replace(depth))
+}
+
+impl Gateway {
+    /// Entre dans un dispatch gardé — `None` = limite de récursion atteinte
+    /// (l'appelant rend alors [`recursion_limit_response`] sans exécuter le
+    /// corps).
+    fn enter_dispatch() -> Option<DispatchDepthGuard> {
+        let depth = DISPATCH_DEPTH.get();
+        if depth >= MAX_DISPATCH_DEPTH {
+            return None;
+        }
+        DISPATCH_DEPTH.set(depth + 1);
+        Some(DispatchDepthGuard)
+    }
+}
+
+/// Enveloppe d'erreur rendue au-delà de [`MAX_DISPATCH_DEPTH`] dispatchs
+/// imbriqués sur le thread courant ; le code JSON-RPC employé est rendu avec
+/// les octets, pour que le statut HTTP du chemin `dispatch_request` suive le
+/// corps (400 pour une erreur de parsing).
+///
+/// `-32603` avec l'`id` de la requête quand il est lisible (JSON-RPC 2.0 §5 —
+/// l'`id` d'un type interdit est rendu null, comme pour toute requête non
+/// décodable) ; `None` pour une notification (sans champ `id` — aucune réponse
+/// ne lui est jamais envoyée). Un corps **illisible** rend l'erreur de parsing
+/// du chemin nominal (`-32700`, `id: null`) : `None` y laisserait le client
+/// attendre une réponse qui n'arrive jamais.
+fn recursion_limit_response(body: &[u8]) -> Option<(Vec<u8>, i64)> {
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) else {
+        // Même verdict que le chemin nominal (`-32700`, `id: null`) : refuser
+        // en silence ferait attendre un client qui a bien envoyé une requête.
+        return Some((
+            crate::jsonrpc::Outgoing::parse_error().to_vec(),
+            crate::jsonrpc::ErrorObject::PARSE_ERROR,
+        ));
+    };
+    let id = match parsed.get("id") {
+        // Pas d'`id` : notification — le dispatch n'y répond jamais.
+        None => return None,
+        Some(value @ (serde_json::Value::String(_) | serde_json::Value::Number(_))) => {
+            value.clone()
+        }
+        // `id: null` explicite ou type interdit : `id` null dans la réponse.
+        Some(_) => serde_json::Value::Null,
+    };
+    Some((
+        crate::jsonrpc::Outgoing::failure(
+            id,
+            crate::jsonrpc::ErrorObject::new(
+                crate::jsonrpc::ErrorObject::INTERNAL_ERROR,
+                format!(
+                    "limite de récursion gateway atteinte (plus de {MAX_DISPATCH_DEPTH} \
+                     dispatch imbriqués sur le même thread, tous gateways confondus, \
+                     depuis un handler)"
+                ),
+            ),
+        )
+        .to_vec(),
+        crate::jsonrpc::ErrorObject::INTERNAL_ERROR,
+    ))
 }
 
 // Verrou **réentrant** portant l'état du builder.
@@ -603,13 +816,13 @@ mod tests {
                 b
             });
         }
-        // Les quatre lecteurs ont servi au moins une requête avant l'arrêt
-        // (attente bornée à 5 s — un dispatch dure des microsecondes ; le
-        // plafond ne sert que sur un runner pathologiquement saturé).
-        let echeance = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Attente bornée à 5 s — un dispatch dure des microsecondes ; le
+        // plafond ne sert que sur un runner pathologiquement saturé.
+        // `checked_add` : aucun `+` sur `Instant` (débordement = panique).
+        let echeance = std::time::Instant::now().checked_add(std::time::Duration::from_secs(5));
         for flag in &served {
             while !flag.load(std::sync::atomic::Ordering::Relaxed)
-                && std::time::Instant::now() < echeance
+                && echeance.is_none_or(|fin| std::time::Instant::now() < fin)
             {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -869,5 +1082,33 @@ mod tests {
         // Default : gateway vide constructible
         let vide = Gateway::default();
         assert_eq!(vide.tool_count(), 0);
+    }
+
+    // ---------------------------------------------- garde de récursion
+
+    /// Un corps **illisible** au niveau limite rend la même erreur de parsing
+    /// que le chemin nominal (`-32700`, `id: null`) — et non `None`, qui
+    /// laissait le client attendre une réponse jamais écrite (audit
+    /// 2026-11-13, R4). La profondeur est posée à la borne comme le ferait le
+    /// 32ᵉ dispatch empilé ; le garde la restaure au `Drop`.
+    #[test]
+    fn corps_illisible_a_la_profondeur_limite_rend_l_erreur_de_parsing() {
+        let gw = Gateway::new(build("a"));
+        let _profondeur = bind_dispatch_depth(MAX_DISPATCH_DEPTH);
+        for corps in [&b"pas du json"[..], b"{\"jsonrpc\":\"2.0\",", b""] {
+            let reply = gw.dispatch(corps).unwrap_or_else(|| {
+                panic!("profondeur limite + corps {corps:?} : une réponse est due, pas None")
+            });
+            let v: Value = serde_json::from_slice(&reply).unwrap();
+            assert_eq!(
+                v["error"]["code"],
+                json!(-32700),
+                "même verdict que le chemin nominal pour un corps illisible ({corps:?}) : {v}"
+            );
+            assert!(
+                v["id"].is_null(),
+                "un corps non décodable rend `id: null` ({corps:?}) : {v}"
+            );
+        }
     }
 }

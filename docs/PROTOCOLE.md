@@ -20,16 +20,17 @@ comportements (codes, en-têtes, erreurs) et l'enveloppe obligatoire du profil s
 | `resultType` (SEP-2322) | présent dans **chaque** résultat (`"complete"`) |
 | `serverInfo` (SEP-2575) | le serveur s'identifie sous `_meta` de **chaque** résultat |
 | `tools/list` — `ttlMs` / `cacheScope` (SEP-2549) | `60000` / `"private"` |
-| `outputSchema` | publié dans `tools/list` **et exécuteur** : une sortie `structuredContent` non conforme devient un résultat `isError` (`.output_schema("outil", schéma)`) |
+| `outputSchema` | publié dans `tools/list` **et exécuteur** : une sortie `structuredContent` non conforme devient un résultat `isError` (`.output_schema("outil", schéma)`) ; sur un échec (`isError`) avec schéma publié, `structuredContent` est **omis** (page *Tools* : tout résultat structuré doit conformer au schéma) — le détail de l'erreur reste dans `content` ; sans schéma publié, la forme `{"error": …}` historique est conservée |
 | `resources/list` / `resources/read` | `200` — catalogue et lecture, `ttlMs`/`cacheScope` comme `tools/list` (SEP-2549) ; uri inconnue/manquante : `-32602` ; handler en échec : `-32603` (data `handler_failed`) ; lecture **binaire** : `contents[].blob` (base64 — jamais un texte qui simule le binaire) |
 | `resources/templates/list` | `200` — catalogue des gabarits (URI templates RFC 6570), `ttlMs`/`cacheScope` comme `resources/list` ; servi même sans gabarit (liste vide) |
 | `prompts/list` / `prompts/get` | `200` — catalogue et rendu (messages `user`/`assistant`, `content` = bloc `ContentBlock` complet : texte, image, audio, `resource_link`, ressource embarquée) ; nom inconnu : `-32602` ; `arguments` non-objet : `-32602` |
 | `completion/complete` | `200` — suggestions (`completion.values`, ≤ 100 : au-delà tronquées + `hasMore: true`) ; fournisseur absent ou params invalides (`ref`, `argument`) : `-32602` ; échec du fournisseur : `-32603` (data `handler_failed`) ; capacité `completions` annoncée seulement quand un fournisseur existe |
 | Résultat `input_required` (MRTR) | `200` — `{ resultType: "input_required", inputRequests?, requestState, _meta }` ; rejeu (id **différent**) avec `inputResponses` + écho du jeton ; état signé HMAC-SHA256 (TTL 10 min, liaison méthode/paramètres saillants) : altéré/expiré/malformé/autre clé/requête modifiée → `-32602` avant tout handler ; requête embarquée dont la capacité client n'est pas déclarée → `-32021` ; requête embarquée invalide ou état > 8 Kio → `-32603` (bogue de handler, rien n'est émis) ; `inputResponses` sans `requestState` → `-32602` ; champs MRTR ignorés sur toute autre méthode |
 | `notifications/progress` | `200 text/event-stream` — flux ouvert **avant** le dispatch quand `_meta.progressToken` est fourni et que le client accepte SSE : chaque `progress::report` écrit une notification (jeton de la requête, `progress`/`total`/`message`), l'événement final clôt le flux ; sans jeton ou sans SSE, rapport ignoré et réponse JSON unique ; aucune notification après la réponse |
+| Annulation par fermeture du flux SSE (`2026-07-28`, MUST) | la première écriture SSE qui échoue (client déconnecté) lève le drapeau **coopératif** `litemcp::cancel` de la requête : le handler le consulte à ses points sûrs (`cancel::is_cancelled()`, jeton clonable via `cancel::token()`) et sort de lui-même. Aucune interruption n'est imposée (Rust n'a pas d'annulation de thread) et `notifications/cancelled` n'est pas traitée ; hors flux SSE, le drapeau vaut `false` |
 | Capacités `tools` / `resources` / `prompts` | **toujours** annoncées dans `server/discover` (et dans `initialize`, en profil legacy) — les méthodes correspondantes sont servies même à registre vide (aucune sous-capacité non servie déclarée) |
 | `Mcp-Method` / `Mcp-Name` (SEP-2243) | acceptés ; **incohérents avec le corps** → `-32020` (`HeaderMismatch`) |
-| `initialize` / `ping` | **non servis** en profil strict (`404` + `-32601 Unknown method`) ; servis avec `.legacy(true)`, où `initialize` **négocie** `2025-11-25` (version demandée si elle est servie, sinon plus récente révision legacy servie) |
+| `initialize` / `ping` | **non servis** en profil strict (`404` + `-32601 Unknown method` ; l'erreur d'`initialize` porte `data.supported` — les versions modernes servies, page *Versioning*) ; servis avec `.legacy(true)`, où `initialize` **négocie** `2025-11-25` (version demandée si elle est servie, sinon plus récente révision legacy servie) |
 | Sonde `GET /health` | `200` « ok » (sans JSON-RPC ; probes k8s/systemd) · `HEAD /health` : mêmes en-têtes, sans corps · **un corps annoncé est refusé** (`400`, la sonde n'en accepte aucun) · autre méthode : `405` (`Allow: GET, HEAD`) |
 | `GET` sur `/mcp` | `405 Method Not Allowed` (pas de listener SSE permanent en stateless) |
 | Version HTTP ≠ `HTTP/1.0`/`HTTP/1.1` exactes (sensible à la casse) · ligne de requête malformée | `505` · `400` |
@@ -92,10 +93,12 @@ session `Mcp-Session-Id` n'est créée (la révision `2025-11-25` l'autorise : �
 
 | Écart | Effet |
 |---|---|
-| fermeture d'un flux SSE non traitée comme annulation | le handler n'est pas interrompu, aucun jeton d'annulation n'est exposé |
-| erreur `-32601` sur `initialize` sans `data.supported` | la spec le recommande (« SHOULD »), pas d'obligation |
-| `structuredContent` d'un résultat `isError` non confronté à `outputSchema` | le succès est validé, l'échec non |
 | extension `tasks` non implémentée | 9 scénarios du harness non scorés, hors périmètre du cœur |
+
+**Annulation** : plus d'écart — la fermeture du flux SSE est traitée comme une annulation
+(obligation MUST de la révision). Le contrat est **coopératif** : le transport lève le drapeau à la
+première écriture qui échoue, le handler le consulte où il veut et sort de lui-même ; un handler qui
+ne le consulte jamais s'exécute jusqu'au bout, borné par `tool_timeout` (30 s par défaut).
 
 Conformité mesurée le 2026-11-13 : harness officiel `@modelcontextprotocol/conformance`
 `0.2.0-alpha.12`, requis `2026-07-28` → **37/37 scénarios scorés verts** (50/50 scénarios

@@ -1,0 +1,30 @@
+﻿--- tour 1 : 0.11.0 ---
+RESULT|tools/list (20)|dispatch|2000|17.211|16.300|13.00|8868
+RESULT|tools/list (20)|http-json|2000|96.555|82.800|15.00|8999
+RESULT|tools/call (petit)|dispatch|2000|3.904|3.400|30.00|3750
+RESULT|tools/call (petit)|http-json|2000|80.010|69.100|32.00|3881
+--- tour 1 : courant ---
+RESULT|tools/list (20)|dispatch|2000|1.562|1.100|8.00|7100
+RESULT|tools/list (20)|http-json|2000|88.988|85.600|10.00|7231
+RESULT|tools/call (petit)|dispatch|2000|42.470|37.100|38.00|8531
+RESULT|tools/call (petit)|http-json|2000|115.851|101.400|40.00|8662
+--- tour 2 : 0.11.0 ---
+RESULT|tools/list (20)|dispatch|2000|12.468|10.800|13.00|8868
+RESULT|tools/list (20)|http-json|2000|97.907|84.900|15.00|8999
+RESULT|tools/call (petit)|dispatch|2000|4.287|3.500|30.00|3750
+RESULT|tools/call (petit)|http-json|2000|86.197|76.900|32.00|3881
+--- tour 2 : courant ---
+RESULT|tools/list (20)|dispatch|2000|1.268|1.100|8.00|7100
+RESULT|tools/list (20)|http-json|2000|75.962|67.800|10.00|7231
+RESULT|tools/call (petit)|dispatch|2000|37.201|35.000|38.00|8531
+RESULT|tools/call (petit)|http-json|2000|111.140|97.200|40.00|8662
+--- tour 3 : 0.11.0 ---
+RESULT|tools/list (20)|dispatch|2000|12.897|11.100|13.00|8868
+RESULT|tools/list (20)|http-json|2000|88.573|81.200|15.00|8999
+RESULT|tools/call (petit)|dispatch|2000|3.386|3.300|30.00|3750
+RESULT|tools/call (petit)|http-json|2000|73.997|68.100|32.00|3881
+--- tour 3 : courant ---
+RESULT|tools/list (20)|dispatch|2000|1.097|1.100|8.00|7100
+RESULT|tools/list (20)|http-json|2000|74.614|65.600|10.00|7231
+RESULT|tools/call (petit)|dispatch|2000|38.742|35.100|38.00|8531
+RESULT|tools/call (petit)|http-json|2000|123.078|121.400|40.00|8662

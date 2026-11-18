@@ -45,6 +45,22 @@ fn foreign_pid() -> u64 {
     u64::from(u32::MAX - 1)
 }
 
+/// Rajeunit un fichier (mtime reculé de 2 minutes) sans dépendance externe
+/// (`File::set_times`, std ≥ 1.75). Un `.tmp` plus récent que [`DEBRIS_AGE`]
+/// serait respecté même par l'ancien code : les témoins du contre-test au
+/// nommage doivent être VIEILLIS pour que seul le nom fasse la différence.
+fn vieillir(path: &Path) {
+    let passe = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .checked_sub(Duration::from_secs(120))
+        .map(|d| UNIX_EPOCH + d)
+        .unwrap();
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(passe))
+        .unwrap();
+}
+
 /// Un port **libre et non réattribuable** — bind, port noté, listener lâché :
 /// toute annonce qui le porte est prouvablement morte.
 ///
@@ -161,6 +177,66 @@ fn sweep_retire_les_fichiers_corrompus() {
         "l'écriture atomique garantit qu'un non-parsable n'est pas en cours"
     );
     assert!(!path.exists(), "le débris corrompu est retiré");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sweep_ne_touche_pas_aux_fichiers_etrangers_d_un_dossier_arbitraire() {
+    // sweep_dir est conçue pour les **dossiers d'annonces** : elle ne doit
+    // détruire que les fichiers qui portent LE nommage des annonces
+    // (`<nom>.json`, tmp d'annonce `<nom>.json.<pid>.<nanos>.tmp`) — jamais
+    // un fichier étranger d'un dossier de données (audit 2026-11-13, § 5.2).
+    let dir = unique_dir("etrangers");
+    // Un `.tmp` utilisateur (aucun rapport avec le tmp d'annonce), VIEILLI :
+    // l'âge seul ne doit pas suffire à la destruction.
+    let tmp_utilisateur = dir.join("sauvegarde.tmp");
+    fs::write(&tmp_utilisateur, "donnees utilisateur").unwrap();
+    vieillir(&tmp_utilisateur);
+    // Un `.tmp` json-voisin mais hors nommage d'annonce (`<pid>.<nanos>`
+    // absent), vieilli lui aussi.
+    let tmp_json_etrange = dir.join("export.json.backup.tmp");
+    fs::write(&tmp_json_etrange, "sauvegarde json utilisateur").unwrap();
+    vieillir(&tmp_json_etrange);
+    // Un `.json` de données non parsable dont le nom ne peut PAS être un nom
+    // d'annonce (`..` interdit par le nommage, stem hors limite 100 octets).
+    let json_nom_invalide = dir.join("mes..notes.json");
+    fs::write(&json_nom_invalide, "{pas du json — données utilisateur").unwrap();
+    let json_nom_trop_long = dir.join(format!("{}-donnees.json", "x".repeat(101)));
+    fs::write(&json_nom_trop_long, "{toujours pas du json").unwrap();
+    // Contrôle positif : une annonce corrompue (nommage VALIDE) est retirée.
+    let annonce_corrompue = dir.join("annonce.json");
+    fs::write(&annonce_corrompue, "{annonce corrompue").unwrap();
+
+    let report = sweep_dir(&dir);
+    assert!(
+        tmp_utilisateur.exists(),
+        "un .tmp utilisateur n'est jamais un débris d'annonce : {report:?}"
+    );
+    assert!(
+        tmp_json_etrange.exists(),
+        "seul le tmp d'annonce (`<nom>.json.<pid>.<nanos>.tmp`) est un débris : {report:?}"
+    );
+    assert!(
+        json_nom_invalide.exists(),
+        "un nom qui ne peut pas être un nom d'annonce n'est jamais détruit : {report:?}"
+    );
+    assert!(
+        json_nom_trop_long.exists(),
+        "un nom hors limite du nommage d'annonce n'est jamais détruit : {report:?}"
+    );
+    assert!(
+        !annonce_corrompue.exists(),
+        "une annonce corrompue (nommage valide) est toujours retirée : {report:?}"
+    );
+    assert_eq!(report.corrupt, 1, "{report:?}");
+    assert_eq!(
+        report.debris, 0,
+        "aucun tmp étranger n'est compté débris : {report:?}"
+    );
+    assert_eq!(
+        report.foreign, 4,
+        "les quatre fichiers étrangers sont comptés et respectés : {report:?}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

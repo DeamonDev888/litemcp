@@ -920,9 +920,16 @@ impl CallToolResult {
     /// Forme fil : le `content` textuel porte le message seul (compatible
     /// avec les clients qui ne lisent que le texte), et
     /// `structuredContent.error` porte l'erreur machine-lisible (`code`,
-    /// `retryable`, `retryAfterMs`) — voir [`crate::error`]. Le
-    /// `structuredContent` d'un échec n'a pas à conformer à l'`outputSchema`
-    /// publié : il décrit l'échec, pas une sortie réussie.
+    /// `retryable`, `retryAfterMs`) — voir [`crate::error`].
+    ///
+    /// **`outputSchema` publié** : la page *Tools* (`2026-07-28`) exige que
+    /// tout résultat structuré conforme au schéma publié (« Servers **MUST**
+    /// provide structured results that conform to this schema ») — la forme
+    /// `{"error": …}` ne l'est pas. Le noyau ([`crate::server::ServerCore`])
+    /// **omet** donc `structuredContent` de ce résultat quand un
+    /// `outputSchema` est publié pour l'outil (le détail de l'erreur reste
+    /// dans `content`) ; sans schéma publié, la forme ci-dessus est
+    /// conservée telle quelle.
     #[must_use]
     pub fn from_tool_error(error: &ToolError) -> Self {
         Self {

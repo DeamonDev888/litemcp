@@ -49,8 +49,51 @@
 
 #![forbid(unsafe_code)]
 
-use proc_macro::{Delimiter, TokenStream, TokenTree};
+use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
 use std::str::FromStr;
+
+/// Diagnostic d'une macro : message et **jeton à souligner**.
+///
+/// `span` reste `None` pour les erreurs qui ne désignent aucun jeton précis
+/// (clé requise absente de l'attribut, item qui n'est pas une fonction) : le
+/// `compile_error!` retombe alors sur le span d'appel, c'est-à-dire l'attribut
+/// entier — comportement historique, conservé là où il est juste.
+struct Diag {
+    message: String,
+    span: Option<Span>,
+}
+
+impl Diag {
+    /// Diagnostic ancré sur le span d'appel (aucun jeton à souligner).
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            span: None,
+        }
+    }
+
+    /// Diagnostic soulignant exactement `span`.
+    fn at(message: impl Into<String>, span: Span) -> Self {
+        Self {
+            message: message.into(),
+            span: Some(span),
+        }
+    }
+
+    /// Diagnostic soulignant le **premier jeton** de `tokens` : convention des
+    /// sites fautifs, où la tête de la construction en cause (nom du
+    /// paramètre, premier jeton du type, littéral de `default`) est le jeton
+    /// que l'utilisateur doit corriger.
+    fn over(message: impl Into<String>, tokens: &[TokenTree]) -> Self {
+        Self {
+            message: message.into(),
+            span: tokens.first().map(TokenTree::span),
+        }
+    }
+}
+
+/// Résultat des parsings internes : l'erreur porte son span.
+type MacroResult<T> = core::result::Result<T, Diag>;
 
 /// Déclare un **outil** : schéma dérivé des paramètres, enregistré via
 /// `register_<fonction>` → `ServerBuilder::tool_typed`.
@@ -83,18 +126,25 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
         Ok(attrs) => attrs,
-        Err(message) => return err(&message),
+        Err(diag) => return err(diag),
     };
     let sig = match parse_fn_sig(&item, "#[resource]") {
         Ok(sig) => sig,
-        Err(message) => return err(&message),
+        Err(diag) => return err(diag),
     };
     if attrs.uri.is_none() || attrs.description.is_none() {
-        return err("#[resource] exige uri = \"…\" et description = \"…\"");
+        // Aucun jeton n'est fautif : c'est une clé *absente*. Le span d'appel
+        // souligne l'attribut entier, qui est ici le bon repère.
+        return err(Diag::new(
+            "#[resource] exige uri = \"…\" et description = \"…\"",
+        ));
     }
-    if !sig.raw_params.is_empty() {
-        return err("#[resource] : la fonction ne prend pas de paramètres — \
-             le handler produit le contenu à chaque lecture");
+    if let Some(first_param) = sig.raw_params.first() {
+        return err(Diag::over(
+            "#[resource] : la fonction ne prend pas de paramètres — \
+             le handler produit le contenu à chaque lecture",
+            first_param,
+        ));
     }
     let uri = attrs.uri.expect("vérifié ci-dessus");
     let description = attrs.description.expect("vérifié ci-dessus");
@@ -136,24 +186,29 @@ fn generate_parametrized(attr: TokenStream, item: TokenStream, target: Target) -
     };
     let attrs = match parse_attrs(attr) {
         Ok(attrs) => attrs,
-        Err(message) => return err(&message),
+        Err(diag) => return err(diag),
     };
     let sig = match parse_fn_sig(&item, macro_name) {
         Ok(sig) => sig,
-        Err(message) => return err(&message),
+        Err(diag) => return err(diag),
     };
     let Some(description) = attrs.description else {
-        return err(&format!("{macro_name} exige description = \"…\""));
+        // Clé absente : rien de plus précis que l'attribut entier.
+        return err(Diag::new(format!("{macro_name} exige description = \"…\"")));
     };
     let params = match collect_params(&sig.raw_params, macro_name, &attrs.defaults) {
         Ok(params) => params,
-        Err(message) => return err(&message),
+        Err(diag) => return err(diag),
     };
     // Un `default(nom = …)` doit désigner un paramètre **existant**.
-    for (name, _) in &attrs.defaults {
-        if !params.iter().any(|param| &param.ident == name) {
-            return err(&format!(
-                "{macro_name} : `default({name} = …)` ne correspond à aucun paramètre"
+    for decl in &attrs.defaults {
+        if !params.iter().any(|param| param.ident == decl.name) {
+            return err(Diag::at(
+                format!(
+                    "{macro_name} : `default({} = …)` ne correspond à aucun paramètre",
+                    decl.name
+                ),
+                decl.name_span,
             ));
         }
     }
@@ -232,6 +287,18 @@ fn strip_raw_ident(ident: &str) -> &str {
     ident.strip_prefix("r#").unwrap_or(ident)
 }
 
+/// `default(param = littéral)` déclaré dans l'attribut.
+struct DefaultDecl {
+    /// Nom du paramètre visé, sans `r#`.
+    name: String,
+    /// Jetons de la valeur — soulignés si ce n'est pas un littéral valide ou
+    /// si elle est incompatible avec le type du paramètre.
+    tokens: Vec<TokenTree>,
+    /// Jeton `param` — souligné si la cible n'existe pas ou est déclarée deux
+    /// fois.
+    name_span: Span,
+}
+
 /// Attributs acceptés par les trois macros.
 #[derive(Default)]
 struct Attrs {
@@ -239,10 +306,10 @@ struct Attrs {
     description: Option<String>,
     uri: Option<String>,
     /// Valeurs par défaut des paramètres : `default(limit = 10, mode = "fast")`.
-    defaults: Vec<(String, Vec<TokenTree>)>,
+    defaults: Vec<DefaultDecl>,
 }
 
-fn parse_attrs(attr: TokenStream) -> Result<Attrs, String> {
+fn parse_attrs(attr: TokenStream) -> MacroResult<Attrs> {
     let mut out = Attrs::default();
     let tokens: Vec<TokenTree> = attr.into_iter().collect();
     if tokens.is_empty() {
@@ -253,19 +320,25 @@ fn parse_attrs(attr: TokenStream) -> Result<Attrs, String> {
             continue;
         }
         let Some(TokenTree::Ident(ident)) = entry.first() else {
-            return Err(
-                "attribut invalide — attendus : name, description, uri, default(nom = valeur)"
-                    .to_string(),
-            );
+            return Err(Diag::over(
+                "attribut invalide — attendus : name, description, uri, default(nom = valeur)",
+                entry,
+            ));
         };
         let key = ident.to_string();
         match key.as_str() {
             "name" | "description" | "uri" => {
                 if entry.len() != 3 || !is_punct(&entry[1], '=') {
-                    return Err(format!("syntaxe attendue : `{key} = \"…\"`"));
+                    return Err(Diag::over(
+                        format!("syntaxe attendue : `{key} = \"…\"`"),
+                        entry,
+                    ));
                 }
                 let Some(value) = parse_token_string_lit(&entry[2]) else {
-                    return Err(format!("`{key}` attend une chaîne littérale (`\"…\"`)"));
+                    return Err(Diag::at(
+                        format!("`{key}` attend une chaîne littérale (`\"…\"`)"),
+                        entry[2].span(),
+                    ));
                 };
                 match key.as_str() {
                     "name" => out.name = Some(value),
@@ -276,13 +349,22 @@ fn parse_attrs(attr: TokenStream) -> Result<Attrs, String> {
             }
             "default" => {
                 if entry.len() != 2 {
-                    return Err("syntaxe attendue : `default(nom = valeur, …)`".to_string());
+                    return Err(Diag::over(
+                        "syntaxe attendue : `default(nom = valeur, …)`",
+                        entry,
+                    ));
                 }
                 let TokenTree::Group(group) = &entry[1] else {
-                    return Err("syntaxe attendue : `default(nom = valeur, …)`".to_string());
+                    return Err(Diag::at(
+                        "syntaxe attendue : `default(nom = valeur, …)`",
+                        entry[1].span(),
+                    ));
                 };
                 if group.delimiter() != Delimiter::Parenthesis {
-                    return Err("syntaxe attendue : `default(nom = valeur, …)`".to_string());
+                    return Err(Diag::at(
+                        "syntaxe attendue : `default(nom = valeur, …)`",
+                        group.span(),
+                    ));
                 }
                 let inner: Vec<TokenTree> = group.stream().into_iter().collect();
                 for pair in split_comma_separated(&inner) {
@@ -290,31 +372,39 @@ fn parse_attrs(attr: TokenStream) -> Result<Attrs, String> {
                         continue;
                     }
                     let Some(TokenTree::Ident(param_ident)) = pair.first() else {
-                        return Err(
-                            "syntaxe attendue dans `default(…)` : `nom = valeur`".to_string()
-                        );
+                        return Err(Diag::over(
+                            "syntaxe attendue dans `default(…)` : `nom = valeur`",
+                            pair,
+                        ));
                     };
+                    let name_span = param_ident.span();
                     if pair.len() < 3 || !is_punct(&pair[1], '=') {
-                        return Err(format!(
-                            "syntaxe attendue dans `default(…)` : `{param_ident} = valeur`"
+                        return Err(Diag::at(
+                            format!(
+                                "syntaxe attendue dans `default(…)` : `{param_ident} = valeur`"
+                            ),
+                            name_span,
                         ));
                     }
                     let param_name = strip_raw_ident(&param_ident.to_string()).to_string();
-                    if out
-                        .defaults
-                        .iter()
-                        .any(|(existing, _)| existing == &param_name)
-                    {
-                        return Err(format!("attribut `default` en double pour `{param_name}`"));
+                    if out.defaults.iter().any(|decl| decl.name == param_name) {
+                        return Err(Diag::at(
+                            format!("attribut `default` en double pour `{param_name}`"),
+                            name_span,
+                        ));
                     }
-                    out.defaults.push((param_name, pair[2..].to_vec()));
+                    out.defaults.push(DefaultDecl {
+                        name: param_name,
+                        tokens: pair[2..].to_vec(),
+                        name_span,
+                    });
                 }
             }
             _ => {
-                return Err(
-                    "attribut inconnu — attendus : name, description, uri, default(nom = valeur)"
-                        .to_string(),
-                );
+                return Err(Diag::at(
+                    "attribut inconnu — attendus : name, description, uri, default(nom = valeur)",
+                    ident.span(),
+                ));
             }
         }
     }
@@ -327,14 +417,30 @@ struct FnSig {
     raw_params: Vec<Vec<TokenTree>>,
 }
 
-fn parse_fn_sig(item: &TokenStream, macro_name: &str) -> Result<FnSig, String> {
+fn parse_fn_sig(item: &TokenStream, macro_name: &str) -> MacroResult<FnSig> {
     let tokens: Vec<TokenTree> = item.clone().into_iter().collect();
+    // `async fn` : LiteMCP est synchrone, la fonction annotée est appelée
+    // directement par le handler généré. Sans ce garde, rustc rend un
+    // `E0308 mismatched types … found future` qui ne nomme ni la cause ni le
+    // mot-clé à retirer ; on souligne donc le jeton `async` lui-même.
+    if let Some(span) = tokens.iter().find_map(|token| match token {
+        TokenTree::Ident(ident) if ident.to_string() == "async" => Some(ident.span()),
+        _ => None,
+    }) {
+        return Err(Diag::at(
+            format!("{macro_name} : LiteMCP est synchrone, retirez `async`"),
+            span,
+        ));
+    }
     let mut i = 0;
     while i < tokens.len() {
         if let TokenTree::Ident(ident) = &tokens[i] {
             if ident.to_string() == "fn" {
                 let Some(TokenTree::Ident(fn_ident)) = tokens.get(i + 1) else {
-                    return Err(format!("{macro_name} : nom de fonction attendu après `fn`"));
+                    return Err(Diag::at(
+                        format!("{macro_name} : nom de fonction attendu après `fn`"),
+                        ident.span(),
+                    ));
                 };
                 let name = fn_ident.to_string();
                 let mut j = i + 2;
@@ -346,9 +452,12 @@ fn parse_fn_sig(item: &TokenStream, macro_name: &str) -> Result<FnSig, String> {
                     // liste de paramètres et l'erreur de compilation
                     // résultante n'aurait aucun rapport avec la cause.
                     if is_punct(&tokens[j], '<') {
-                        return Err(format!(
-                            "{macro_name} : les fonctions génériques ne sont pas supportées — \
-                             les types de paramètres doivent être concrets"
+                        return Err(Diag::at(
+                            format!(
+                                "{macro_name} : les fonctions génériques ne sont pas supportées — \
+                                 les types de paramètres doivent être concrets"
+                            ),
+                            tokens[j].span(),
                         ));
                     }
                     if let TokenTree::Group(group) = &tokens[j] {
@@ -364,15 +473,17 @@ fn parse_fn_sig(item: &TokenStream, macro_name: &str) -> Result<FnSig, String> {
                     }
                     j += 1;
                 }
-                return Err(format!(
-                    "{macro_name} : liste de paramètres attendue pour `{name}`"
+                return Err(Diag::at(
+                    format!("{macro_name} : liste de paramètres attendue pour `{name}`"),
+                    ident.span(),
                 ));
             }
         }
         i += 1;
     }
-    Err(format!(
-        "{macro_name} doit être appliqué à une fonction `fn`"
+    Err(Diag::over(
+        format!("{macro_name} doit être appliqué à une fonction `fn`"),
+        &tokens,
     ))
 }
 
@@ -405,7 +516,10 @@ enum DefaultLit {
 }
 
 impl DefaultLit {
-    /// Expression Rust produisant un `serde_json::Value` possédé.
+    /// Expression Rust produisant un `serde_json::Value` possédé —
+    /// référencé via le réexport `::litemcp::serde_json` : la crate
+    /// utilisatrice n'a pas besoin de dépendre directement de `serde_json`
+    /// (audit 2026-11-13, m1 — litemcp réexporte publiquement `serde_json`).
     fn to_json_value_expr(&self) -> String {
         match self {
             // Suffixe **exact** : i64 quand ça tient (forme historique),
@@ -413,25 +527,25 @@ impl DefaultLit {
             // passage par un type qui tronquerait la valeur.
             Self::Int(n) => {
                 if *n >= i64::MIN as i128 && *n <= i64::MAX as i128 {
-                    format!("::serde_json::Value::from({n}i64)")
+                    format!("::litemcp::serde_json::Value::from({n}i64)")
                 } else if *n >= 0 && *n <= u64::MAX as i128 {
-                    format!("::serde_json::Value::from({n}u64)")
+                    format!("::litemcp::serde_json::Value::from({n}u64)")
                 } else {
                     "::core::compile_error!(\"litemcp/macros : littéral par défaut \
                         hors des plages exactes i64/u64\")"
                         .to_string()
                 }
             }
-            Self::Float(n) => format!("::serde_json::Value::from({n:?}f64)"),
+            Self::Float(n) => format!("::litemcp::serde_json::Value::from({n:?}f64)"),
             Self::Str(s) => {
-                format!("::serde_json::Value::from(::std::string::String::from({s:?}))")
+                format!("::litemcp::serde_json::Value::from(::std::string::String::from({s:?}))")
             }
-            Self::Bool(b) => format!("::serde_json::Value::from({b})"),
+            Self::Bool(b) => format!("::litemcp::serde_json::Value::from({b})"),
             Self::Array(items) => {
                 let rendered: Vec<String> =
                     items.iter().map(DefaultLit::to_json_value_expr).collect();
                 format!(
-                    "::serde_json::Value::Array(::std::vec![{}])",
+                    "::litemcp::serde_json::Value::Array(::std::vec![{}])",
                     rendered.join(", ")
                 )
             }
@@ -499,8 +613,8 @@ struct Param {
 fn collect_params(
     raw_params: &[Vec<TokenTree>],
     macro_name: &str,
-    defaults: &[(String, Vec<TokenTree>)],
-) -> Result<Vec<Param>, String> {
+    defaults: &[DefaultDecl],
+) -> MacroResult<Vec<Param>> {
     let mut params = Vec::new();
     for raw in raw_params {
         if raw
@@ -508,12 +622,16 @@ fn collect_params(
             .any(|t| matches!(t, TokenTree::Ident(id) if id.to_string() == "self"))
             || raw.iter().all(|t| is_punct(t, '.'))
         {
-            return Err(format!(
-                "{macro_name} : `self` et les variadiques ne sont pas supportés"
+            return Err(Diag::over(
+                format!("{macro_name} : `self` et les variadiques ne sont pas supportés"),
+                raw,
             ));
         }
         let colon_pos = raw.iter().position(|t| is_punct(t, ':')).ok_or_else(|| {
-            format!("{macro_name} : chaque paramètre doit être de la forme `nom: Type`")
+            Diag::over(
+                format!("{macro_name} : chaque paramètre doit être de la forme `nom: Type`"),
+                raw,
+            )
         })?;
         let pat_tokens = &raw[..colon_pos];
         let ty_tokens = &raw[colon_pos + 1..];
@@ -524,46 +642,59 @@ fn collect_params(
                 strip_raw_ident(&id.to_string()).to_string()
             }
             _ => {
-                return Err(format!(
-                    "{macro_name} : chaque paramètre doit être un identifiant simple"
+                return Err(Diag::over(
+                    format!("{macro_name} : chaque paramètre doit être un identifiant simple"),
+                    pat_tokens,
                 ));
             }
         };
 
         let (inner_tokens, optional) = strip_option_tokens(ty_tokens);
         let Some(ty) = parse_param_type(&inner_tokens) else {
-            return Err(format!(
-                "{macro_name} : type non supporté pour le paramètre `{param_ident}` — \
-                 entiers, f32/f64, bool, String, Option<T>, Vec<T>"
+            return Err(Diag::over(
+                format!(
+                    "{macro_name} : type non supporté pour le paramètre `{param_ident}` — \
+                     entiers, f32/f64, bool, String, Option<T>, Vec<T>"
+                ),
+                &inner_tokens,
             ));
         };
 
         let default_tokens = defaults
             .iter()
-            .find(|(name, _)| name == &param_ident)
-            .map(|(_, expr)| expr.as_slice());
+            .find(|decl| decl.name == param_ident)
+            .map(|decl| decl.tokens.as_slice());
 
         let default = match default_tokens {
             None => None,
             Some(_) if optional => {
-                return Err(format!(
-                    "{macro_name} : le paramètre `{param_ident}` ne peut pas avoir à la fois \
-                     `Option<T>` et une valeur par défaut"
+                return Err(Diag::over(
+                    format!(
+                        "{macro_name} : le paramètre `{param_ident}` ne peut pas avoir à la fois \
+                         `Option<T>` et une valeur par défaut"
+                    ),
+                    pat_tokens,
                 ));
             }
             Some(tokens) => match parse_default_lit(tokens) {
                 Some(lit) if lit.is_compatible_with(&ty) => Some(lit),
                 Some(_) => {
-                    return Err(format!(
-                        "{macro_name} : la valeur par défaut de `{param_ident}` est incompatible \
-                         avec le type ou les bornes de `{}`",
-                        ty.rust_type_str()
+                    return Err(Diag::over(
+                        format!(
+                            "{macro_name} : la valeur par défaut de `{param_ident}` est incompatible \
+                             avec le type ou les bornes de `{}`",
+                            ty.rust_type_str()
+                        ),
+                        tokens,
                     ));
                 }
                 None => {
-                    return Err(format!(
-                        "{macro_name} : la valeur par défaut de `{param_ident}` doit être un \
-                         littéral (publiée dans le JSON Schema)"
+                    return Err(Diag::over(
+                        format!(
+                            "{macro_name} : la valeur par défaut de `{param_ident}` doit être un \
+                             littéral (publiée dans le JSON Schema)"
+                        ),
+                        tokens,
                     ));
                 }
             },
@@ -1034,8 +1165,36 @@ fn parse_str_literal(raw: &str) -> Option<String> {
     Some(out)
 }
 
-fn err(message: &str) -> TokenStream {
-    TokenStream::from_str(&format!("compile_error!({message:?});")).expect("compile_error valide")
+/// Rend `diag` sous forme de `compile_error!` **ancré sur son span**.
+///
+/// Les jetons sont construits directement au lieu d'être reparsés depuis une
+/// `String` : c'est le seul moyen stable de donner au `compile_error!` un span
+/// choisi. Le parsing, lui, ne rend que des spans d'appel — d'où le
+/// soulignement de tout l'attribut `#[tool(...)]` au lieu du paramètre fautif.
+fn err(diag: Diag) -> TokenStream {
+    let Diag { message, span } = diag;
+    let span = span.unwrap_or_else(Span::call_site);
+    let mut message = Literal::string(&message);
+    message.set_span(span);
+    let mut group = Group::new(
+        Delimiter::Parenthesis,
+        TokenStream::from(TokenTree::Literal(message)),
+    );
+    group.set_span(span);
+    let mut bang = Punct::new('!', Spacing::Alone);
+    bang.set_span(span);
+    // Point-virgule obligatoire : sans lui, une invocation de macro en
+    // position d'item (`compile_error!(…)` sans `;`) déclenche en plus
+    // « macros that expand to items must be delimited with braces or followed
+    // by a semicolon » — bruit qui masquerait le vrai diagnostic.
+    let mut semicolon = Punct::new(';', Spacing::Alone);
+    semicolon.set_span(span);
+    TokenStream::from_iter([
+        TokenTree::Ident(Ident::new("compile_error", span)),
+        TokenTree::Punct(bang),
+        TokenTree::Group(group),
+        TokenTree::Punct(semicolon),
+    ])
 }
 
 #[cfg(test)]
@@ -1116,19 +1275,19 @@ mod tests {
     fn emission_des_litteraux_defaut_sans_troncature() {
         assert_eq!(
             int(-1).to_json_value_expr(),
-            "::serde_json::Value::from(-1i64)"
+            "::litemcp::serde_json::Value::from(-1i64)"
         );
         assert_eq!(
             int(i64::MIN as i128).to_json_value_expr(),
-            "::serde_json::Value::from(-9223372036854775808i64)"
+            "::litemcp::serde_json::Value::from(-9223372036854775808i64)"
         );
         assert_eq!(
             int(i64::MAX as i128 + 1).to_json_value_expr(),
-            "::serde_json::Value::from(9223372036854775808u64)"
+            "::litemcp::serde_json::Value::from(9223372036854775808u64)"
         );
         assert_eq!(
             int(u64::MAX as i128).to_json_value_expr(),
-            format!("::serde_json::Value::from({}u64)", u64::MAX)
+            format!("::litemcp::serde_json::Value::from({}u64)", u64::MAX)
         );
         assert!(
             int(u64::MAX as i128 + 1)

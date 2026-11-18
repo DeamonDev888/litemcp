@@ -2263,3 +2263,84 @@ fn duration_max_drain_timeout_finishes_without_panic() {
         "aucune connexion ne reste au terme du drain"
     );
 }
+
+// --- P1 2026-11-13 (audit § 2.2) : résidu CRLFCRLF après un POST valide ----
+
+#[test]
+fn crlfcrlf_residue_after_valid_post_yields_a_single_response() {
+    // Un POST **valide** suivi d'un résidu `\r\n\r\n` (une ligne vide en
+    // trop au terme du message). Le garde de cadrage (fin de corps) attribue
+    // le résidu ambigu à la requête courante : une seule réponse (400), puis
+    // fermeture — jamais la seconde réponse 400 parasite (« malformed
+    // request line ») que la boucle keep-alive rendait en relisant la ligne
+    // vide comme une ligne de requête (audit § 2.2 : statuts ["200", "400"]).
+    let addr = spawn_hardened();
+    let body =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ok","arguments":{}}}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}\r\n\r\n",
+        body.len()
+    );
+    let raw = raw_http_exchange(addr, &request);
+    let responses: Vec<&str> = raw
+        .split("HTTP/1.1 ")
+        .filter(|part| !part.is_empty())
+        .collect();
+    assert_eq!(
+        responses.len(),
+        1,
+        "une seule réponse complète, jamais un 400 parasite : {raw:?}"
+    );
+    assert!(
+        raw.starts_with("HTTP/1.1 400 Bad Request"),
+        "le résidu ambigu est attribué à la requête courante (400) et la \
+         connexion ferme selon l'intention du garde : {raw:?}"
+    );
+}
+
+#[test]
+fn default_tool_timeout_is_exposed_and_bounds_a_blocked_handler() {
+    // Défaut non nul (audit L3) : sans borne, autant de handlers bloqués que
+    // de connexions saturaient le serveur. La valeur exposée est 30 s.
+    assert_eq!(
+        litemcp::DEFAULT_TOOL_TIMEOUT,
+        std::time::Duration::from_secs(30),
+        "le défaut doit être de 30 s"
+    );
+
+    // Le **mécanisme** est le même que celui du défaut (tout `tool_timeout`
+    // configuré passe par le chemin borné) : un délai court permet de le
+    // vérifier sans attendre 30 s. Le handler dort 10 s ; la réponse doit
+    // arriver bien avant.
+    let bound = ServerBuilder::new("borne", "0.1.0")
+        .legacy(true)
+        .tool_timeout(std::time::Duration::from_millis(150))
+        .tool("bloque", "dort", |_args| {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            Ok(serde_json::json!({}))
+        })
+        .bind("127.0.0.1:0")
+        .unwrap();
+    let addr = bound.local_addr().unwrap();
+    std::thread::spawn(move || bound.serve().unwrap());
+
+    let started = std::time::Instant::now();
+    let (status, body) = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bloque","arguments":{}}}"#,
+        "application/json",
+        None,
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    assert_eq!(
+        v["result"]["structuredContent"]["error"]["code"], "timeout",
+        "le dépassement est classé `timeout` : {v}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "le handler bloqué doit être borné, pas attendu : {elapsed:?}"
+    );
+}

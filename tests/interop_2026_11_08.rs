@@ -76,6 +76,11 @@ fn spawn_allowlisted(origins: &[&str]) -> SocketAddr {
     let bound = ServerBuilder::new("interop", "0.1.0")
         .legacy(true)
         .allow_origins(origins)
+        // Déploiement explicite derrière un reverse proxy : le `Host` public
+        // (`proxy.example:443`, un nom pleinement qualifié) doit être déclaré
+        // — depuis L1, un `Host` étranger rend `421` même avec une origine
+        // autorisée. Aucune assertion de ce fichier n'est modifiée.
+        .allowed_hosts(["proxy.example"])
         .bind("127.0.0.1:0")
         .unwrap();
     let addr = bound.local_addr().unwrap();

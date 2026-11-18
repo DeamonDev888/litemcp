@@ -1,5 +1,7 @@
 # cargo-deny — périmètre volontairement minimal : uniquement les advisories
-# RustSec sur les dépendances verrouillées (le crate n'a que serde/serde_json).
+# RustSec sur les dépendances verrouillées. Le noyau reste serde/serde_json ;
+# les features optionnelles ajoutent `ed25519-dalek` (auth-sign), `rustls` et
+# `rcgen` (tls) et leurs transitives, qui sont donc couvertes ici aussi.
 # `cargo deny check advisories` échoue sur toute vulnérabilité connue.
 [advisories]
 version = 2

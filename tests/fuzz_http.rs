@@ -241,6 +241,12 @@ fn request_like() -> impl Strategy<
         Just(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ok","arguments":{}}}"#.to_string()),
         Just("garbage pas json".to_string()),
         Just("[1, 2, 3]".to_string()),
+        // Résidu `CRLFCRLF` après un corps (audit 2026-11-13, § 2.2) : avec
+        // `Content-Length: 2`, le corps `"{}"` est suivi d'une ligne vide en
+        // trop — l'invariant (réponses complètes uniquement) tient qu'il
+        // produise une ou deux réponses complètes.
+        Just("{}\r\n\r\n".to_string()),
+        Just("garbage pas json\r\n\r\n".to_string()),
     ];
     (verb, path, version, sep, headers, body)
 }
