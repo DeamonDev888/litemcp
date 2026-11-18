@@ -40,27 +40,75 @@ fn json(bytes: &[u8]) -> Value {
 
 /// Tous les corps partagent le même sort, qu'on passe par `dispatch` ou par
 /// `dispatch_request` sans en-têtes : c'est le contrat d'un noyau unique.
+///
+/// L'équivalence seule serait tautologique (les deux entrées partagent le même
+/// noyau) : chaque cas fixe donc aussi **les octets exacts** attendus sur le
+/// fil, enveloppe JSON-RPC comprise — une régression de sérialisation (ordre
+/// des clés, champ ajouté, `id` non écho-té) fait rougir ce test même quand les
+/// deux entrées restent d'accord entre elles.
 #[test]
 fn dispatch_et_dispatch_request_sans_entetes_rendent_le_meme_corps() {
     let core = core();
-    let cases: Vec<Vec<u8>> = vec![
-        corps_nu("1", "tools/list"),
-        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}".to_vec(),
-        corps_avec_meta("2", "tools/list", ""),
-        b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"1999-01-01\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}".to_vec(),
-        b"{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"tools/list\",\"params\":{}}".to_vec(),
-        b"not json".to_vec(),
-        b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}".to_vec(),
+    // (corps envoyé, réponse attendue octet pour octet ; `None` = notification)
+    let cases: Vec<(Vec<u8>, Option<&str>)> = vec![
+        (
+            corps_nu("1", "tools/list"),
+            Some(
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing required `_meta` object in params"}}"#,
+            ),
+        ),
+        (
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}".to_vec(),
+            Some(
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"params object is required and must contain `_meta`"}}"#,
+            ),
+        ),
+        (
+            corps_avec_meta("2", "tools/list", ""),
+            Some(
+                r#"{"jsonrpc":"2.0","id":2,"result":{"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"verdict","version":"0.1.0"}},"cacheScope":"private","resultType":"complete","tools":[{"description":"Écho","inputSchema":{"type":"object"},"name":"echo"}],"ttlMs":60000}}"#,
+            ),
+        ),
+        (
+            b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"1999-01-01\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}".to_vec(),
+            Some(
+                r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32022,"message":"Unsupported protocol version: 1999-01-01","data":{"requested":"1999-01-01","supported":["2026-07-28"]}}}"#,
+            ),
+        ),
+        (
+            b"{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"tools/list\",\"params\":{}}".to_vec(),
+            Some(
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"request id must be a string or a number (null is not permitted in modern MCP 2026-07-28)"}}"#,
+            ),
+        ),
+        (
+            b"not json".to_vec(),
+            Some(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"invalid JSON"}}"#),
+        ),
+        (
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}".to_vec(),
+            None,
+        ),
     ];
-    for body in cases {
+    for (body, attendu) in cases {
+        let envoye = String::from_utf8_lossy(&body).into_owned();
         let direct = core.dispatch(&body);
         let structure = core.dispatch_request(&body, None).map(|r| r.body);
-        assert_eq!(
-            direct,
-            structure,
-            "verdicts divergents pour {}",
-            String::from_utf8_lossy(&body)
-        );
+        assert_eq!(direct, structure, "verdicts divergents pour {envoye}");
+        match attendu {
+            Some(attendu) => {
+                let octets = direct.expect("une requête reçoit une réponse");
+                assert_eq!(
+                    String::from_utf8_lossy(&octets),
+                    attendu,
+                    "octets fil inattendus pour {envoye}"
+                );
+            }
+            None => assert!(
+                direct.is_none(),
+                "une notification ne reçoit aucune réponse : {envoye}"
+            ),
+        }
     }
 }
 

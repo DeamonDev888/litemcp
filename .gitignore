@@ -7,6 +7,9 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 .zwork/
+# Rapports internes du chantier d'authentification (source de vérité locale,
+# hors dépôt et hors paquet Cargo — voir `exclude` du manifeste).
+auth-rapports/
 
 # Secrets / credentials crates.io — ne jamais committer
 .cargo/

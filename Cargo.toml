@@ -3,7 +3,7 @@ members = [".", "litemcp-macros"]
 
 [package]
 name = "litemcp"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.85"
 description = "LiteMCP — la lib MCP la plus légère en mémoire et la plus rapide : votre serveur MCP en quelques lignes. Streamable HTTP stateless (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement."
@@ -14,7 +14,9 @@ keywords = ["mcp", "mcp-server", "llm", "json-rpc", "http"]
 categories = ["api-bindings", "network-programming", "web-programming::http-server"]
 # `examples/audit_target.rs` : sonde d'audit privée (ignorée par Git), tenue
 # hors du paquet même si une copie réapparaît le temps d'une campagne.
-exclude = [".github", "docs", ".zwork", "scripts", "examples/audit_target.rs"]
+# `auth-rapports/` : rapports internes du chantier d'authentification, hors
+# paquet comme `.zwork/` (le dossier reste dans l'arbre, ignoré par Git).
+exclude = [".github", "docs", ".zwork", "auth-rapports", "scripts", "examples/audit_target.rs"]
 
 [features]
 # Macros `#[tool]`/`#[resource]`/`#[prompt]` — **incluses par défaut** :
@@ -27,20 +29,61 @@ macros = ["dep:litemcp-macros"]
 # Adaptateur schemars : n'importe quel type #[derive(JsonSchema)] devient un
 # schéma exécuteur (dérivation par schemars, validation par jsonschema).
 schemars = ["dep:schemars", "dep:jsonschema"]
+# Signature et vérification de requêtes (RFC 9421 + RFC 9530, profil de
+# docs/auth.md) : Ed25519 par `ed25519-dalek`, version exacte. Sans la
+# feature, le crate garde serde + serde_json et rien d'autre.
+auth-sign = ["dep:ed25519-dalek"]
+# TLS 1.3 serveur (docs/auth.md §8) : `rustls` + `ring`, plus `rcgen` pour le
+# certificat auto-signé **en mémoire** (`self_signed_ephemeral`). Sans `tls12`
+# dans `rustls` : TLS 1.2 est incompilable, et le serveur ne négocie que 1.3.
+# `rcgen` est en `default-features = false` (backend `ring`, licence MIT OR
+# Apache-2.0) : il n'introduit ni `aws-lc`, ni cmake, ni NASM.
+tls = ["dep:rustls", "dep:rcgen"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-litemcp-macros = { path = "litemcp-macros", version = "0.4.1", optional = true }
+litemcp-macros = { path = "litemcp-macros", version = "0.4.2", optional = true }
 schemars = { version = "1", optional = true }
 jsonschema = { version = "0.60", default-features = false, optional = true }
+# DL1 = a : la seule crate cryptographique du lot L2. Pas de `default-features`
+# (`alloc`/`std` inutiles ici), `rand_core` pour l'aléa du système et
+# `zeroize` pour effacer la graine à la destruction de `SigningKey`.
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["rand_core", "zeroize"], optional = true }
+# TLS 1.3 seulement : `ring` comme fournisseur, `std`. Jamais `tls12`, jamais
+# `aws-lc` (cmake/NASM sous Windows). Version épinglée (docs/auth.md §7).
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"], optional = true }
+# Certificat auto-signé éphémère (en mémoire, jamais sur disque) : backend
+# `ring`, aucune autre feature (`ring` implique `crypto`).
+rcgen = { version = "=0.14.7", default-features = false, features = ["ring"], optional = true }
 
 [dev-dependencies]
 # Fuzz du transport HTTP (tests/fuzz_http.rs) — dev uniquement, le cœur du
 # crate garde exactement serde + serde_json.
 proptest = "1"
+# Client TLS des tests d'intégration (tests/auth_tls_2026_11_15.rs) : même
+# version que le serveur, avec `tls12` côté client pour **prouver** qu'un
+# client 1.2 est refusé. La configuration serveur reste TLS 1.3 seulement.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+# Certificats de test (clé éphémère en mémoire) — même version et mêmes
+# features que la dépendance optionnelle du crate ; jamais compilé dans la
+# bibliothèque livrée.
+rcgen = { version = "=0.14.7", default-features = false, features = ["ring"] }
 
 [profile.release]
 strip = true
 lto = "fat"
 codegen-units = 1
+
+# Exemples d'authentification : ils exigent leurs features (le serveur ouvert
+# `hello` reste découvert automatiquement et compile dans toutes les
+# configurations).
+[[example]]
+name = "auth_sign"
+path = "examples/auth_sign.rs"
+required-features = ["auth-sign"]
+
+[[example]]
+name = "auth_tls"
+path = "examples/auth_tls.rs"
+required-features = ["tls", "auth-sign"]

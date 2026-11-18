@@ -436,6 +436,47 @@ fn feature_matrix_is_enforced_in_ci_and_release_gate() {
 }
 
 #[test]
+fn auth_feature_matrix_is_enforced_in_ci() {
+    // Le chantier d'authentification ajoute deux features qui ne compilent pas
+    // dans le noyau : `auth-sign` (ed25519-dalek) et `tls` (rustls + rcgen).
+    // `--all-features` ne prouve rien d'elles isolément : une cible de test
+    // cassée sous l'une ou l'autre passait la CI. Le clippy sans feature par
+    // défaut couvre la configuration minimale servie aux utilisateurs.
+    const COMMANDS: [&str; 3] = [
+        "cargo test -p litemcp --no-default-features --features auth-sign",
+        "cargo test -p litemcp --no-default-features --features tls",
+        "cargo clippy --workspace --all-targets --no-default-features -- -D warnings",
+    ];
+
+    let Some(ci) = workflow("ci.yml") else {
+        return;
+    };
+    for command in COMMANDS {
+        assert!(
+            ci.contains(command),
+            "ci.yml : la matrice de features doit exécuter `{command}`"
+        );
+    }
+}
+
+#[test]
+fn windows_and_macos_jobs_run_the_all_features_suite() {
+    // Windows et macOS ne lançaient que la configuration par défaut : les
+    // chemins TLS (`ring`, sans cmake ni NASM) et d'authentification n'y
+    // étaient jamais compilés ni exécutés.
+    let Some(ci) = workflow("ci.yml") else {
+        return;
+    };
+    for job in ["windows", "macos"] {
+        let block = job_block(&ci, job).unwrap_or_else(|| panic!("job {job} présent"));
+        assert!(
+            block.contains("cargo test --workspace --all-features"),
+            "ci.yml : le job {job} doit lancer `cargo test --workspace --all-features`"
+        );
+    }
+}
+
+#[test]
 fn rustdoc_warnings_are_denied_in_ci_and_release_gate() {
     // Un lien intra-doc cassé ou redondant ne doit jamais passer en silence :
     // la doc est construite avec `-D warnings` sur TOUT le workspace.

@@ -30,9 +30,11 @@
 //! ([`crate::schemars`]) avec les sémantiques JSON Schema de bout en bout.
 //!
 //! Trois surfaces MCP : **outils** (`tools/*`), **ressources**
-//! (`resources/*`) et **prompts** (`prompts/*`) — chaque handler peut être
-//! borné dans le temps ([`tool_timeout`](crate::server::ServerBuilder::tool_timeout)),
-//! et le serveur s'arrête proprement
+//! (`resources/*`) et **prompts** (`prompts/*`) — chaque handler est borné
+//! dans le temps ([`tool_timeout`](crate::server::ServerBuilder::tool_timeout),
+//! **30 s par défaut**,
+//! [`no_tool_timeout`](crate::server::ServerBuilder::no_tool_timeout) pour
+//! revenir à l'illimité), et le serveur s'arrête proprement
 //! ([`handle`](crate::http::BoundServer::handle)/
 //! [`shutdown`](crate::http::ServerHandle::shutdown)).
 //! La feature `macros` (incluse par défaut) ajoute `#[tool]` : le schéma
@@ -109,6 +111,20 @@
 //! restent à la périphérie (gateway / mesh) ; le verrou applicatif, lui,
 //! vit ici.
 //!
+//! **Autorisation** ([`auth`]) : l'identité est établie par le transport
+//! ([`auth::AuthContext`]), les droits sont déclarés par élément
+//! ([`require_right`](crate::server::ServerBuilder::require_right),
+//! [`require_resource_right`](crate::server::ServerBuilder::require_resource_right),
+//! [`require_prompt_right`](crate::server::ServerBuilder::require_prompt_right)),
+//! les listes sont filtrées par appelant, une confirmation externe peut être
+//! exigée avant un outil sensible
+//! ([`approval_policy`](crate::server::ServerBuilder::approval_policy)) et
+//! chaque décision part au journal de l'application
+//! ([`on_auth_decision`](crate::server::ServerBuilder::on_auth_decision)).
+//! Sans [`verifier`](crate::server::ServerBuilder::verifier), le comportement
+//! du crate est **inchangé** ; avec, un élément sans droit déclaré est refusé
+//! (`-32023`, HTTP 403).
+//!
 //! Spec cible : MCP **2026-07-28** — protocole **stateless**, sans handshake :
 //! chaque message est un `POST /mcp`, la réponse arrive en `application/json`
 //! (ou en `text/event-stream` si le client ne demande que du SSE, ou s'il
@@ -152,6 +168,11 @@
 //!   l'événement de réponse, puis la connexion est fermée. Le jeton est
 //!   toujours repris de la requête (jamais choisi par le handler) ; sans
 //!   jeton, sans flux SSE ou après la réponse, `report` est une non-action ;
+//! - annulation **coopérative** : la fermeture du flux SSE lève le drapeau
+//!   [`cancel::is_cancelled`] de la requête — le handler consulte le drapeau
+//!   (ou le [`cancel::token`] qu'il passe à ses fils) et sort de lui-même à
+//!   son prochain point sûr ; rien ne l'interrompt et `notifications/cancelled`
+//!   n'est pas traitée ;
 //! - version de protocole : **obligatoire** dans `_meta`
 //!   (`io.modelcontextprotocol/protocolVersion`) en profil strict — son
 //!   absence est refusée en `-32602`, une version inconnue en `-32022` ;
@@ -189,6 +210,15 @@
 /// Anti-zombie — registre sans fantômes, drain de fin de vie, bilan
 /// vérifiable (`ZombieReport`).
 pub mod antizombie;
+/// Autorisation — **qui** appelle et **ce qu'il a le droit de faire** :
+/// identité établie par le transport ([`auth::AuthContext`]), droits
+/// déclarés par l'application, confirmation externe, listes filtrées. Sans
+/// [`auth::Verifier`] configuré, le comportement du crate est inchangé.
+pub mod auth;
+/// Annulation **coopérative** — la fermeture du flux SSE lève un drapeau que
+/// le handler consulte aux points sûrs de son choix
+/// ([`cancel::is_cancelled`], [`cancel::token`]).
+pub mod cancel;
 pub mod error;
 /// Registre **dynamique** — la surface d'outils change pendant le service
 /// ([`Gateway`]) : le socle des gateways qui
@@ -218,6 +248,10 @@ mod request_state;
 #[cfg(feature = "schemars")]
 pub mod schemars;
 pub mod server;
+/// TLS 1.3 **serveur** (feature `tls`) — [`tls::TlsConfig`], empreinte du
+/// certificat pour l'épinglage ([`auth::PinnedServer`]).
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod zod;
 
 pub use antizombie::{SweepReport, ZombieReport, sweep_dir, sweep_registry};
@@ -226,10 +260,21 @@ pub use gateway::Gateway;
 pub use http::{RequestContext, RequestRejection};
 pub use jsonrpc::ErrorObject;
 pub use server::{
-    CallEvent, CallStatus, DispatchResponse, HttpStatus, InputRound, McpHeaders, PromptOutcome,
-    ProtocolProfile, ResourceOutcome, ServerBuilder, ServerCore, ToolOutcome, ToolResult,
+    CallEvent, CallStatus, DEFAULT_TOOL_TIMEOUT, DispatchResponse, HttpStatus, InputRound,
+    McpHeaders, PromptOutcome, ProtocolProfile, ResourceOutcome, ServerBuilder, ServerCore,
+    ToolOutcome, ToolResult,
 };
 pub use zod::WithHeader;
+
+/// Ré-export de `serde_json` pour le code généré par les macros : avec
+/// `#[tool(default(...))]` (idem `#[prompt]`/`#[resource]`), le schéma
+/// généré référence `::litemcp::serde_json` — une crate utilisatrice n'a
+/// pas besoin de dépendre directement de `serde_json` pour déclarer un
+/// défaut de paramètre (audit 2026-11-13, m1). Réexport **public** plutôt
+/// que chemin interne : la version de `serde_json` vue par la crate
+/// utilisatrice reste celle de `litemcp`, donc un seul type `Value` circule
+/// entre le schéma publié et le code généré.
+pub use serde_json;
 
 /// Version du crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -266,6 +311,8 @@ pub const DEFAULT_PORT_RANGE: std::ops::RangeInclusive<u16> = 23080..=23099;
 /// Tout ce qu'il faut pour écrire un serveur en quelques lignes.
 pub mod prelude {
     pub use crate::antizombie::{SweepReport, ZombieReport, sweep_dir, sweep_registry};
+    pub use crate::auth;
+    pub use crate::cancel;
     pub use crate::error::{ErrorCode, ToolError};
     pub use crate::gateway::Gateway;
     pub use crate::http::{RequestContext, RequestRejection, ServerHandle};
@@ -286,6 +333,8 @@ pub mod prelude {
         CallEvent, CallStatus, DispatchResponse, HttpStatus, InputRound, McpHeaders, PromptOutcome,
         ProtocolProfile, ResourceOutcome, ServerBuilder, ToolOutcome, ToolResult,
     };
+    #[cfg(feature = "tls")]
+    pub use crate::tls::{CertificateFingerprint, TlsConfig, TlsError};
     pub use crate::zod::{self, Schema, WithHeader};
     pub use crate::{DEFAULT_ADDRESS, DEFAULT_PORT, DEFAULT_PORT_RANGE, VERSION};
 }

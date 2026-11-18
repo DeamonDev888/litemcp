@@ -70,7 +70,7 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 
 `examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux) ; il envoie l'enveloppe stricte (3 en-têtes + 2 clés `_meta`) et rend ses chiffres sur le profil par défaut (voir [`BENCH.md`](BENCH.md)).
 
-Les comptes de tests cités dans les anciennes campagnes (**547 / 504 / 481**) sont périmés : mesurés le 2026-11-13, la suite donne **557** tests avec toutes les features, **514** avec le jeu par défaut et **491** sans aucune feature (0 échec) — tous exécutés sous Windows 11 ; la CI, elle, ne tourne que sous Linux.
+Les comptes de tests cités dans les anciennes campagnes (**547 / 504 / 481**) sont périmés : mesurés le 2026-11-17, la suite donne **828** tests avec toutes les features, **649** avec le jeu par défaut et **624** sans aucune feature (0 échec) — tous exécutés sous Windows 11 (rustc 1.99.1) ; la CI, elle, tourne sous Linux (matrice complète), et sous Windows et macOS (suite par défaut **et** toutes features).
 
 ## Tailles de binaire
 

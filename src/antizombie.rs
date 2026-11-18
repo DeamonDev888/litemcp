@@ -122,9 +122,13 @@ pub struct SweepReport {
     /// conservé et compté dans [`Self::skipped`]. Un retrait impossible
     /// n'est jamais compté ici non plus.
     pub corrupt: usize,
-    /// Fichiers d'un schéma inconnu (JSON valide sans `port` utilisable) —
-    /// laissés en place : ils pourraient appartenir à une version future du
-    /// format d'annonce.
+    /// Fichiers d'un schéma inconnu (JSON valide sans `port` utilisable)
+    /// et fichiers qui ne peuvent pas être des annonces au vu du **nommage**
+    /// (`.json` hors nommage d'annonce — nom vide, trop long, `..`,
+    /// séparateur, `:` — et `.tmp` hors nommage de tmp d'annonce
+    /// `<nom>.json.<pid>.<nanos>.tmp`) — laissés en place : ils pourraient
+    /// appartenir à une version future du format d'annonce, ou être les
+    /// données d'un dossier arbitraire que [`sweep_dir`] n'a pas à détruire.
     pub foreign: usize,
     /// Annonces du process courant — ignorées : le serveur lié les gère
     /// lui-même (retrait dans le `Drop` de
@@ -254,6 +258,45 @@ pub fn sweep_registry() -> SweepReport {
     sweep_dir(&crate::registry::registry_dir())
 }
 
+/// Le nom d'un **tmp d'annonce** — `<nom>.json.<pid>.<nanos>.tmp`, le nommage
+/// exact écrit par `registry::write_atomically` (deux segments **numériques**
+/// entre `.json.` et `.tmp`, précédés d'un nom d'annonce sûr). Un `.tmp` qui
+/// ne porte pas ce nommage n'est jamais un débris d'annonce : fichier
+/// étranger, respecté par le sweep.
+fn announcement_tmp_name(name: &str) -> bool {
+    let Some(core) = name.strip_suffix(".tmp") else {
+        return false;
+    };
+    let Some(pos) = core.rfind(".json.") else {
+        return false;
+    };
+    let tail = &core[pos + ".json.".len()..];
+    let mut segments = tail.split('.');
+    match (segments.next(), segments.next(), segments.next()) {
+        (Some(pid), Some(nanos), None) => {
+            !pid.is_empty()
+                && !nanos.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && nanos.bytes().all(|b| b.is_ascii_digit())
+                && crate::registry::is_safe_name(&core[..pos])
+        }
+        _ => false,
+    }
+}
+
+/// Le nom d'un **fichier d'annonce** — `<nom>.json` où `nom` est un nom
+/// d'annonce sûr (`registry::is_safe_name`). Rend le nom d'annonce quand le
+/// nommage correspond, `None` sinon : un `.json` étranger (données d'un
+/// dossier arbitraire) n'est jamais détruit par le sweep.
+fn announcement_stem(name: &str) -> Option<&str> {
+    let stem = name.strip_suffix(".json")?;
+    if crate::registry::is_safe_name(stem) {
+        Some(stem)
+    } else {
+        None
+    }
+}
+
 /// Passe `dir` au peigne fin : retire les annonces **usurpées** (l'adresse
 /// publiée répond avec une identité d'instance différente — décision
 /// re-vérifiée sous le verrou du nom), les `.json` au contenu non-UTF-8 ou
@@ -266,6 +309,23 @@ pub fn sweep_registry() -> SweepReport {
 /// et respecte les instances vivantes vérifiées, les fichiers d'un schéma
 /// inconnu et l'annonce du process courant. Dossier absent ou vide : rapport
 /// vide — jamais d'erreur.
+///
+/// **Conçue pour les dossiers d'annonces** — le nommage est le contrat : ne
+/// sont détruits que les fichiers qui portent LE nommage d'annonce écrit par
+/// [`crate::registry`] — `<nom>.json` (nom sûr, voir
+/// `registry::is_safe_name`) et son tmp d'écriture
+/// `<nom>.json.<pid>.<nanos>.tmp`. Tout autre fichier (`.tmp` utilisateur,
+/// `.json` de données au nom hors nommage) est compté [`SweepReport::foreign`]
+/// et respecté, où que soit le dossier : un nettoyage périodique sur un
+/// dossier de données ne détruit jamais un fichier étranger.
+///
+/// **Limite assumée** : un `.json` au contenu non parsable dont le nom
+/// ressemble exactement à un nom d'annonce (`<nom>.json`, nom sûr) reste
+/// indistinguable d'un débris d'annonce par le seul nommage — il est retiré
+/// même dans un dossier arbitraire. Le sweep ne peut pas faire mieux sans
+/// lire le contenu (une écriture d'annonce interrompue n'est pas parsable
+/// par construction), et le dossier d'annonces est un temp partagé où un
+/// débris d'annonce est justement ce qu'il faut nettoyer.
 ///
 /// Utilisable périodiquement sans serveur ; le budget est [`SWEEP_BUDGET`] de
 /// **temps de sondes effectif** (chaque sonde est bornée par
@@ -291,13 +351,29 @@ pub fn sweep_dir(dir: &Path) -> SweepReport {
         // jamais lus par les consommateurs. Un `.tmp` **récent** peut être
         // celui d'un écrivain vivant — seul un orphelin (vieux) part.
         if name.ends_with(".tmp") {
-            if older_than(&path, DEBRIS_AGE) && fs::remove_file(&path).is_ok() {
-                report.debris += 1;
+            if announcement_tmp_name(name) {
+                if older_than(&path, DEBRIS_AGE) && fs::remove_file(&path).is_ok() {
+                    report.debris += 1;
+                }
+                continue;
             }
+            // Un `.tmp` qui ne porte pas le nommage de tmp d'annonce n'est
+            // jamais un débris : fichier étranger (dossier arbitraire),
+            // respecté — sweep_dir ne détruit que le nommage d'annonce.
+            report.foreign += 1;
             continue;
         }
         if !name.ends_with(".json") {
             continue; // jamais une annonce : respecté
+        }
+        // Nommage : `<nom>.json` où `nom` est un nom d'annonce sûr. Un
+        // `.json` dont le nom ne peut pas être celui d'une annonce est un
+        // fichier étranger (données d'un dossier arbitraire) : respecté
+        // SANS lecture ni sonde — le sweep ne détruit que le nommage
+        // d'annonce (audit 2026-11-13, § 5.2).
+        if announcement_stem(name).is_none() {
+            report.foreign += 1;
+            continue;
         }
         let body = match fs::read(&path) {
             Ok(bytes) => bytes,

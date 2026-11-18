@@ -99,24 +99,13 @@ fn default_on_a_required_field_makes_it_optional() {
 }
 
 #[test]
+#[should_panic(expected = "valeur par défaut invalide")]
 fn default_is_validated_against_its_own_schema() {
     // Un défaut incohérent avec le schéma (ici : une chaîne trop courte
     // pour la contrainte `min`) est une erreur de programmation : il est
-    // refusé à la validation, comme Zod.
-    let core = ServerBuilder::new("t", "0.1.0")
-        .tool_typed(
-            "t",
-            "t",
-            zod::object().opt("s", zod::string().min(5).default("ab")),
-            |args| Ok(args.clone()),
-        )
-        .core();
-
-    let v = call_tool(&core, "t", json!({}));
-    assert!(
-        v.get("error").is_some(),
-        "le défaut incohérent doit être refusé : {v}"
-    );
+    // refusé **à la construction** (audit 2026-11-13, A7) — il n'est plus
+    // publié puis rendu en `-32602` à chaque appel vide.
+    let _ = zod::string().min(5).default("ab");
 }
 
 #[test]

@@ -760,3 +760,652 @@ fn pipelined_request_after_any_protocol_violation_is_never_executed() {
     }
     assert_eq!(executed.load(Ordering::SeqCst), 0);
 }
+
+// ============================================================================
+// 13. L1 — `Host` confronté au listener (`allowed_hosts`, `421 Misdirected Request`)
+// ============================================================================
+
+#[test]
+fn host_etranger_est_refuse_421_sans_origin() {
+    // Avant L1, `Host` n'était vérifié qu'en syntaxe : `POST /mcp` avec
+    // `Host: attaquant.example` et **sans** `Origin` rendait 200 — la garde
+    // DNS-rebinding ne couvrait donc pas un client non-navigateur (ou une
+    // page qui omet `Origin`) qui vise le loopback par un nom qu'il contrôle.
+    let (addr, executed) = spawn_audit_server();
+    let body = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"admin_action","arguments":{}}}"#;
+
+    for host in [
+        "attaquant.example",
+        "attaquant.example:443",
+        "ataquant.example:23080",
+        "10.1.2.3",
+        "10.1.2.3:23080",
+    ] {
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, head, resp) = raw_exchange(addr, req.as_bytes());
+        assert_eq!(
+            status, 421,
+            "Host {host:?} doit être refusé en 421 Misdirected Request : {head}"
+        );
+        assert!(
+            !resp.contains("executed"),
+            "aucune réponse de handler derrière un Host étranger : {resp:?}"
+        );
+    }
+    assert_eq!(
+        executed.load(Ordering::SeqCst),
+        0,
+        "aucun handler ne doit s'exécuter derrière un Host étranger"
+    );
+}
+
+#[test]
+fn host_du_listener_est_accepte_sans_origin() {
+    let (addr, _) = spawn_audit_server();
+    let port = addr.port();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+    // Autorités **locales** : adresse effective du listener, `localhost`,
+    // littéral de bouclage — avec ou sans port, la partie nom reste locale.
+    for host in [
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        "mon-service".to_string(),
+    ] {
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, _, resp) = raw_exchange(addr, req.as_bytes());
+        assert_eq!(status, 200, "Host {host:?} doit être accepté : {resp}");
+    }
+}
+
+#[test]
+fn host_ipv6_de_bouclage_est_accepte_sur_un_listener_ipv6() {
+    let Ok(bound) = ServerBuilder::new("v6", "1.0.0")
+        .legacy(true)
+        .tool("ok", "Répond ok", |_| Ok(json!({ "ok": true })))
+        .bind("[::1]:0")
+    else {
+        return; // IPv6 indisponible sur ce runner : rien à vérifier.
+    };
+    let addr = bound.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = bound.serve();
+    });
+    let port = addr.port();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    for host in [format!("[::1]:{port}"), format!("localhost:{port}")] {
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, head, _) = raw_exchange(addr, req.as_bytes());
+        assert_eq!(status, 200, "Host {host:?} sur listener [::1] : {head}");
+    }
+}
+
+#[test]
+fn host_ipv4_est_accepte_sur_un_listener_double_pile() {
+    // A5 (contre-revue) : sur un listener `[::]:port`, un client IPv4 fait
+    // rendre `::ffff:a.b.c.d` à `stream.local_addr()`, alors que `Host` porte
+    // le littéral IPv4 nu. Sans normalisation v4-mappée, `Host: a.b.c.d:port`
+    // (l'IP de la machine) rendait `421` alors que le client parle bien à ce
+    // listener. La normalisation elle-même est verrouillée unitairement dans
+    // `src/http.rs` (`host_autorise_normalise_les_adresses_ipv4_mappees`) ;
+    // ce test couvre le chemin réel bout en bout.
+    let Ok(bound) = ServerBuilder::new("double-pile", "1.0.0")
+        .legacy(true)
+        .tool("ok", "Répond ok", |_| Ok(json!({ "ok": true })))
+        .bind("[::]:0")
+    else {
+        return; // IPv6 indisponible sur ce runner : rien à vérifier.
+    };
+    let addr = bound.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = bound.serve();
+    });
+    let port = addr.port();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+    // Plateforme double pile (Linux) : le client IPv4 parle au listener
+    // `[::]` et `stream.local_addr()` rend `::ffff:127.0.0.1`. Sous Windows,
+    // un listener `[::]` est **v6-only** par défaut : la connexion v4 est
+    // refusée avant toute requête, on vise alors `[::1]`. La normalisation
+    // v4-mappée est verrouillée unitairement dans `src/http.rs`
+    // (`host_autorise_normalise_les_adresses_ipv4_mappees`) ; ce test couvre
+    // le chemin réel bout en bout là où la plateforme l'expose.
+    let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+    let v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+    let (cible, hotes) = match TcpStream::connect(v4) {
+        Ok(_) => (
+            v4,
+            vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")],
+        ),
+        Err(_) => (
+            v6,
+            vec![format!("[::1]:{port}"), format!("localhost:{port}")],
+        ),
+    };
+    for host in hotes {
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, head, _) = raw_exchange(cible, req.as_bytes());
+        assert_eq!(status, 200, "Host {host:?} sur listener [::] : {head}");
+    }
+
+    // Forme **v4-mappée** : elle ne se résout en une interface locale qu'après
+    // normalisation — `421` avant le correctif, sur les deux plateformes.
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, head, _) = raw_exchange(cible, req.as_bytes());
+    assert_eq!(
+        status, 200,
+        "Host v4-mappé de bouclage sur listener [::] : {head}"
+    );
+
+    for host in [format!("10.1.2.3:{port}"), "10.1.2.3".to_string()] {
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, head, _) = raw_exchange(cible, req.as_bytes());
+        assert_eq!(
+            status, 421,
+            "Host {host:?} (IP étrangère non mappée) doit rester refusé : {head}"
+        );
+    }
+}
+
+#[test]
+fn allowed_hosts_custom_ajoute_le_nom_public_du_proxy() {
+    // Reverse proxy : le client envoie le nom public, le proxy route vers le
+    // loopback. `.allowed_hosts` ouvre ce nom — en **ajout** des autorités
+    // locales par défaut (une configuration explicite ne doit pas casser
+    // l'exception loopback documentée par `allow_origins`).
+    let bound = ServerBuilder::new("proxy", "1.0.0")
+        .legacy(true)
+        .tool("ok", "Répond ok", |_| Ok(json!({ "ok": true })))
+        .allowed_hosts(["mcp.exemple.com", "interne.exemple.com:8443"])
+        .bind("127.0.0.1:0")
+        .expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = bound.serve();
+    });
+    let port = addr.port();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+    for host in [
+        "mcp.exemple.com".to_string(),
+        "mcp.exemple.com:443".to_string(),
+        "interne.exemple.com:8443".to_string(),
+        // Autorités locales : toujours acceptées.
+        format!("localhost:{port}"),
+        "127.0.0.1".to_string(),
+    ] {
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, head, _) = raw_exchange(addr, req.as_bytes());
+        assert_eq!(status, 200, "Host {host:?} doit être accepté : {head}");
+    }
+
+    for host in ["autre.exemple.com", "evil.example", "10.1.2.3:23080"] {
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, head, _) = raw_exchange(addr, req.as_bytes());
+        assert_eq!(
+            status, 421,
+            "Host {host:?} hors liste explicite doit être refusé : {head}"
+        );
+    }
+}
+
+// ============================================================================
+// 14. L1 — CORS complet (`OPTIONS` preflight 204, `Access-Control-Allow-Origin`)
+// ============================================================================
+
+fn spawn_cors_server() -> SocketAddr {
+    let bound = ServerBuilder::new("cors", "1.0.0")
+        .legacy(true)
+        .tool("ok", "Répond ok", |_| Ok(json!({ "ok": true })))
+        .allow_origins(&["https://app.exemple.com"])
+        .bind("127.0.0.1:0")
+        .expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = bound.serve();
+    });
+    addr
+}
+
+#[test]
+fn cors_preflight_autorise_rend_204_avec_les_entetes_attendus() {
+    // Avant L1 : `OPTIONS /mcp` rendait 405 et aucune réponse ne portait
+    // `Access-Control-Allow-Origin` — un client navigateur ne pouvait rien lire.
+    let addr = spawn_cors_server();
+    let req = "OPTIONS /mcp HTTP/1.1\r\nHost: t\r\nOrigin: https://app.exemple.com\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type,mcp-protocol-version\r\nConnection: close\r\n\r\n";
+    let (status, head, body) = raw_exchange(addr, req.as_bytes());
+    assert_eq!(status, 204, "préflight autorisé : {head}");
+    assert_eq!(body, "", "un 204 n'a pas de corps");
+    assert!(
+        head.contains("Access-Control-Allow-Origin: https://app.exemple.com"),
+        "ACAO échoé : {head}"
+    );
+    assert!(
+        head.contains("Access-Control-Allow-Methods: POST, OPTIONS"),
+        "méthodes autorisées : {head}"
+    );
+    assert!(
+        head.contains(
+            "Access-Control-Allow-Headers: Content-Type, Accept, MCP-Protocol-Version, Mcp-Method, Mcp-Name"
+        ),
+        "en-têtes autorisés : {head}"
+    );
+    assert!(head.contains("Vary: Origin"), "Vary: Origin : {head}");
+    assert!(
+        !head.to_ascii_lowercase().contains("content-length"),
+        "un 204 ne doit pas porter Content-Length (RFC 9110 §8.6) : {head}"
+    );
+}
+
+#[test]
+fn cors_preflight_origine_refusee_ou_absente_rend_403() {
+    let addr = spawn_cors_server();
+    for origin_line in [
+        "Origin: https://evil.example\r\n",
+        "Origin: null\r\n",
+        "", // pas d'`Origin` : rien n'est autorisé
+    ] {
+        let req = format!(
+            "OPTIONS /mcp HTTP/1.1\r\nHost: t\r\n{origin_line}Access-Control-Request-Method: POST\r\nConnection: close\r\n\r\n"
+        );
+        let (status, head, _) = raw_exchange(addr, req.as_bytes());
+        assert_eq!(
+            status, 403,
+            "préflight {origin_line:?} doit être refusé : {head}"
+        );
+        assert!(
+            !head.contains("Access-Control-Allow-Origin"),
+            "aucun ACAO sur un refus : {head}"
+        );
+    }
+}
+
+#[test]
+fn cors_post_origine_autorisee_porte_acao_et_vary() {
+    let addr = spawn_cors_server();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nOrigin: https://app.exemple.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, head, resp) = raw_exchange(addr, req.as_bytes());
+    assert_eq!(status, 200, "{head}");
+    assert!(
+        head.contains("Access-Control-Allow-Origin: https://app.exemple.com"),
+        "ACAO sur la réponse POST autorisée : {head}"
+    );
+    assert!(head.contains("Vary: Origin"), "Vary: Origin : {head}");
+    assert!(resp.contains("\"result\""), "{resp:?}");
+
+    // Sans `Origin` (client CLI), aucune en-tête CORS n'est ajouté : le
+    // chemin chaud reste identique octet pour octet.
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, head, _) = raw_exchange(addr, req.as_bytes());
+    assert_eq!(status, 200, "{head}");
+    assert!(
+        !head.contains("Access-Control-Allow-Origin"),
+        "pas d'ACAO sans Origin : {head}"
+    );
+}
+
+#[test]
+fn cors_notification_origine_autorisee_porte_acao_et_vary() {
+    // B1 (contre-revue) : le chemin notification (`Ok(None)` → `202`) passait
+    // une chaîne vide en `extra_headers` — aucun en-tête CORS. `notifications/
+    // initialized` est pourtant la première requête qu'un client MCP envoie
+    // après l'initialisation : sans `Access-Control-Allow-Origin` sur le
+    // `202`, le navigateur rejette la réponse et la session ne démarre pas.
+    let addr = spawn_cors_server();
+    let body = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nOrigin: https://app.exemple.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, head, resp) = raw_exchange(addr, req.as_bytes());
+    assert_eq!(status, 202, "notification d'origine autorisée : {head}");
+    assert!(resp.is_empty(), "un 202 n'a pas de corps : {resp:?}");
+    assert!(
+        head.contains("Access-Control-Allow-Origin: https://app.exemple.com"),
+        "ACAO sur le 202 : {head}"
+    );
+    assert!(
+        head.contains("Vary: Origin"),
+        "Vary: Origin sur le 202 : {head}"
+    );
+
+    // Une origine non autorisée reste refusée en 403, sans en-tête CORS.
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, head, _) = raw_exchange(addr, req.as_bytes());
+    assert_eq!(status, 403, "origine non autorisée : {head}");
+    assert!(
+        !head.contains("Access-Control-Allow-Origin"),
+        "aucun ACAO sur un refus : {head}"
+    );
+}
+
+// ============================================================================
+// 15. L1 — Échéance **globale** d'écriture (client qui lit lentement)
+// ============================================================================
+
+#[test]
+fn client_qui_ne_lit_pas_est_coupe_a_l_echeance_globale() {
+    // Remplace `client_lent_en_lecture_perd_la_connexion_a_l_echeance_globale`
+    // (audit L6), qui passait pour la mauvaise raison : sa charge de 8 Mio,
+    // dupliquée par le résultat (`content[].text` + `structuredContent`),
+    // faisait 16 777 454 octets — **au-dessus** du plafond de réponse par
+    // défaut (16 777 216). La connexion se fermait sur le refus de taille
+    // (`-32603 response size ... exceeds maximum`), pas sur l'échéance.
+    //
+    // Ici la charge (2 Mio) reste très en dessous du plafond (16 Mio) et le
+    // test vérifie explicitement que le corps n'est **pas** ce refus.
+    //
+    // Ce que le test mesure, et pourquoi le côté client ne suffit pas : la
+    // durée vue par un lecteur lent est dominée par le drainage des octets
+    // déjà remis au noyau (mesuré : 512 Kio à 17 Kio/s = 30 s), pas par
+    // l'instant de la coupure. La garantie réelle est **serveur** : le slot
+    // de connexion est rendu à l'échéance, pas au `WRITE_TIMEOUT` de 10 s.
+    // On l'observe de l'extérieur avec `max_connections(1)` : un second
+    // client est refusé (`503`) tant que le premier retient le slot, et servi
+    // (`200`) dès qu'il l'a rendu.
+    //
+    // Sans tranches bornées, le premier `write_vectored` de 4 Mio est absorbé
+    // d'un coup par le noyau (mesuré : 4 194 533 octets en un appel) et le
+    // serveur considère la réponse écrite : rien n'est coupé. Sans borne par
+    // tentative, l'appel bloqué ne rend la main qu'au `WRITE_TIMEOUT` (10 s).
+    // Les deux mécanismes sont donc nécessaires, et le test tombe si l'un
+    // manque — voir `.zwork/rapports-2026-11-13/LB-echeance-ecriture.md`.
+    let charge = "x".repeat(2 * 1024 * 1024);
+    let bound = ServerBuilder::new("lent", "1.0.0")
+        .legacy(true)
+        .tool("gros", "Grosse réponse", move |_| {
+            Ok(json!({ "charge": charge }))
+        })
+        .read_timeout(Duration::from_millis(300))
+        .write_deadline(Duration::from_secs(1))
+        .max_connections(1)
+        .bind("127.0.0.1:0")
+        .expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = bound.serve();
+    });
+
+    // Premier client : demande une réponse de ~4 Mio et **ne lit pas** — sa
+    // fenêtre TCP reste fermée, l'écriture du serveur se bloque sur le corps.
+    let mut lent = TcpStream::connect(addr).expect("connect");
+    lent.set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set_read_timeout");
+    let body =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"gros","arguments":{}}}"#;
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let debut = Instant::now();
+    lent.write_all(req.as_bytes()).expect("write");
+
+    // Sonde : à quel instant le slot revient-il ?
+    let mut rendu = None;
+    while debut.elapsed() < Duration::from_secs(12) {
+        if slot_rendu(addr) {
+            rendu = Some(debut.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let rendu = rendu.expect("le slot n'a jamais été rendu : la connexion n'est pas coupée");
+
+    // Le premier client draine ce qui a été mis en file avant la coupure.
+    let mut recu = Vec::new();
+    let mut tampon = [0u8; 32 * 1024];
+    loop {
+        match lent.read(&mut tampon) {
+            Ok(0) => break,
+            Ok(n) => recu.extend_from_slice(&tampon[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => panic!("lecture interrompue après {} octets : {e}", recu.len()),
+        }
+        assert!(
+            debut.elapsed() < Duration::from_secs(20),
+            "drainage interminable : {} octets reçus",
+            recu.len()
+        );
+    }
+
+    // Distinction explicite des deux causes de fermeture : réponse 200, corps
+    // qui n'est pas l'erreur de taille.
+    let texte = String::from_utf8_lossy(&recu).into_owned();
+    let (tete, corps) = match texte.split_once("\r\n\r\n") {
+        Some((tete, corps)) => (tete.to_string(), corps.to_string()),
+        None => (texte.clone(), String::new()),
+    };
+    assert!(
+        tete.starts_with("HTTP/1.1 200"),
+        "la fermeture ne doit pas venir d'un refus de transport : {tete}"
+    );
+    assert!(
+        !corps.contains("-32603") && !corps.contains("exceeds maximum"),
+        "le corps est le refus de taille, pas une réponse tronquée : {:.200}",
+        corps
+    );
+    let longueur: usize = tete
+        .lines()
+        .find_map(|ligne| ligne.strip_prefix("Content-Length: "))
+        .and_then(|valeur| valeur.trim().parse().ok())
+        .expect("Content-Length");
+    assert!(
+        longueur > 3 * 1024 * 1024,
+        "la réponse attendue fait ~4 Mio sur le fil (2 Mio dupliqués) : {longueur}"
+    );
+    assert!(
+        rendu < Duration::from_secs(6),
+        "slot rendu trop tard ({rendu:?}) : la tentative a bloqué jusqu'au WRITE_TIMEOUT"
+    );
+    assert!(
+        corps.len() < longueur / 2,
+        "le client a reçu {} octets de corps sur {longueur} : aucune coupure",
+        corps.len()
+    );
+}
+
+/// Vrai si le serveur accepte une requête neuve (slot de connexion libre) :
+/// `GET /health` rend `200` quand le plafond de connexions le permet, `503`
+/// quand il est atteint.
+fn slot_rendu(addr: SocketAddr) -> bool {
+    let Ok(mut flux) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        return false;
+    };
+    if flux
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .is_err()
+    {
+        return false;
+    }
+    if flux
+        .write_all(b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut reponse = String::new();
+    let _ = flux.read_to_string(&mut reponse);
+    reponse.starts_with("HTTP/1.1 200")
+}
+
+/// Serveur à grosse réponse pour le test de plafond d'écriture : `plafond`
+/// explicite, ou `None` pour laisser le défaut (`read_timeout` 300 ms → 1 s)
+/// couper l'écriture.
+fn spawn_gros(plafond: Duration) -> SocketAddr {
+    // 4 Mio de charge : le résultat MCP la duplique (`content[].text` +
+    // `structuredContent`), soit ~8,4 Mo sur le fil — sous le plafond de
+    // réponse de 16 Mio.
+    let charge = "x".repeat(4 * 1024 * 1024);
+    let builder = ServerBuilder::new("lent-releve", "1.0.0")
+        .legacy(true)
+        .tool("gros", "Grosse réponse", move |_| {
+            Ok(json!({ "charge": charge }))
+        })
+        .read_timeout(Duration::from_millis(300))
+        .write_deadline(plafond);
+    let bound = builder.bind("127.0.0.1:0").expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = bound.serve();
+    });
+    addr
+}
+
+fn requete_gros() -> String {
+    let body =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"gros","arguments":{}}}"#;
+    format!(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[test]
+fn plafond_d_ecriture_releve_laisse_passer_une_reponse_lente() {
+    // A3 (contre-revue) : le défaut (`read_timeout` 300 ms → échéance 1 s)
+    // coupe une grosse réponse lue à 32 Kio toutes les 25 ms (~3,2 s) —
+    // un client lent mais légitime, servi **en entier** avant L1.
+    // `.write_deadline(10 s)` relève le plafond : la réponse passe.
+    let addr = spawn_gros(Duration::from_secs(10));
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set_read_timeout");
+    stream.write_all(requete_gros().as_bytes()).expect("write");
+
+    let start = Instant::now();
+    let mut recu = 0usize;
+    let mut buf = [0u8; 32 * 1024];
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "test bloqué après {recu} octets"
+        );
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => recu += n,
+            Err(e) => panic!(
+                "réponse coupée après {recu} octets alors que le plafond est relevé à 10 s : {e}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        recu >= 8 * 1024 * 1024,
+        "réponse tronquée : {recu} octets reçus sur ~8,4 Mo"
+    );
+
+    // Témoin négatif **non inclus** : sur cette machine, les tampons de
+    // socket absorbent les ~8,4 Mo même avec un lecteur lent, donc « le défaut
+    // coupe » n'est pas observable de bout en bout. Le contraste « défaut
+    // coupe / plafond relevé laisse passer » est verrouillé de manière
+    // déterministe au niveau du mécanisme
+    // (`ecrire_tous_vecteurs_plafond_releve_laisse_passer_une_ecriture_lente`)
+    // et le câblage du builder par `write_deadline_du_builder_remplace_le_defaut`,
+    // tous deux dans `src/http.rs`.
+}
+
+// ============================================================================
+// 16. L1 — `HTTP/1.0` sur les réponses d'erreur globales
+// ============================================================================
+
+#[test]
+fn http10_error_responses_keep_the_request_version() {
+    let (addr, _) = spawn_audit_server();
+
+    // 400 après parsing de la ligne de requête (framing ambigu).
+    let req = "POST /mcp HTTP/1.0\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    let (status, head, _) = raw_exchange(addr, req.as_bytes());
+    assert_eq!(status, 400, "{head}");
+    assert!(
+        head.starts_with("HTTP/1.0 400"),
+        "version propagée : {head}"
+    );
+
+    // 404 route inconnue.
+    let req = "GET /inconnue HTTP/1.0\r\nHost: t\r\nConnection: close\r\n\r\n";
+    let (status, head, _) = raw_exchange(addr, req.as_bytes());
+    assert_eq!(status, 404, "{head}");
+    assert!(
+        head.starts_with("HTTP/1.0 404"),
+        "version propagée : {head}"
+    );
+
+    // 405 méthode refusée.
+    let req = "GET /mcp HTTP/1.0\r\nHost: t\r\nConnection: close\r\n\r\n";
+    let (status, head, _) = raw_exchange(addr, req.as_bytes());
+    assert_eq!(status, 405, "{head}");
+    assert!(
+        head.starts_with("HTTP/1.0 405"),
+        "version propagée : {head}"
+    );
+}
+
+#[test]
+fn http10_503_refusal_stays_http11_because_the_version_is_unknown() {
+    // Le refus de saturation part **avant** toute lecture : la version de la
+    // requête n'est pas connue au moment d'écrire la ligne de statut. La
+    // réponse reste donc `HTTP/1.1` — limite documentée (docs/SECURITE.md),
+    // et c'est le seul cas où la version ne peut pas être propagée.
+    let bound = ServerBuilder::new("cap10", "1.0.0")
+        .legacy(true)
+        .tool("ok", "Répond ok", |_| Ok(json!({ "ok": true })))
+        .read_timeout(Duration::from_millis(300))
+        .max_connections(1)
+        .bind("127.0.0.1:0")
+        .expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = bound.serve();
+    });
+
+    let first = TcpStream::connect(addr).expect("connect 1"); // occupe l'unique slot
+    std::thread::sleep(Duration::from_millis(150));
+    let req = "POST /mcp HTTP/1.0\r\nHost: t\r\nContent-Length: 2\r\n\r\n{}";
+    let (status, head, body) = raw_exchange(addr, req.as_bytes());
+    assert_eq!(status, 503, "{head}");
+    assert!(
+        head.starts_with("HTTP/1.1 503"),
+        "refus avant lecture : version inconnue, HTTP/1.1 documenté : {head}"
+    );
+    assert!(body.contains("too many connections"), "{body:?}");
+    drop(first);
+}

@@ -69,6 +69,15 @@ impl ErrorObject {
     /// Incohérence entre les en-têtes `Mcp-Method`/`Mcp-Name` et le corps de
     /// la requête (MCP 2026-07-28, SEP-2243).
     pub const HEADER_MISMATCH: i64 = -32020;
+    /// Refus d'autorisation (LiteMCP) : droit manquant, confirmation refusée
+    /// ou en attente. Un **seul** code pour les trois motifs — `data.reason`
+    /// porte la distinction (`right_missing`, `approval_denied`,
+    /// `approval_pending`). HTTP : `403`.
+    ///
+    /// Justification du choix de `-32023` : voir `docs/auth.md` §5 (première
+    /// valeur libre après le bloc MCP, hors plage implementation-defined que
+    /// MCP déconseille).
+    pub const FORBIDDEN: i64 = -32023;
 
     pub fn new(code: i64, message: impl Into<String>) -> Self {
         Self {

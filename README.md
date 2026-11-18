@@ -29,10 +29,12 @@ MSRV **1.85** (edition 2024) : `rustup toolchain install stable` suffit sur une 
 
 ```toml
 [dependencies]
-litemcp = "0.10"   # macros #[tool]/#[resource]/#[prompt] incluses
+litemcp = "0.12"   # macros #[tool]/#[resource]/#[prompt] incluses
 
-# variantes : { version = "0.10", default-features = false }  → sans les macros
-#             { version = "0.10", features = ["schemars"] }   → adaptateur schemars
+# variantes : { version = "0.12", default-features = false }  → sans les macros
+#             { version = "0.12", features = ["schemars"] }   → adaptateur schemars
+#             { version = "0.12", features = ["auth-sign"] } → signature Ed25519 (RFC 9421)
+#             { version = "0.12", features = ["tls"] }       → TLS 1.3 serveur
 ```
 
 **Le jeu par défaut est complet** : transport HTTP durci, JSON-RPC, module `zod`, erreurs structurées, hooks `on_call`/`on_request`, gateway dynamique, anti-zombie, annonces. Les features sont additives ; la seule qui coûte cher est `schemars` ([chiffres](#features-cargo)).
@@ -95,6 +97,71 @@ La clé et le champ `type` varient d'un client à l'autre (`servers` dans VS Cod
 | `400` + `-32602` · `404` + `-32601` | `_meta` incomplet · `initialize` sur le profil strict (`.legacy(true)` pour un client legacy) |
 | `403` · `503` · connexion refusée | `Origin` non listé · plafond de connexions (256) · mauvais port (`23080..=23099`) |
 
+## Authentification (0.12)
+
+Trois configurations, du plus simple au plus exposé — **sans vérificateur, le comportement du crate est strictement inchangé** (aucune allocation, aucun en-tête retenu).
+
+**1. Serveur ouvert** (ce que fait `cargo run --example hello`) : rien à changer.
+
+**2. Serveur signé** — chaque client a une paire Ed25519, le serveur ne connaît que les clés publiques :
+
+```rust
+use litemcp::auth::sign::{ClientKey, KeyStore, NonceCache, SignatureVerifier, TestKeyStore};
+use litemcp::prelude::*;
+use std::sync::Arc;
+
+# fn exemple(cle_publique: [u8; 32]) -> std::io::Result<()> {
+let magasin: Arc<TestKeyStore> = Arc::new(TestKeyStore::new());
+magasin.insert(
+    "atelier-1",
+    ClientKey::new("atelier-1", cle_publique).with_right("db.read"),
+);
+let keys: Arc<dyn KeyStore> = magasin;
+
+let bound = ServerBuilder::new("calc", "1.0.0")
+    .tool("db.query", "Lit la base", |_args| Ok(serde_json::json!({})))
+    .require_right("db.query", "db.read")   // sans droit, l'outil est refusé ET invisible
+    .verifier(Arc::new(SignatureVerifier::new(
+        keys,
+        NonceCache::with_default_policy(),
+    )))
+    .on_auth_decision(|event| eprintln!("{} {:?} → {:?}", event.method, event.name, event.verdict))
+    .bind("127.0.0.1:23080")?;
+# let _ = bound;
+# Ok(())
+# }
+```
+
+Côté client, `auth::sign::Signer::headers(&RequestToSign)` produit les trois en-têtes du profil (Ed25519 RFC 8032, `Content-Digest` RFC 9530, `Signature-Input`/`Signature` RFC 9421) pour **n'importe quel** client HTTP : ajoutez `Content-Digest`, `Signature-Input` et `Signature` à la requête, tel quel. `cargo run --features auth-sign --example auth_sign` montre le vecteur de référence et cinq refus.
+
+**3. Serveur signé + TLS 1.3** — la confidentialité en plus, certificat en mémoire :
+
+```rust
+use litemcp::prelude::*;
+
+# fn exemple() -> std::io::Result<()> {
+let tls = TlsConfig::self_signed_ephemeral("localhost")
+    .expect("certificat éphémère en mémoire");
+let empreinte = tls.fingerprint();       // « sha256:… » — à épingler côté client
+let bound = ServerBuilder::new("calc", "1.0.0")
+    .tool("db.query", "Lit la base", |_args| Ok(serde_json::json!({})))
+    .require_right("db.query", "db.read")
+    .tls(tls)
+    .bind("127.0.0.1:23080")?;
+assert_eq!(bound.certificate_fingerprint(), Some(empreinte));
+# let _ = bound;
+# Ok(())
+# }
+```
+
+Un client épingle l'identité du serveur avec `auth::PinnedServer::new("sha256:…")` puis `verify(empreinte_observée)` : toute différence est un **refus explicite**, sans option de contournement. `cargo run --features tls,auth-sign --example auth_tls` enchaîne les trois cas sur le loopback.
+
+Réponses : `401` + `WWW-Authenticate: Signature realm="litemcp", tag="litemcp-auth-v1"` et corps **constant** (le motif précis ne sort que par `on_auth_decision`) ; `403` + `-32023` (`data.reason` : `right_missing`, `approval_denied`, `approval_pending`) pour un droit manquant ou une confirmation refusée. `GET /health` reste **ouvert et inchangé**, et `GET /.well-known/oauth-protected-resource` ne répond (document RFC 9728 minimal) que si l'autorisation est active.
+
+Pour une application qui possède **son propre** socket (MCP Control, passerelle maison), un seul point d'entrée : `ServerCore::dispatch_verified(&VerifiedRequest)` rend `AuthResponse { status, headers, body }` et vérifie **toujours** quand l'autorisation est active (`Gateway::dispatch_verified` pour un catalogue dynamique).
+
+> **Ce que la lib ne fait pas** : stockage des clés (le `KeyStore` et les fichiers sont à l'application), appairage et enrôlement (aucun TOFU, aucun QR, aucune découverte), écran de confirmation (le trait décide, l'UI est à vous), émission ou validation de jetons OAuth (le profil expose `Signature`, pas `Bearer` : un client MCP à jeton ne peut pas s'y connecter), rotation/révocation automatiques (une révocation prend effet à la requête suivante), journal d'audit (seul le hook existe), persistance du cache de nonces, terminaison TLS derrière un proxy, mTLS, et **aucun client HTTP** : `Signer` signe pour le client que vous avez déjà.
+
 ## Concepts
 
 ### Outils — schémas dérivés, validation avant exécution
@@ -141,15 +208,17 @@ Un endpoint, un verbe : `POST /mcp`. Réponse `application/json`, ou `text/event
 
 ## Features Cargo
 
-Deux features optionnelles, additives : `macros` (défaut) et `schemars`. Le noyau n'a besoin d'aucune.
+Deux features optionnelles au choix, additives : `macros` (défaut), `schemars`, `auth-sign`, `tls`. Le noyau n'a besoin d'aucune.
 
 | Configuration | Crates dans le build du consommateur | Ce que ça ajoute |
 |---|---|---|
 | `default` | **13** | les macros `#[tool]`/`#[resource]`/`#[prompt]` (crate locale `litemcp-macros`, aucune dépendance) |
 | `default-features = false` | **12** | rien de moins : le noyau complet |
 | `features = ["schemars"]` | **68** (+55) | `schemars` + `jsonschema` : `from_schemars::<T>()`, `from_json_schema`, `format` validés |
+| `features = ["auth-sign"]` | **+16** | signature et vérification Ed25519 (RFC 9421 + RFC 9530), +85 Kio de binaire |
+| `features = ["tls"]` | **+17** | TLS 1.3 serveur (`rustls` + `ring`, jamais `tls12`) + certificat éphémère (`rcgen`), +657 Kio |
 
-*Comptés le 2026-11-13 (`cargo tree -e normal --prefix none`, dédoublonné, crate du consommateur exclue), Windows 11, rustc 1.99.1.*
+*Comptés le 2026-11-13 (`cargo tree -e normal --prefix none`, dédoublonné, crate du consommateur exclue), Windows 11, rustc 1.99.1 ; deltas `auth-sign`/`tls` remesurés le 2026-11-15 (release `strip` + `lto = "fat"`).*
 
 Deux précisions que le slogan « deux dépendances » cache : les dépendances **directes** sont bien `serde` et `serde_json`, mais un build par défaut compile aussi `serde_derive`, donc `syn`, `quote`, `proc-macro2`, `unicode-ident` — ils viennent de `serde`, pas de `litemcp-macros`. Et le binaire d'un serveur à un outil pèse **≈ 1 Mio** (961 Kio mesurés, release `lto = "fat"` + `strip`), pas les 263 Kio annoncés auparavant : méthode et chiffres antérieurs dans [`docs/MESURES.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/MESURES.md#tailles-de-binaire).
 
@@ -160,8 +229,8 @@ Toutes les méthodes du builder sont optionnelles et posent le défaut ci-dessou
 | Méthode / limite | Défaut | Rôle |
 |---|---|---|
 | `.route(path)` / `.bind_default()` | `/mcp` / `23080..=23099` | chemin unique validé au bind ; premier port libre sur `127.0.0.1`, repli éphémère |
-| `.allow_origins(&[…])` | vide | origines tolérées — **filtre anti-DNS-rebinding, pas du CORS** ([Limites](#limites)) |
-| `.tool_timeout(d)` | illimité | délai des handlers → `isError`/`-32603` data `timeout` ; le thread n'est pas tué |
+| `.allow_origins(&[…])` | vide | origines autorisées en cross-origin (préflight `204`, ACAO echoé, jamais `*`) — valide aussi la garde anti-DNS-rebinding ([Limites](#limites)) |
+| `.tool_timeout(d)` / `.no_tool_timeout()` | **30 s** / — | délai des handlers → `isError`/`-32603` data `timeout` ; le thread n'est pas tué ; `.no_tool_timeout()` revient à « illimité » (désactive le plafond de 256 threads de handlers) |
 | `.on_request(hook)` | aucun | verrou par requête **avant la lecture du corps** : `401`/`403`/`429` |
 | `.announce()` / `.anti_zombie()` | désactivées | annonce JSON dans `%TEMP%/litemcp-registry/` ; sweep du registre (retrait sur preuve d'identité seule) + drain borné |
 | `.request_state_ttl(d)` / `.request_state_key(k)` | 10 min / aléatoire | état MRTR : TTL et clé HMAC partagée en flotte (clé vide → panique) |
@@ -189,11 +258,11 @@ ServerBuilder::new("calc", "1.0.0")
     .serve()?;
 ```
 
-Le **TLS n'est pas implémenté** (choix architectural : il vit à la périphérie).
+Le **TLS 1.3 est disponible** derrière la feature `tls` (`.tls(TlsConfig)`, certificat en mémoire, empreinte épinglable) ; sans elle, le serveur parle en clair — la terminaison à la périphérie reste un choix valable.
 
 - **Liaison** : bind `127.0.0.1` si le serveur ne parle qu'à des processus locaux ; sinon, reverse proxy pour TLS, authentification forte (OIDC/SAML, OAuth 2.1) et rate-limiting par identité. Derrière un proxy, `ctx.peer` est l'adresse du proxy : ne croyez `X-Forwarded-For` qu'après avoir vérifié le pair ; le plafond de connexions (256) est **global**, le quota par IP est au proxy.
-- **Navigateurs** : garde DNS-rebinding sur `Origin` (liste blanche, exception loopback même-origine) ; `Origin: null` et `Sec-Fetch-Site: cross-site` sont refusés. Aucun en-tête CORS n'est émis : un client navigateur cross-origin ne peut pas lire la réponse ([Limites](#limites)).
-- **Handlers bloquants** : pas de timeout par défaut ; `.tool_timeout(d)` borne la réponse, pas l'exécution (le thread termine en arrière-plan) et aucun jeton d'annulation n'est exposé.
+- **Navigateurs** : garde DNS-rebinding sur `Origin` (liste blanche, exception loopback même-origine) ; `Origin: null` et `Sec-Fetch-Site: cross-site` sont refusés. Les en-têtes CORS ne sont émis que pour une origine déclarée dans `allow_origins` ; une autre origine ne peut pas lire la réponse ([Limites](#limites)).
+- **Handlers bloquants** : 30 s par défaut (`tool_timeout`) — la réponse est bornée, pas l'exécution (le thread termine en arrière-plan) ; une fermeture de flux SSE lève le drapeau coopératif [`cancel`](https://github.com/DeamonDev888/litemcp/blob/main/docs/PROTOCOLE.md), que le handler consulte à ses points sûrs.
 - **Validation** : `tool_typed`/`tool_parse` appliquent le schéma **avant** votre code ; le schéma publié est exécuteur — ce qu'il annonce est exactement ce que la validation applique.
 
 Le transport refuse, sur **toutes** les routes : `Transfer-Encoding` (400, anti request-smuggling), `Content-Length` dupliqué ou malformé (400/411), en-têtes à valeur unique dupliqués (400), ligne d'en-tête sans `:` ou espace avant `:` (400), obs-fold et LF seul (400), version HTTP inconnue (505), route inconnue (404), `Content-Type` non JSON (415), corps > 1 Mio (413), en-têtes > 64 ou ligne > 16 Kio (431), `Origin` non autorisé (403) ; paniques de handler et de hook contenues (`-32603` avec l'`id`). Détail : [`docs/SECURITE.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/SECURITE.md).
@@ -221,14 +290,14 @@ Soit **×2,1** sur la latence moyenne et **×1,7** sur la mémoire face au meill
 
 ## Limites
 
-- **TLS et authentification forte** : hors périmètre, à la périphérie (reverse proxy, gateway).
-- **Pas de CORS** : `.allow_origins` filtre l'`Origin`, il ne l'autorise pas. Mesuré : préflight `OPTIONS` → `405`, aucune réponse ne porte `Access-Control-Allow-Origin` — un client navigateur cross-origin ne peut pas fonctionner, même listé.
-- **`Host` non confronté au listener** : la garde DNS-rebinding repose sur `Origin` et `Sec-Fetch-Site` ; un client sans `Origin` passe (mesuré). Une option `allowed_hosts` manque.
-- **Pas d'annulation MCP** : la fermeture d'un flux SSE n'interrompt pas le handler et aucun jeton n'est exposé ; `tool_timeout` est **illimité par défaut** et ne tue pas le thread.
-- **`structuredContent` d'un `isError` non confronté à `outputSchema`** : le succès est validé, l'échec non (profil strict comme legacy).
+- **TLS et authentification forte** : TLS 1.3 serveur et signature de requêtes sont **dans la lib** (features `tls` et `auth-sign`, [guide](#authentification-012)) ; restent à la périphérie l'OIDC/SAML, l'OAuth 2.1 pour clients à jeton, le mTLS, le rate-limit par identité et la terminaison TLS mutualisée.
+- **CORS : liste blanche seulement** : `.allow_origins` ouvre le cross-origin aux seules origines déclarées — préflight `OPTIONS` → `204` avec `Access-Control-Allow-Origin` (l'origine listée, echoée une à une, jamais `*`) et `Vary: Origin`, et les réponses `POST` de ces origines portent les mêmes en-têtes ; une origine non listée reste refusée en `403`, sans aucun en-tête CORS. Pas de `Access-Control-Allow-Credentials`, et les rejets de transport (`400`/`413`/`415`) partent avant le verdict CORS : côté navigateur ils apparaissent comme une erreur CORS, pas comme leur statut exact.
+- **`Host` : une règle par défaut, pas une authentification** : `ServerBuilder::allowed_hosts` confronte l'autorité reçue au listener **avant le routage** — `421 Misdirected Request` pour tout nom pleinement qualifié non déclaré (`attaquant.example`) ou toute IP étrangère. Par défaut sont acceptées l'IP effective du listener, le bouclage et tout **nom court** non qualifié (`localhost`, `mon-service`, mais aussi un nom sans point non déclaré) : ce n'est pas une liste blanche exhaustive, et le port de l'autorité est ignoré. Derrière un reverse proxy, déclarez le nom public.
+- **Annulation coopérative, jamais préemptive** : la fermeture d'un flux SSE lève un drapeau (`litemcp::cancel::is_cancelled`) que le handler consulte **s'il le veut** ; rien ne l'interrompt (Rust n'a pas d'annulation de thread). `tool_timeout` (30 s par défaut) borne la réponse, pas les effets de bord en cours ; `notifications/cancelled` n'est pas implémentée.
+- **`structuredContent` d'un `isError`** : avec un `outputSchema` publié, le champ est **omis** sur un échec (page *Tools* : tout résultat structuré doit conformer au schéma publié) — le détail de l'erreur reste dans `content` ; sans `outputSchema` publié, la forme `{"error": …}` historique est conservée.
 - **Pas de pagination** (`cursor` ignoré, pas de `nextCursor`), **pas de souscriptions** (`subscriptions/listen` absent : les clients s'appuient sur `ttlMs` = 60 s), extension **`tasks`** non implémentée.
 - **Pas de `chunked` entrant** : tout `Transfer-Encoding` est refusé (`400`) ; un proxy qui re-chunke doit dé-chunker.
-- **CI sans macOS** (`.github/workflows/ci.yml`) : la matrice complète (défaut, toutes features, sans défaut, features isolées, MSRV 1.85, rustdoc) tourne sous Linux, et un job `windows-latest` lance la suite par défaut ; aucun job macOS. Pour rejouer la suite localement : [`docs/TESTS.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/TESTS.md).
+- **CI : trois systèmes, couverture inégale** (`.github/workflows/ci.yml`) : la matrice complète (défaut, toutes features, sans défaut, features isolées `macros` / `schemars` / `auth-sign` / `tls`, MSRV 1.85, rustdoc strict, simulations du pipeline de publication) tourne sous `ubuntu-latest` ; les jobs `windows-latest` et `macos-latest` lancent la suite en configuration par défaut **et** en `--all-features`, mais ni clippy, ni rustdoc, ni les features isolées — un écart propre à une plateforme sous une feature isolée n'y serait pas vu. Pour rejouer la suite localement : [`docs/TESTS.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/TESTS.md).
 
 ## Licence
 

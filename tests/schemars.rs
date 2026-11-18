@@ -413,3 +413,54 @@ fn erreur_de_schema_interne_sort_en_32603_neutre() {
         assert!(!wire.contains(leak), "fuite interne `{leak}` dans {wire}");
     }
 }
+
+/// L4 — les branches `anyOf`/`oneOf` sont compilées **à la construction** :
+/// aucun travail de schéma ne reste sur le chemin d'une requête.
+#[test]
+fn les_branches_anyof_oneof_sont_compilees_a_la_construction() {
+    use litemcp::zod::Schema;
+    let schema = from_json_schema(json!({
+        "type": "object",
+        "anyOf": [
+            {
+                "type": "object",
+                "properties": { "a": { "type": "integer", "default": 1 } },
+                "required": ["a"]
+            },
+            {
+                "type": "object",
+                "properties": { "b": { "type": "string", "default": "x" } },
+                "required": ["b"]
+            }
+        ]
+    }));
+    // Compilées avant tout appel : la construction a fait le travail.
+    assert_eq!(
+        schema.branches_compilees(),
+        2,
+        "les deux branches `anyOf` doivent être prêtes dès la construction"
+    );
+    assert!(schema.has_defaults(), "le document porte des défauts");
+    // Une injection (le chemin d'une requête) n'ajoute **aucune** compilation.
+    for _ in 0..8 {
+        let mut value = json!({ "a": 5 });
+        schema.apply_defaults(&mut value);
+        assert_eq!(value["a"], 5);
+    }
+    assert_eq!(
+        schema.branches_compilees(),
+        2,
+        "une requête ne doit jamais compiler de branche"
+    );
+    // Un document sans défaut ne paie aucune compilation de branche.
+    let sans_defaut = from_json_schema(json!({
+        "type": "object",
+        "oneOf": [{ "type": "object" }, { "type": "string" }]
+    }));
+    assert!(!sans_defaut.has_defaults());
+    assert_eq!(
+        sans_defaut.branches_compilees(),
+        0,
+        "sans défaut, les branches ne servent à rien"
+    );
+}

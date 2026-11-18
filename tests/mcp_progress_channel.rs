@@ -13,7 +13,10 @@
 //! * la propagation du canal quand le handler tourne dans un fil détaché
 //!   (`tool_timeout`) ;
 //! * la fermeture du canal : aucune notification ne peut suivre la réponse,
-//!   même depuis un handler détaché après expiration du délai.
+//!   même depuis un handler détaché après expiration du délai ;
+//! * l'**annulation coopérative** : la fermeture du flux SSE par le client
+//!   lève le drapeau `litemcp::cancel` et un handler qui le consulte sort de
+//!   sa boucle (spec Streamable HTTP `2026-07-28`, MUST).
 //!
 //! Les tests parlent HTTP brut (socket réel), pas `ServerCore` : c'est le
 //! transport qui est en cause, pas le dispatch.
@@ -24,10 +27,10 @@ mod fixture;
 use litemcp::ServerBuilder;
 use litemcp::protocol::{META_CLIENT_CAPABILITIES, META_PROTOCOL_VERSION, PROTOCOL_VERSION};
 use serde_json::{Value, json};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 
 fn next_id() -> i64 {
     static ID: AtomicI64 = AtomicI64::new(1);
@@ -331,5 +334,117 @@ fn no_progress_after_the_response_even_from_a_detached_handler() {
     assert_eq!(
         last["result"]["isError"], true,
         "le délai dépassé est rendu en erreur d'outil : {last}"
+    );
+}
+
+#[test]
+fn closing_the_sse_stream_cancels_the_handler() {
+    // Spec Streamable HTTP `2026-07-28` (MUST) : la fermeture du flux SSE est
+    // traitée comme une annulation. Le transport ne peut pas interrompre un
+    // fil : il lève le drapeau `litemcp::cancel` à la première écriture qui
+    // échoue, et le handler sort de sa boucle à son prochain point sûr.
+    //
+    // Budget borné dans les deux sens : le handler abandonne de lui-même au
+    // bout de 5 s (échec propre du test si le drapeau n'arrive jamais), le
+    // test attend le verdict 6 s au plus.
+    let observed = std::sync::Arc::new(AtomicBool::new(false));
+    let drapeau = std::sync::Arc::clone(&observed);
+    let addr = spawn(ServerBuilder::new("cancel-sse", "1.0.0").tool_result(
+        "boucle",
+        "Boucle jusqu'à la fermeture du flux",
+        move |_args| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if litemcp::cancel::is_cancelled() {
+                    drapeau.store(true, Ordering::SeqCst);
+                    return Ok(litemcp::protocol::CallToolResult::from_content([
+                        litemcp::protocol::ContentBlock::text("cancelled"),
+                    ]));
+                }
+                // Chaque rapport est une écriture SSE : c'est elle qui
+                // révèle la déconnexion du client.
+                let _ = litemcp::progress::report(1.0, Some(1000.0), None);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(litemcp::protocol::CallToolResult::from_content([
+                litemcp::protocol::ContentBlock::text("budget épuisé"),
+            ]))
+        },
+    ));
+
+    let request = tool_call("boucle", Some("tok-cancel"));
+    let body = request.to_string();
+    let raw = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\
+         MCP-Protocol-Version: {PROTOCOL_VERSION}\r\nMcp-Method: tools/call\r\n\
+         Mcp-Name: boucle\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(addr).expect("connexion");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout de lecture");
+    stream.write_all(raw.as_bytes()).expect("écriture");
+
+    // On lit jusqu'au premier événement : la tête est partie et le handler
+    // tourne déjà quand on raccroche.
+    let mut reader = BufReader::new(stream.try_clone().expect("clone du socket"));
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("ligne de statut");
+    assert!(line.starts_with("HTTP/1.1 200 OK"), "{line}");
+    let mut seen_progress = false;
+    while !seen_progress {
+        line.clear();
+        if reader.read_line(&mut line).expect("ligne du flux") == 0 {
+            break;
+        }
+        seen_progress = line.starts_with("data: ");
+    }
+    assert!(seen_progress, "aucune notification lue avant la fermeture");
+
+    // Fermeture brutale du flux SSE (les deux poignées du socket).
+    drop(reader);
+    drop(stream);
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline && !observed.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "la fermeture du flux SSE doit lever le drapeau d'annulation vu par le handler"
+    );
+}
+
+#[test]
+fn a_json_client_never_sees_a_cancellation() {
+    // Chemin nominal : aucun flux SSE, donc aucun jeton — `is_cancelled` est
+    // une non-action (`false`) et le handler ne peut pas croire à tort que
+    // son client est parti.
+    let observed = std::sync::Arc::new(AtomicBool::new(false));
+    let vue = std::sync::Arc::clone(&observed);
+    let addr = spawn(ServerBuilder::new("cancel-json", "1.0.0").tool_result(
+        "sonde",
+        "Lit le drapeau d'annulation",
+        move |_args| {
+            vue.store(litemcp::cancel::is_cancelled(), Ordering::SeqCst);
+            assert!(
+                litemcp::cancel::token().is_none(),
+                "aucun jeton hors flux SSE"
+            );
+            Ok(litemcp::protocol::CallToolResult::from_content([
+                litemcp::protocol::ContentBlock::text("ok"),
+            ]))
+        },
+    ));
+    let request = tool_call("sonde", None);
+    let (head, body) = post(addr, "application/json", &request);
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    let response: Value = serde_json::from_str(body.trim()).expect("JSON-RPC");
+    assert_eq!(response["id"], request["id"]);
+    assert!(
+        !observed.load(Ordering::SeqCst),
+        "le handler ne doit voir aucune annulation sur le chemin JSON"
     );
 }

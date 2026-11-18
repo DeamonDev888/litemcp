@@ -585,3 +585,98 @@ fn edit_ne_contourne_pas_le_plafond_inflight_global() {
         "les slots doivent revenir à la terminaison des handlers détachés"
     );
 }
+
+// ------------------------------------------------- 11. garde de récursion
+
+/// Régression (audit 2026-11-13, § 6.2) : un outil qui re-dispatche sur son
+/// **propre** gateway créait une récursion non bornée — débordement de pile
+/// (`exit 0xC00000FD`, `catch_unwind` ne l'attrape pas), tout le process
+/// mourait. La garde thread-local coupe au-delà de 32 dispatch imbriqués
+/// par un `-32603` : le process survit et sert encore.
+///
+/// Le handler ne remonte PAS la réponse imbriquée telle quelle — chaque
+/// niveau l'encapsulerait dans la réponse du suivant et la taille croîtrait
+/// exponentiellement (le plafond de réponse 16 Mio couperait avant qu'on
+/// voie la garde). Il remonte un drapeau compact portant le **code réel** de
+/// l'enveloppe de refus : « garde » + `code` quand son appel imbriqué a été
+/// refusé (ou quand le refus a déjà été remonté par le niveau du dessous),
+/// « suit » sinon (la récursion continue d'un niveau). Le code est asserté
+/// ci-dessous (`-32603`, et lui seul) : accepter n'importe quelle enveloppe
+/// d'erreur laisserait passer un `-32600` de protocole.
+#[test]
+fn l_auto_appel_du_gateway_rend_32603_et_le_process_survit() {
+    const CORPS_AUTO: &[u8] =
+        br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"auto","arguments":{}}}"#;
+    let gw = Arc::new(Gateway::new(ServerBuilder::new("gw-recursion", "1.0.0")));
+    let exterieur = Arc::clone(&gw);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let compte = Arc::clone(&executions);
+    gw.edit(move |b| {
+        let exterieur = Arc::clone(&exterieur);
+        let compte = Arc::clone(&compte);
+        b.tool(
+            "auto",
+            "s'appelle lui-même sur son propre gateway",
+            move |_a| {
+                compte.fetch_add(1, Ordering::SeqCst);
+                let reponse = exterieur
+                    .dispatch_unchecked(CORPS_AUTO)
+                    .and_then(|octets| serde_json::from_slice::<Value>(&octets).ok());
+                match reponse {
+                    // L'appel imbriqué a été REFUSÉ par la garde avec le code
+                    // attendu : remonter le drapeau et ce code.
+                    Some(v) if v["error"]["code"] == json!(-32603) => Ok(json!({
+                        "garde": true,
+                        "code": v["error"]["code"].clone(),
+                    })),
+                    // Le refus a été remonté par le niveau du dessous.
+                    Some(v) if v["result"]["structuredContent"].get("garde").is_some() => {
+                        Ok(json!({
+                            "garde": true,
+                            "code": v["result"]["structuredContent"]["code"].clone(),
+                        }))
+                    }
+                    // Enveloppe d'erreur d'un AUTRE code : drapeau quand même,
+                    // pour que l'assertion échoue proprement au lieu de laisser
+                    // la récursion continuer jusqu'au débordement de pile.
+                    Some(v) if v.get("error").is_some() => Ok(json!({
+                        "garde": true,
+                        "code": v["error"]["code"].clone(),
+                    })),
+                    // La récursion continue d'un niveau.
+                    _ => Ok(json!({ "suit": true })),
+                }
+            },
+        )
+    });
+
+    let reponse = call(&gw, "auto");
+    assert!(
+        reponse["error"].is_null(),
+        "le dispatch externe rend une réponse, pas une erreur protocole : {reponse}"
+    );
+    assert_eq!(
+        reponse["result"]["structuredContent"]["garde"], true,
+        "la garde de récursion a coupé l'auto-appel et le drapeau remonte : {reponse}"
+    );
+    assert_eq!(
+        reponse["result"]["structuredContent"]["code"],
+        json!(-32603),
+        "le refus porte le code d'erreur interne `-32603`, et lui seul : {reponse}"
+    );
+    // Exactement 32 exécutions de handler : les niveaux 1..32 passent, le
+    // 33ᵉ dispatch est refusé SANS exécuter le handler — « au-delà de 32
+    // niveaux d'imbrication ».
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        32,
+        "la garde coupe au-delà de 32 niveaux de dispatch imbriqués"
+    );
+
+    // Le process survit : une requête ultérieure passe encore.
+    assert_eq!(
+        tool_names(&gw),
+        vec!["auto".to_string()],
+        "le gateway sert encore après la garde"
+    );
+}

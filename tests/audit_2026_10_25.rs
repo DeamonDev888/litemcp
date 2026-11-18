@@ -124,22 +124,24 @@ fn timeout_is_classified_retryable() {
 }
 
 #[test]
-fn output_schema_violation_is_classified_internal() {
+fn output_schema_violation_is_a_tool_failure_without_structured_content() {
     // Le handler a réussi mais sa sortie viole le contrat publié :
-    // échec `internal`, non retentable.
+    // résultat `isError` (pas une erreur JSON-RPC). Déclaré le 2026-11-13
+    // (audit MINEUR 3) : avec un `outputSchema` publié, `structuredContent`
+    // est **omis** sur un échec — page *Tools*, « Servers MUST provide
+    // structured results that conform to this schema » — le détail du
+    // message reste dans `content`. (Avant : ce test attendait
+    // `structuredContent.error.code == "internal"`, forme non conforme au
+    // schéma publié.)
     let core = ServerBuilder::new("t", "0.1.0")
         .output_schema("bad", zod::object().field("wanted", zod::integer()))
         .tool("bad", "mauvaise sortie", |_| Ok(json!({ "autre": 1 })))
         .core();
     let v = call_tool(&core, "bad", json!({}));
     assert_eq!(v["result"]["isError"], true);
-    assert_eq!(
-        v["result"]["structuredContent"]["error"]["code"],
-        "internal"
-    );
-    assert_eq!(
-        v["result"]["structuredContent"]["error"]["retryable"],
-        false
+    assert!(
+        v["result"].get("structuredContent").is_none(),
+        "outputSchema publié → structuredContent omis sur isError : {v}"
     );
     assert!(
         v["result"]["content"][0]["text"]
