@@ -596,13 +596,17 @@ mod tests {
             coupe.octets
         );
 
-        // Plafond relevé (celui de `.write_deadline(10 s)`) : tout passe.
+        // Plafond relevé (celui de `.write_deadline(30 s)`) : tout passe.
+        // 30 s et pas 10 : au compte-gouttes (1 octet/ms), la coalescence des
+        // timers macOS arrondit chaque sleep de 1 ms vers ~10 ms — 1 536
+        // octets y durent ~15 s et dépassaient le plafond de 10 s (échec CI
+        // macOS 2026-11-21 : « response write deadline exceeded »).
         let mut lent = GoutteAEcriture::default();
         let mut vecteurs = [IoSlice::new(&charge)];
         ecrire_tous_vecteurs(
             &mut lent,
             &mut vecteurs,
-            Instant::now().checked_add(Duration::from_secs(10)),
+            Instant::now().checked_add(Duration::from_secs(30)),
         )
         .expect("plafond relevé : écriture complète attendue");
         assert_eq!(lent.octets, charge.len());
