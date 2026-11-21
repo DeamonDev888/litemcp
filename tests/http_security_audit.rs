@@ -1128,8 +1128,16 @@ fn client_qui_ne_lit_pas_est_coupe_a_l_echeance_globale() {
     // défaut (16 777 216). La connexion se fermait sur le refus de taille
     // (`-32603 response size ... exceeds maximum`), pas sur l'échéance.
     //
-    // Ici la charge (2 Mio) reste très en dessous du plafond (16 Mio) et le
-    // test vérifie explicitement que le corps n'est **pas** ce refus.
+    // Ici la charge (7 Mio) reste sous le plafond (16 Mio : dupliquée par le
+    // résultat, la réponse fait ~14 Mio) et le test vérifie explicitement que
+    // le corps n'est **pas** ce refus. Pourquoi 7 Mio et pas 2 : sur Linux,
+    // les tampons noyau d'un client qui ne lit pas absorbent ~4 Mio (wmem
+    // autotuné ≤ 4 Mio + fenêtre TCP fermée ≈ 212 Kio de rcvbuf) — une
+    // réponse de 4 Mio y entrait en entier, aucune écriture ne bloquait, le
+    // budget ne se consommait pas et la coupure n'avait jamais lieu (échec CI
+    // ubuntu 2026-11-19 : « le client a reçu 2 621 440 octets de corps sur
+    // 4 194 533 : aucune coupure »). À ~14 Mio sur le fil, le blocage est
+    // garanti sur les trois plateformes.
     //
     // Ce que le test mesure, et pourquoi le côté client ne suffit pas : la
     // durée vue par un lecteur lent est dominée par le drainage des octets
@@ -1140,13 +1148,14 @@ fn client_qui_ne_lit_pas_est_coupe_a_l_echeance_globale() {
     // client est refusé (`503`) tant que le premier retient le slot, et servi
     // (`200`) dès qu'il l'a rendu.
     //
-    // Sans tranches bornées, le premier `write_vectored` de 4 Mio est absorbé
-    // d'un coup par le noyau (mesuré : 4 194 533 octets en un appel) et le
+    // Sans tranches bornées, le premier `write_vectored` de la réponse est
+    // absorbé d'un coup par le noyau (mesuré : 4 194 533 octets en un appel)
+    // et le
     // serveur considère la réponse écrite : rien n'est coupé. Sans borne par
     // tentative, l'appel bloqué ne rend la main qu'au `WRITE_TIMEOUT` (10 s).
     // Les deux mécanismes sont donc nécessaires, et le test tombe si l'un
     // manque — voir `.zwork/rapports-2026-11-13/LB-echeance-ecriture.md`.
-    let charge = "x".repeat(2 * 1024 * 1024);
+    let charge = "x".repeat(7 * 1024 * 1024);
     let bound = ServerBuilder::new("lent", "1.0.0")
         .legacy(true)
         .tool("gros", "Grosse réponse", move |_| {
@@ -1162,7 +1171,7 @@ fn client_qui_ne_lit_pas_est_coupe_a_l_echeance_globale() {
         let _ = bound.serve();
     });
 
-    // Premier client : demande une réponse de ~4 Mio et **ne lit pas** — sa
+    // Premier client : demande une réponse de ~14 Mio et **ne lit pas** — sa
     // fenêtre TCP reste fermée, l'écriture du serveur se bloque sur le corps.
     let mut lent = TcpStream::connect(addr).expect("connect");
     lent.set_read_timeout(Some(Duration::from_millis(100)))
@@ -1228,8 +1237,8 @@ fn client_qui_ne_lit_pas_est_coupe_a_l_echeance_globale() {
         .and_then(|valeur| valeur.trim().parse().ok())
         .expect("Content-Length");
     assert!(
-        longueur > 3 * 1024 * 1024,
-        "la réponse attendue fait ~4 Mio sur le fil (2 Mio dupliqués) : {longueur}"
+        longueur > 13 * 1024 * 1024,
+        "la réponse attendue fait ~14 Mio sur le fil (7 Mio dupliqués) : {longueur}"
     );
     assert!(
         rendu < Duration::from_secs(6),

@@ -169,7 +169,7 @@ pub fn version_facts(metadata_json: &str) -> Result<VersionFacts, String> {
     })
 }
 
-fn package_version<'a>(packages: &'a [serde_json::Value], name: &str) -> Option<String> {
+fn package_version(packages: &[serde_json::Value], name: &str) -> Option<String> {
     packages
         .iter()
         .find(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(name))

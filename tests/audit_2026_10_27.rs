@@ -107,13 +107,30 @@ fn m1_timeout_de_lecture_nest_plus_herite() {
     buf.extend_from_slice(corps);
     let pas = buf.len() / 7;
     let mut sent = 0usize;
+    // Dribble **autocalibré** : chaque pause vise à finir le corps vers 85 %
+    // du budget de requête (read_timeout × 2 = 800 ms ici), quel que soit le
+    // runner. Les pauses fixes de 100 ms dépassaient le budget sur les
+    // runners macOS (dérive des sleeps + ordonnancement) : `read_body`
+    // répondait alors `400 truncated or slow request body` à la requête 1
+    // (échecs CI macOS 2026-11-19 et 2026-11-21). Le resserrement du timeout
+    // reste engagé en fin de dribble (budget restant < read_timeout), ce que
+    // la requête 2 met ensuite à l'épreuve.
+    let debut_dribble = std::time::Instant::now();
     while sent < buf.len() {
         let fin = (sent + pas).min(buf.len());
         if a.write_all(&buf[sent..fin]).is_err() {
             break;
         }
         sent = fin;
-        std::thread::sleep(Duration::from_millis(100));
+        if sent < buf.len() {
+            // Pause = budget restant ÷ tranches restantes, bornée [10, 120]
+            // ms : ample sur un runner rapide, resserrée sur un runner lent —
+            // le dribble finit toujours dans le budget.
+            let cible = 680u64.saturating_sub(debut_dribble.elapsed().as_millis() as u64);
+            let restants = ((buf.len() - sent).div_ceil(pas.max(1))) as u64;
+            let pause = (cible / restants.max(1)).clamp(10, 120);
+            std::thread::sleep(Duration::from_millis(pause));
+        }
     }
     let (st1, _) = read_response(&mut a);
     assert_eq!(st1, "200", "la requête 1 doit réussir");
