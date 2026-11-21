@@ -244,7 +244,7 @@ pub(crate) fn encode_nonce(nonce: &Nonce) -> String {
     out
 }
 
-/// Nonce neuf de 16 octets, tiré du générateur du **système**.
+/// Nonce neuf de 16 octets, tiré du CSPRNG du **système** (`getrandom`).
 pub(crate) fn system_nonce() -> Nonce {
     super::system_bytes::<16>()
 }

@@ -47,6 +47,23 @@ fn unique_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// Dossier de registre partagé, prêt pour l'annonce : sous Unix le crate
+/// n'accepte qu'un répertoire `0700` qui nous appartient. `create_dir_all`
+/// seul le créerait en `0755` (umask) au premier passage — le test pose donc
+/// lui-même le mode que le serveur exige, au lieu de dépendre de l'ordre
+/// d'exécution des tests (un autre binaire de test peut avoir créé le
+/// dossier avant).
+fn preparer_registre() -> PathBuf {
+    let registry = litemcp::registry::registry_dir();
+    fs::create_dir_all(&registry).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    registry
+}
+
 /// PID étranger plausible (jamais le nôtre).
 fn foreign_pid() -> u64 {
     u64::from(u32::MAX - 1)
@@ -332,8 +349,7 @@ fn bind_non_loopback_est_probee_sur_l_adresse_publiee_et_conservee() {
 
 #[test]
 fn l_annonce_reelle_publie_adresse_et_identite_puis_est_retiree() {
-    let registry = litemcp::registry::registry_dir();
-    fs::create_dir_all(&registry).unwrap();
+    let registry = preparer_registre();
     let name = format!(
         "ztest-regvie-e2e-{}-{}",
         std::process::id(),
@@ -482,8 +498,7 @@ fn handler_terminant_pendant_le_drain_est_compte_zero() {
 
 #[test]
 fn annonces_et_retraits_concurrents_ne_detruisent_pas_la_plus_recente() {
-    let registry = litemcp::registry::registry_dir();
-    fs::create_dir_all(&registry).unwrap();
+    let registry = preparer_registre();
     let name = format!(
         "ztest-regvie-race-{}-{}",
         std::process::id(),
@@ -536,8 +551,7 @@ fn annonces_et_retraits_concurrents_ne_detruisent_pas_la_plus_recente() {
 
 #[test]
 fn le_retrait_d_une_instance_ne_supprime_pas_l_annonce_d_une_autre_du_meme_port() {
-    let registry = litemcp::registry::registry_dir();
-    fs::create_dir_all(&registry).unwrap();
+    let registry = preparer_registre();
     let name = format!(
         "ztest-regvie-retract-id-{}-{}",
         std::process::id(),

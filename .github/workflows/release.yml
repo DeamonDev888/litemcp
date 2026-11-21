@@ -8,8 +8,8 @@
 #      macros = exigence exacte de la dépendance, section CHANGELOG présente)
 #      PUIS gate qualité (fmt workspace, clippy -D warnings, tests all-features
 #      ET sans features par défaut, chaque feature isolée, doc rustdoc stricte
-#      RUSTDOCFLAGS=-D warnings, contenu des deux paquets — scripts/release.ps1) ;
-#   2. `publish` — publication crates.io IDEMPOTENTE via scripts/release.ps1
+#      RUSTDOCFLAGS=-D warnings, contenu des deux paquets — crate `release-tool`) ;
+#   2. `publish` — publication crates.io IDEMPOTENTE via l'outil `release-tool`
 #      : litemcp-macros d'abord, puis litemcp ; le job REVALIDE lui-même les
 #      versions (`cargo metadata`) juste avant le premier `cargo publish`,
 #      l'API crates.io est interrogée avec distinction stricte 200/404/autre —
@@ -66,14 +66,13 @@ jobs:
           VERSION_INPUT: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          # Le tag est dérivé par le script depuis GITHUB_REF (aucun indicateur
+          # Le tag est dérivé par l'outil depuis GITHUB_REF (aucun indicateur
           # optionnel : un tag présent ne peut pas être ignoré en silence).
-          # Aucun argument vide n'est transmis — `pwsh -File script.ps1 -Param ""`
-          # n'est pas portable (Windows PowerShell 5.1 supprime l'argument vide
-          # et la liaison échoue en « argument manquant »).
+          # Aucun argument vide n'est transmis : un input vide s'apparenterait
+          # à un indicateur absent, jamais à un contrôle vidé.
           ARGS=(check)
-          if [ -n "$VERSION_INPUT" ]; then ARGS+=(-InputVersion "$VERSION_INPUT"); fi
-          V=$(pwsh -NoProfile -File scripts/release.ps1 "${ARGS[@]}" \
+          if [ -n "$VERSION_INPUT" ]; then ARGS+=(--input-version "$VERSION_INPUT"); fi
+          V=$(cargo run --quiet -p release-tool -- "${ARGS[@]}" \
             | sed -n 's/^version=//p' | tail -1)
           if [ -z "$V" ]; then
             echo "coherence non resolue — abandon avant tout test et toute publication"
@@ -82,10 +81,11 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "version a publier : $V"
 
-      # Gate qualité : fmt workspace + clippy strict + tests + doc + contenu
-      # des paquets. Chaque étape court-circuite le pipeline.
-      - name: Gate qualite (fmt, clippy, tests, doc, paquets)
-        run: pwsh -NoProfile -File scripts/release.ps1 verify
+      # Gate qualité : simulations du pipeline + fmt workspace + clippy strict
+      # + tests + matrice de features + doc + contenu des paquets. Chaque
+      # étape court-circuite le pipeline.
+      - name: Gate qualite (simulations, fmt, clippy, tests, doc, paquets)
+        run: cargo run --quiet -p release-tool -- verify
 
   publish:
     name: Publier sur crates.io (macros puis racine)
@@ -120,8 +120,8 @@ jobs:
         run: |
           set -euo pipefail
           ARGS=(check)
-          if [ -n "$VERSION_INPUT" ]; then ARGS+=(-InputVersion "$VERSION_INPUT"); fi
-          V=$(pwsh -NoProfile -File scripts/release.ps1 "${ARGS[@]}" \
+          if [ -n "$VERSION_INPUT" ]; then ARGS+=(--input-version "$VERSION_INPUT"); fi
+          V=$(cargo run --quiet -p release-tool -- "${ARGS[@]}" \
             | sed -n 's/^version=//p' | tail -1)
           if [ -z "$V" ]; then
             echo "coherence non resolue — abandon avant toute publication"
@@ -142,7 +142,7 @@ jobs:
       - name: Publier sur crates.io (idempotent, erreurs reseau non masquees)
         env:
           CARGO_REGISTRY_TOKEN: ${{ env.HAS_REGISTRY_TOKEN == 'true' && secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
-        run: pwsh -NoProfile -File scripts/release.ps1 publish -Version ${{ steps.recheck.outputs.version }}
+        run: cargo run --quiet -p release-tool -- publish --version ${{ steps.recheck.outputs.version }}
 
   github-release:
     name: Release GitHub

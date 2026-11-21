@@ -135,6 +135,15 @@ fn published_root_kind(root: &Value) -> String {
 
 impl ServerBuilder {
     /// Nouveau builder — `name`/`version` sont les `serverInfo` MCP.
+    ///
+    /// # Panique
+    ///
+    /// Tire **ici** la clé HMAC par défaut des `requestState`
+    /// (`request_state::harvest_key`, `getrandom`) : si le système
+    /// n'a pas d'entropie disponible (seccomp, cible non supportée), la
+    /// construction panique — même si l'appelant compte fournir sa propre clé
+    /// avec `request_state_key`. Sur une cible sans CSPRNG, fournir la clé
+    /// n'est pas une option : le crate n'a pas de repli faible par choix.
     #[must_use]
     pub fn new(name: &str, version: &str) -> Self {
         Self {
@@ -364,7 +373,8 @@ impl ServerBuilder {
     ///
     /// Le cycle est entièrement stateless : tout ce qui traverse les tours
     /// tient dans le `requestState` signé (HMAC-SHA256, TTL, liaison
-    /// méthode/paramètres/id) que le client renvoie octet pour octet avec un
+    /// méthode/paramètres saillants/tour, identité de l'appelant sous
+    /// autorisation) que le client renvoie octet pour octet avec un
     /// **id JSON-RPC différent** — aucune dépendance à une connexion, une
     /// session ou un process ; le rejeu peut atterrir sur une autre instance
     /// partageant la clé. Les autres arguments (`tool`, `tool_typed`…) ne
@@ -684,14 +694,16 @@ impl ServerBuilder {
     ///
     /// Par défaut (liste vide), seules les **autorités locales** sont
     /// acceptées : l'adresse IP effective du listener, un littéral de
-    /// bouclage (`127.0.0.0/8`, `::1`, avec ou sans port) et les noms courts
-    /// non qualifiés (`localhost`, `mon-service`, `test`). Tout nom
-    /// pleinement qualifié (`mcp.exemple.com`) ou littéral d'adresse
-    /// étranger (`10.1.2.3`) est refusé en `421`. La règle s'appuie sur ce
-    /// que le DNS rebinding **exige** : un nom résolvable depuis l'internet
-    /// public, toujours qualifié (au moins un point) — un nom court ou un
-    /// littéral de bouclage ne peut pas être détourné par un enregistrement
-    /// DNS public.
+    /// bouclage (`127.0.0.0/8`, `::1`, avec ou sans port) et **tout nom sans
+    /// point** — la règle locale teste littéralement l'absence de `.`, donc
+    /// un nom court non qualifié (`localhost`, `mon-service`, `test`) passe
+    /// quel que soit son libellé. Tout nom **pleinement qualifié**, c'est-à-
+    /// dire contenant au moins un point (`mcp.exemple.com`), ou tout littéral
+    /// d'adresse étranger (`10.1.2.3`) est refusé en `421 Misdirected
+    /// Request`. La règle s'appuie sur ce que le DNS rebinding **exige** : un
+    /// nom résolvable depuis l'internet public, toujours qualifié (au moins
+    /// un point) — un nom court ou un littéral de bouclage ne peut pas être
+    /// détourné par un enregistrement DNS public.
     ///
     /// Une liste non vide **s'ajoute** aux autorités locales ci-dessus
     /// (elle ne les remplace pas : une configuration explicite ne doit pas
@@ -1715,7 +1727,8 @@ impl ServerBuilder {
         listener: std::net::TcpListener,
     ) -> std::io::Result<crate::http::BoundServer> {
         // Anti-zombie : le sweep du registre partagé précède notre propre
-        // annonce — le dossier est propre au moment où nous y publions.
+        // annonce — le dossier est validé avant lecture (rapport vide s'il
+        // est hostile ou absent), donc propre au moment où nous y publions.
         let zombie = if self.anti_zombie {
             Some(Arc::new(crate::antizombie::ZombieState::new(
                 crate::antizombie::sweep_registry(),

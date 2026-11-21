@@ -448,3 +448,84 @@ fn a_json_client_never_sees_a_cancellation() {
         "le handler ne doit voir aucune annulation sur le chemin JSON"
     );
 }
+
+/// Le budget d'écriture ne borne **pas la durée de vie** du flux : un handler
+/// plus long que `write_deadline` qui rapporte garde son flux **et** sa
+/// réponse finale. Seul le temps réellement passé à écrire est décompté —
+/// sinon `no_tool_timeout()` deviendrait inutilisable dès qu'un outil dépasse
+/// le budget (client sain, flux coupé, réponse perdue).
+#[test]
+fn un_handler_long_garde_son_flux_et_sa_reponse() {
+    let annule = std::sync::Arc::new(AtomicBool::new(false));
+    let vu_annulation = annule.clone();
+    let addr = spawn(
+        ServerBuilder::new("echeance-sse", "1.0.0")
+            .write_deadline(Duration::from_secs(1))
+            .no_tool_timeout()
+            .tool_result("rapporte", "Rapporte après l'échéance", move |_args| {
+                assert!(
+                    litemcp::progress::report(0.0, Some(100.0), None),
+                    "première émission dans le budget"
+                );
+                std::thread::sleep(Duration::from_millis(1300));
+                let seconde = litemcp::progress::report(50.0, Some(100.0), None);
+                vu_annulation.store(litemcp::cancel::is_cancelled(), Ordering::SeqCst);
+                assert!(
+                    seconde,
+                    "le silence du handler ne consomme pas le budget d'écriture"
+                );
+                Ok(litemcp::protocol::CallToolResult::from_content([
+                    litemcp::protocol::ContentBlock::text("fin"),
+                ]))
+            }),
+    );
+    let request = tool_call("rapporte", Some("tok-echeance"));
+    let body = request.to_string();
+    let raw = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\
+         MCP-Protocol-Version: {PROTOCOL_VERSION}\r\nMcp-Method: tools/call\r\n\
+         Mcp-Name: rapporte\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(addr).expect("connexion");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout de lecture");
+    stream.write_all(raw.as_bytes()).expect("écriture");
+
+    // Lecture jusqu'à la fermeture du flux.
+    let mut recu = String::new();
+    let mut tampon = [0u8; 1024];
+    loop {
+        match stream.read(&mut tampon) {
+            Ok(0) => break,
+            Ok(n) => recu.push_str(&String::from_utf8_lossy(&tampon[..n])),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                break;
+            }
+            Err(error) => panic!("lecture du flux : {error}"),
+        }
+    }
+
+    let (head, flux) = recu.split_once("\r\n\r\n").expect("tête HTTP complète");
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    assert!(
+        flux.contains("\"result\""),
+        "la réponse finale doit être écrite malgré le dépassement du budget : {flux}"
+    );
+    assert_eq!(
+        progress_events(&events(flux)).len(),
+        2,
+        "les deux émissions (avant et après le silence) doivent partir : {flux}"
+    );
+    assert!(
+        !annule.load(Ordering::SeqCst),
+        "un handler long vers un client qui lit ne doit pas être annulé"
+    );
+}

@@ -31,7 +31,10 @@ const TRANCHE_ECRITURE: usize = 256 * 1024;
 /// Budget minimal armable sur une tentative : une échéance plus courte est
 /// déjà expirée (un `set_write_timeout` nul est refusé par le système, et
 /// arrondi à zéro il vaudrait « infini » sur certaines plateformes).
-const PAS_MIN_ECRITURE: Duration = Duration::from_millis(1);
+///
+/// Partagé avec le canal SSE ([`super::sse`]), qui applique la même règle
+/// aux événements de progression.
+pub(super) const PAS_MIN_ECRITURE: Duration = Duration::from_millis(1);
 
 /// Ferme une socket **sans perdre la réponse déjà écrite**.
 ///
@@ -445,8 +448,8 @@ fn longueur_totale(bufs: &[IoSlice<'_>]) -> usize {
 }
 
 /// Erreur d'échéance d'écriture — `TimedOut`, que l'appelant traite comme une
-/// connexion à fermer.
-fn echeance_depassee() -> std::io::Error {
+/// connexion à fermer. Partagée avec le canal SSE ([`super::sse`]).
+pub(super) fn echeance_depassee() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::TimedOut,
         "response write deadline exceeded",

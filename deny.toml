@@ -6,3 +6,14 @@
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # RUSTSEC-2026-0009 — `time` < 0.3.47 : DoS par épuisement de pile à la
+    # lecture d'une entrée RFC 2822 hostile. Seule voie d'entrée du graphe :
+    # `rcgen` (feature `tls`, via `time`/`yasna`) — et rcgen ne PARSE pas
+    # d'entrée 2822 fournie par un client, il FORMATE les dates des
+    # certificats que le serveur génère lui-même : le chemin vulnérable
+    # n'est pas atteignable depuis le crate. La version corrigée (0.3.47)
+    # exige Rust 1.88 alors que le MSRV déclaré est 1.85 (README, job msrv
+    # de la CI) : l'entrée d'ignore est levée au prochain relèvement de MSRV.
+    "RUSTSEC-2026-0009",
+]

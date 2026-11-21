@@ -82,7 +82,8 @@ jobs:
         # fichier de verrouillage à respecter.
         # `--features schemars` : publie `json_schema_2020_12_tool` (scénario
         # pending, non scoré) depuis le document JSON Schema 2020-12 brut — la
-        # feature reste opt-in, le cœur garde serde + serde_json seuls.
+        # feature reste opt-in, le cœur garde ses trois dépendances directes
+        # (serde, serde_json, getrandom).
         run: cargo build --release --example conformance_server --features schemars
 
       - name: Démarrage de la fixture (arrière-plan)

@@ -9,10 +9,11 @@
 //!   4. la notification du tuto part après la release GitHub, jamais avant ;
 //!   5. le job `publish` revalide lui-même les versions (`cargo metadata`)
 //!      juste avant le premier `cargo publish`, sans dépendre de l'ordre des
-//!      jobs, et n'invoque jamais le script avec une variable de version vide
-//!      (une liaison `-Param ""` dépend de l'hôte qui lance PowerShell) ; le
-//!      tag n'est jamais passé en argument : le script le dérive de `GITHUB_REF`
-//!      (source unique, un tag présent ne peut pas être ignoré en silence) ;
+//!      jobs, et ne transmet jamais d'argument vide (liste `ARGS=(check)`,
+//!      `--input-version` ajouté seulement si l'input du break-glass est non
+//!      vide) ; le tag n'est jamais passé en argument : l'outil le dérive de
+//!      `GITHUB_REF` (source unique, un tag présent ne peut pas être ignoré
+//!      en silence) ;
 //!   6. les licences MIT/Apache accompagnent le paquet `litemcp-macros` ;
 //!   7. la CI exécute la **matrice de features** (`--no-default-features`,
 //!      chaque feature isolée) et construit la doc avec `RUSTDOCFLAGS=-D
@@ -33,7 +34,13 @@ fn workspace() -> PathBuf {
 
 /// Contenu d'un workflow, ou `None` si `.github/` n'est pas présent (paquet).
 fn workflow(name: &str) -> Option<String> {
-    std::fs::read_to_string(workspace().join(".github").join("workflows").join(name)).ok()
+    // Normalisation CRLF → LF : un checkout Windows (`core.autocrlf=true`,
+    // image des runners windows-latest) écrit des CRLF dans les fichiers LF du
+    // dépôt — les assertions littérales multi-lignes ci-dessous ne doivent pas
+    // dépendre de la plateforme de checkout (échec CI 2026-11-19, job windows).
+    std::fs::read_to_string(workspace().join(".github").join("workflows").join(name))
+        .ok()
+        .map(|text| text.replace("\r\n", "\n"))
 }
 
 fn indent_of(line: &str) -> usize {
@@ -326,9 +333,9 @@ fn publish_job_rechecks_versions_before_publishing() {
                  avant le premier cargo publish"
             )
         });
-        let publication = job
-            .find("release.ps1 publish")
-            .unwrap_or_else(|| panic!("{name} : le job publish doit publier via release.ps1"));
+        let publication = job.find("release-tool -- publish").unwrap_or_else(|| {
+            panic!("{name} : le job publish doit publier via l'outil release-tool")
+        });
         assert!(
             check < publication,
             "{name} : la revalidation doit précéder la publication"
@@ -337,8 +344,8 @@ fn publish_job_rechecks_versions_before_publishing() {
 
     let verify = job_block(&release, "verify").expect("job verify présent");
     assert!(
-        verify.contains("release.ps1 verify"),
-        "release.yml : le gate verify doit exécuter le script partagé"
+        verify.contains("release-tool -- verify"),
+        "release.yml : le gate verify doit exécuter l'outil partagé"
     );
     assert!(
         verify.contains("ARGS=(check)"),
@@ -351,21 +358,16 @@ fn workflows_never_pass_an_empty_version_argument() {
     let Some((release, publish)) = assert_workflows_available() else {
         return;
     };
-    // `pwsh -File script.ps1 -Param ""` n'est pas portable : Windows
-    // PowerShell 5.1 supprime l'argument vide et la liaison échoue en
-    // « argument manquant ». Les workflows construisent donc la liste
-    // d'arguments et n'ajoutent que les valeurs non vides ; le tag, lui, est
-    // lu par le script depuis `GITHUB_REF` — jamais recopié en argument.
+    // Le tag vient TOUJOURS de `GITHUB_REF` (dérivé par l'outil, jamais
+    // recopié en argument : un tag présent ne peut pas être ignoré en
+    // silence), et aucun argument vide n'est transmis — la liste `ARGS=(check)`
+    // n'ajoute `--input-version` que si l'input du break-glass est non vide.
     for (name, text) in [("release.yml", &release), ("publish.yml", &publish)] {
-        for forbidden in [
-            "-TagVersion",
-            "release.ps1 check -InputVersion",
-            "release.ps1 check -TagVersion",
-        ] {
+        for forbidden in ["--tag-version", "--input-version \"\"", "release.ps1"] {
             assert!(
                 !text.contains(forbidden),
                 "{name} : `{forbidden}` ne doit pas apparaître (le tag vient de GITHUB_REF, \
-                 les arguments vides ne sont jamais transmis)"
+                 les arguments vides ne sont jamais transmis, plus aucun reste du PowerShell)"
             );
         }
         assert!(
@@ -420,17 +422,19 @@ fn feature_matrix_is_enforced_in_ci_and_release_gate() {
         );
     }
 
-    // `scripts/` est exclu du paquet crates.io : dans une crate empaquetée,
-    // le gate de release n'est pas là et l'assertion est sans objet.
-    let Ok(release) = std::fs::read_to_string(workspace().join("scripts").join("release.ps1"))
+    // `release-tool/` est un membre du workspace, pas une dépendance du
+    // paquet publié : dans une crate empaquetée, le gate n'est pas là et
+    // l'assertion est sans objet.
+    let Ok(release) =
+        std::fs::read_to_string(workspace().join("release-tool").join("src").join("lib.rs"))
     else {
-        eprintln!("scripts/release.ps1 absent (paquet crates.io) — assertion ignorée");
+        eprintln!("release-tool absent (paquet crates.io) — assertion ignorée");
         return;
     };
     for command in COMMANDS {
         assert!(
             release.contains(command),
-            "release.ps1 (verify) : la matrice de features doit exécuter `{command}`"
+            "release-tool (verify) : la matrice de features doit exécuter `{command}`"
         );
     }
 }
@@ -492,18 +496,22 @@ fn rustdoc_warnings_are_denied_in_ci_and_release_gate() {
         "ci.yml : la doc doit couvrir tout le workspace"
     );
 
-    let Ok(release) = std::fs::read_to_string(workspace().join("scripts").join("release.ps1"))
+    // L'implémentation du gate vit dans la crate `release-tool` (membre du
+    // workspace, hors du paquet publié) : la variable d'environnement et la
+    // commande y sont figées, comme dans l'ancien script.
+    let Ok(release) =
+        std::fs::read_to_string(workspace().join("release-tool").join("src").join("lib.rs"))
     else {
-        eprintln!("scripts/release.ps1 absent (paquet crates.io) — assertion ignorée");
+        eprintln!("release-tool absent (paquet crates.io) — assertion ignorée");
         return;
     };
     assert!(
-        release.contains("$env:RUSTDOCFLAGS = '-D warnings'"),
-        "release.ps1 : le gate de doc doit poser RUSTDOCFLAGS=-D warnings"
+        release.contains("RUSTDOCFLAGS"),
+        "release-tool : le gate de doc doit poser RUSTDOCFLAGS=-D warnings"
     );
     assert!(
         release.contains("cargo doc --workspace --no-deps --all-features"),
-        "release.ps1 : le gate de doc doit couvrir tout le workspace"
+        "release-tool : le gate de doc doit couvrir tout le workspace"
     );
 }
 

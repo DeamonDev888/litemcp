@@ -1367,10 +1367,16 @@ pub(super) fn handle_connection(stream: Conn, env: ConnectionEnv<'_>) -> std::io
                 // la première écriture SSE qui échoue le lève, et le handler
                 // sort à son prochain point sûr (voir [`crate::cancel`]).
                 let cancellation = CancelToken::new();
+                // **Budget d'écriture du flux** : `write_budget`, le même que
+                // pour la réponse finale, mais compté en temps passé à
+                // écrire (voir [`SseProgressChannel`]) — pas en durée de vie,
+                // sinon un handler long qui progresse se ferait couper. Sous
+                // `no_tool_timeout()`, c'est la seule borne des émissions.
                 let channel = Arc::new(SseProgressChannel::new(
                     stream.try_clone()?,
                     token,
                     cancellation.clone(),
+                    write_budget,
                 ));
                 let dispatch_result = {
                     let _cancel = crate::cancel::bind(Some(cancellation));

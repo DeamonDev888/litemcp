@@ -41,12 +41,13 @@
 //! (`key_unknown`, `key_revoked`, `signature_invalid`) ne servent qu'au
 //! journal de l'application.
 //!
-//! # Écart assumé avec `docs/auth.md` §10.2
+//! # Aléa
 //!
-//! Le nonce est tiré de [`std::collections::hash_map::RandomState`], dont les
-//! graines viennent du système d'exploitation (c'est déjà la source des clés
-//! HMAC de `crate::request_state`) : `getrandom` n'est pas une dépendance
-//! directe du crate. Aucun générateur ensemencé, aucune horloge comme graine.
+//! Les nonces viennent du **CSPRNG du système d'exploitation** (`getrandom`),
+//! comme les clés Ed25519 et la clé HMAC de `crate::request_state`. Aucun
+//! générateur ensemencé, aucune horloge comme graine : `RandomState` (SipHash)
+//! n'est pas un générateur de clés — la std n'en tire les graines qu'une fois
+//! par fil, et l'algorithme n'est pas spécifié.
 //!
 //! # Exemple
 //!
@@ -945,26 +946,18 @@ pub(crate) fn ct_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-/// Octets du **générateur du système**.
+/// Octets du **CSPRNG du système d'exploitation** (`getrandom`).
 ///
-/// [`std::collections::hash_map::RandomState`] tire une graine neuve du système
-/// d'exploitation à chaque construction (c'est la source que
-/// [`crate::request_state::harvest_key`] emploie déjà) ; chaque mot de 8 octets
-/// est produit par un état indépendant, donc aucun générateur ensemencé ni
-/// aucune horloge n'intervient. Voir l'écart documenté en tête de module.
+/// Source des clés Ed25519 et des nonces : l'API d'entropie de l'OS, sans
+/// générateur ensemencé ni horloge. Voir la section « Aléa » du module.
+///
+/// # Panique
+///
+/// Panique si l'OS ne fournit pas d'entropie : un serveur qui ne peut pas
+/// tirer une clé ne doit pas démarrer avec une clé faible.
 pub(crate) fn system_bytes<const N: usize>() -> [u8; N] {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
     let mut out = [0u8; N];
-    for (index, slot) in out.chunks_mut(8).enumerate() {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u64(index as u64);
-        let word = hasher.finish().to_le_bytes();
-        for (target, byte) in slot.iter_mut().zip(word.iter()) {
-            *target = *byte;
-        }
-    }
+    getrandom::fill(&mut out).expect("the OS entropy source must provide keys and nonces");
     out
 }
 

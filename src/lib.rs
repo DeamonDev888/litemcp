@@ -24,10 +24,10 @@
 //!
 //! Pour les schémas que le DSL n'exprime pas (`oneOf`, `not`,
 //! `patternProperties`…), la feature `schemars` fournit
-//! [`from_json_schema`](crate::schemars::from_json_schema) : un document
-//! JSON Schema écrit à la main, publié tel quel **et** appliqué. La feature `schemars`
-//! adapte en plus n'importe quel type `#[derive(JsonSchema)]`
-//! ([`crate::schemars`]) avec les sémantiques JSON Schema de bout en bout.
+//! `from_json_schema` (`crate::schemars::from_json_schema`) : un document
+//! JSON Schema écrit à la main, publié tel quel **et** appliqué. La feature
+//! `schemars` adapte en plus n'importe quel type `#[derive(JsonSchema)]` via
+//! `crate::schemars`, avec les sémantiques JSON Schema de bout en bout.
 //!
 //! Trois surfaces MCP : **outils** (`tools/*`), **ressources**
 //! (`resources/*`) et **prompts** (`prompts/*`) — chaque handler est borné

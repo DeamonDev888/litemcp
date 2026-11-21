@@ -82,9 +82,14 @@ type HandlerJob = Box<dyn FnOnce() + Send + 'static>;
 /// État partagé de la file de handlers.
 struct FileHandlers {
     jobs: std::collections::VecDeque<HandlerJob>,
-    /// Fils **au repos** (effectivement en attente sur la condition). Un fil
-    /// occupé n'y figure jamais : `run` peut donc s'y fier pour ne pas mettre
-    /// un job en file derrière un fil qui travaille.
+    /// Fils **au repos** : nombre de fils qui consommeront un job déposé
+    /// dans `jobs`. Un worker s'y compte **en tenant le verrou**, avant de se
+    /// mettre en attente, et s'en retire (toujours sous le verrou, avant de
+    /// le relâcher) dès qu'il en sort — pour prendre un job ou pour se
+    /// rendormir. Un fil occupé n'y figure donc jamais.
+    ///
+    /// Invariant exploité par `run` : `jobs.len() < attente` ⇒ le job déposé
+    /// trouve preneur immédiatement, sans attendre la fin d'un autre handler.
     attente: usize,
     /// Le cache a été détruit : les fils au repos sortent à leur réveil.
     ferme: bool,
@@ -126,26 +131,35 @@ impl HandlerPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Confie `job` à un fil au repos, sinon à un fil neuf.
+    /// Confie `job` à un fil au repos **libre**, sinon à un fil neuf.
     ///
-    /// Le job n'attend **jamais** un fil occupé : sans fil au repos, un fil
-    /// est créé (résident tant que le plafond le permet, éphémère ensuite).
-    /// Cette règle est ce qui garde `tool_timeout` honnête — une attente en
-    /// file entrerait dans le délai et couperait un handler innocent.
+    /// Le job n'attend **jamais** un fil occupé : sans fil au repos libre, un
+    /// fil est créé (résident tant que le plafond le permet, éphémère
+    /// ensuite). Cette règle est ce qui garde `tool_timeout` honnête — une
+    /// attente en file entrerait dans le délai et couperait un handler
+    /// innocent.
     fn run(&self, job: HandlerJob) {
         let mut etat = self.etat();
         if !etat.ferme {
-            if etat.attente > 0 {
-                // Un fil est **au repos** : il se réveille et se retire du
-                // compte lui-même en sortant de l'attente (voir `worker`).
+            // « Libre » et non « existant » : `attente` ne comptabilise un
+            // fil qu'il ne consommera pas encore, un fil déjà promis au job
+            // précédent reste compté jusqu'à son réveil. Tester `attente > 0`
+            // seul enfilait alors un second job derrière ce fil, qui le
+            // servait après le premier — le délai du second courait sans que
+            // son handler ait jamais démarré. `jobs.len() < attente` garantit
+            // au contraire un preneur immédiat (invariant de `FileHandlers`).
+            if etat.jobs.len() < etat.attente {
+                // Un fil est **au repos** et libre : il se réveille et se
+                // retire du compte lui-même en sortant de l'attente (voir
+                // `worker`).
                 etat.jobs.push_back(job);
                 drop(etat);
                 self.queue.1.notify_one();
                 return;
             }
-            // Aucun fil au repos : en créer un avant d'enfiler, pour qu'un
-            // échec de création retombe sur le fil éphémère (jamais sur un
-            // job enfilé que personne ne servirait).
+            // Aucun fil au repos **libre** : en créer un avant d'enfiler,
+            // pour qu'un échec de création retombe sur le fil éphémère
+            // (jamais sur un job enfilé que personne ne servirait).
             if self.resident.load(std::sync::atomic::Ordering::Acquire) < self.max_resident {
                 let queue = Arc::clone(&self.queue);
                 let resident = Arc::clone(&self.resident);
@@ -195,6 +209,11 @@ fn worker(
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Le fil se compte au repos **sous le verrou**, avant d'attendre :
+            // dès cet instant `run` peut lui destiner un job, un job déposé
+            // dans `jobs` sera consommé par lui au réveil (invariant de
+            // `FileHandlers::attente`, seul fondement du test
+            // `jobs.len() < attente` dans `run`).
             etat.attente += 1;
             while etat.jobs.is_empty() && !etat.ferme {
                 etat = queue
@@ -203,9 +222,14 @@ fn worker(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
             // Sortie de l'attente : le fil n'est plus au repos, qu'il prenne
-            // un job ou se rendorme. Un fil **occupé** n'est donc jamais
-            // compté comme disponible — c'est ce qui évite qu'un job attende
-            // derrière un autre et voie l'attente entrer dans son délai.
+            // un job ou se rendorme. Le `continue` ci-dessous **relâche** le
+            // `MutexGuard` (il quitte la portée du bloc) : `attente` peut donc
+            // valoir 0 un instant avant que le fil ne se recompte au tour
+            // suivant — la décrémentation et le recomptage ne sont pas
+            // atomiques. L'invariant tient quand même : `attente` ne désigne
+            // jamais un fil **occupé** (décrémenté sous le verrou), et un
+            // `run` qui voit 0 crée un fil au lieu d'enfiler derrière un fil
+            // occupé.
             etat.attente -= 1;
             if etat.jobs.is_empty() {
                 if etat.ferme {
@@ -403,5 +427,130 @@ mod tests_limites_2026_10_25 {
         assert!(matches!(second, Outcome::Done(2)));
         barriere.wait();
         assert!(matches!(occupe.join().unwrap(), Outcome::Done(1)));
+    }
+
+    /// Rafale de deux jobs sur un seul fil au repos : le second ne doit pas
+    /// attendre la fin du premier. Sans le correctif, `run` enfilait les deux
+    /// (le worker ne décrémente `attente` qu'à son réveil) : le second voyait
+    /// son délai courir alors que son handler n'avait jamais démarré, et
+    /// rendait `TimedOut`.
+    ///
+    /// Reproduction de la fenêtre : le fil de test garde le verrou de la
+    /// file, les deux `run_with_timeout` s'y bloquent, puis il est relâché —
+    /// les deux `run` passent alors avant que le worker (encore dans `wait`,
+    /// non notifié) ne se réveille. L'ordonnancement ne laisse la fenêtre
+    /// ouverte qu'irrégulièrement : si la course ne se produit pas (le worker
+    /// se réveille avant le second `run`, qui crée alors un fil), le test
+    /// reste vert — il ne prouve simplement rien de plus, et ne doit pas
+    /// échouer pour autant.
+    ///
+    /// `un_job_deja_en_file_ne_rend_pas_le_fil_au_repos_disponible` épingle
+    /// la même règle sans dépendre de l'ordonnancement.
+    #[test]
+    fn une_rafale_de_deux_jobs_ne_serialise_pas_le_second_derriere_le_premier() {
+        let pool = Arc::new(HandlerPool::new(MAX_RESIDENT_HANDLERS));
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Le premier handler dort bien au-delà du budget du second : s'il est
+        // mis en file derrière lui, le second rend `TimedOut` à coup sûr,
+        // tandis que le budget laisse de la marge à la création d'un fil.
+        const DORT: Duration = Duration::from_millis(400);
+        const BUDGET: Duration = Duration::from_millis(300);
+
+        // Amorce : un job trivial fait naître le fil résident, qui revient au
+        // repos. `attente > 0` sous le verrou = un fil prêt à consommer.
+        assert!(matches!(
+            run_with_timeout(&pool, Duration::from_secs(5), &inflight, 8, || ()),
+            Outcome::Done(())
+        ));
+        let mut tours = 0;
+        loop {
+            let au_repos = pool.etat().attente;
+            if au_repos > 0 {
+                break;
+            }
+            tours += 1;
+            assert!(tours < 1_000_000, "aucun fil au repos après l'amorçage");
+            std::thread::yield_now();
+        }
+
+        // Verrou de la file pris par le fil de test : les deux `run` suivants
+        // s'y bloquent et n'entrent qu'une fois qu'il est relâché.
+        let verrou = pool.etat();
+        let barriere = Arc::new(std::sync::Barrier::new(3));
+        let lancer = |dort: Option<Duration>, budget: Duration| {
+            let pool = Arc::clone(&pool);
+            let inflight = Arc::clone(&inflight);
+            let barriere = Arc::clone(&barriere);
+            std::thread::spawn(move || {
+                barriere.wait();
+                run_with_timeout(&pool, budget, &inflight, 8, move || {
+                    if let Some(dort) = dort {
+                        std::thread::sleep(dort);
+                    }
+                    1u8
+                })
+            })
+        };
+        let premier = lancer(Some(DORT), Duration::from_secs(5));
+        let second = lancer(None, BUDGET);
+        barriere.wait();
+        // Les deux appels sont désormais en attente du verrou (le sleep les
+        // laisse l'atteindre) : on le relâche, ils passent tous les deux
+        // avant le réveil du worker.
+        std::thread::sleep(Duration::from_millis(50));
+        drop(verrou);
+
+        assert!(
+            matches!(premier.join().unwrap(), Outcome::Done(1)),
+            "le premier handler doit aboutir"
+        );
+        assert!(
+            matches!(second.join().unwrap(), Outcome::Done(1)),
+            "job enfilé derrière un fil occupé : son délai a couru sans qu'il démarre"
+        );
+    }
+
+    /// Épinglage **déterministe** de la même règle, sans dépendre de
+    /// l'ordonnancement : un job déjà déposé dans la file du fil au repos
+    /// (état exact de la fenêtre de course) ne rend pas ce fil disponible
+    /// pour autant. Le job suivant doit partir sur un fil créé pour lui.
+    ///
+    /// L'état est construit sous le verrou — un job lent en file, `attente`
+    /// encore à 1 — là où la rafale concurrente ci-dessus ne retombe dans la
+    /// fenêtre que par intermittence : sans le correctif, le job de test est
+    /// enfilé derrière le job lent et son délai court avant tout démarrage.
+    #[test]
+    fn un_job_deja_en_file_ne_rend_pas_le_fil_au_repos_disponible() {
+        let pool = HandlerPool::new(MAX_RESIDENT_HANDLERS);
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Amorce : un job trivial fait naître le fil résident, qui revient au
+        // repos (`attente > 0` sous le verrou = un fil qui consommera un job).
+        assert!(matches!(
+            run_with_timeout(&pool, Duration::from_secs(5), &inflight, 8, || ()),
+            Outcome::Done(())
+        ));
+        let mut tours = 0;
+        loop {
+            let au_repos = pool.etat().attente;
+            if au_repos > 0 {
+                break;
+            }
+            tours += 1;
+            assert!(tours < 1_000_000, "aucun fil au repos après l'amorçage");
+            std::thread::yield_now();
+        }
+        // Job lent déjà confié à ce fil, sans le réveiller : file non vide et
+        // `attente` encore incrémenté, exactement l'instant où un second job
+        // ne doit plus compter sur lui.
+        {
+            let mut etat = pool.etat();
+            etat.jobs
+                .push_back(Box::new(|| std::thread::sleep(Duration::from_millis(400))));
+        }
+        let outcome = run_with_timeout(&pool, Duration::from_millis(300), &inflight, 8, || 2u8);
+        assert!(
+            matches!(outcome, Outcome::Done(2)),
+            "job enfilé derrière un job déjà en file : son délai a couru sans qu'il démarre"
+        );
     }
 }

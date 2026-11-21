@@ -111,7 +111,8 @@ pub enum ToolOutcome {
     /// `2026-07-28`) : le noyau valide les requêtes embarquées (méthode
     /// embarquable + capacité client déclarée, sinon `-32021`), signe
     /// `state` en un `requestState` opaque (HMAC-SHA256, TTL, liaison
-    /// méthode/paramètres/id) et répond `resultType: "input_required"`.
+    /// méthode/paramètres saillants/tour, identité de l'appelant sous
+    /// autorisation) et répond `resultType: "input_required"`.
     InputRequired(InputRequiredSpec),
 }
 
@@ -155,7 +156,8 @@ pub enum ResourceOutcome {
 ///
 /// Entièrement stateless : tout ce qui traverse les tours voyage soit dans
 /// les réponses du client (non fiables), soit dans le `requestState` vérifié
-/// par le noyau (HMAC + TTL + liaison méthode/paramètres/id) — jamais dans
+/// par le noyau (HMAC + TTL + liaison méthode/paramètres saillants/tour,
+/// identité de l'appelant sous autorisation) — jamais dans
 /// un état de connexion, de session ou de process. Un rejeu peut atterrir
 /// sur une autre instance (même clé configurée) et reprendre.
 #[derive(Clone, Debug)]
@@ -634,8 +636,11 @@ struct GetPromptResultRef<'a> {
 
 /// Charge utile signée d'un jeton `requestState` MRTR — le plus petit état
 /// stateless compatible avec la spec : version du format, méthode liée,
-/// digest des paramètres saillants, tour, échéance UNIX et charge opaque du
+/// digest des paramètres saillants, identité de l'appelant quand
+/// l'autorisation est active, tour, échéance UNIX et charge opaque du
 /// handler. Signé (HMAC-SHA256), **pas chiffré** — n'y mettre aucun secret.
+///
+/// L'`id` JSON-RPC n'y figure pas : la spec exige un id différent au rejeu.
 #[derive(Serialize)]
 struct MrtrStatePayload<'a> {
     /// Version du format — toute autre valeur est refusée à la lecture.
@@ -644,6 +649,11 @@ struct MrtrStatePayload<'a> {
     method: &'a str,
     /// Digest des paramètres saillants d'origine (nom/arguments/uri).
     digest: &'a str,
+    /// Identité authentifiée de l'émetteur — présente uniquement quand
+    /// l'autorisation est active, et comparée à l'identité courante à la
+    /// reprise : un jeton émis pour A ne sert pas à B.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub: Option<&'a str>,
     /// Tour auquel le jeton a été émis — le rejeu reprend à `turn + 1`.
     turn: u32,
     /// Échéance UNIX (secondes) — `now >= exp` ⇒ refus (TTL court, spec).

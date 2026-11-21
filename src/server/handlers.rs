@@ -40,6 +40,30 @@ pub(super) fn sanitize_echo(raw: &str) -> String {
     out
 }
 
+/// Identité à graver dans un `requestState` MRTR.
+///
+/// `Ok(None)` quand l'autorisation est **inactive** : il n'y a pas d'identité
+/// à lier, le jeton reste rejouable librement (comportement historique).
+///
+/// Sous autorisation, une identité absente du fil est une **impasse** : le
+/// jeton partirait sans `sub` et `verify_mrtr` refuserait ensuite **tous** les
+/// rejeux (`sub` exigé) — le client ne pourrait jamais compléter son
+/// `input_required`. C'est un bogue serveur (l'appel vient d'un fil qui a
+/// perdu le contexte d'autorisation), rendu en `-32603` : rien ne part sur le
+/// fil.
+fn mrtr_subject(auth_actif: bool) -> Result<Option<String>, &'static str> {
+    if !auth_actif {
+        return Ok(None);
+    }
+    match auth::current() {
+        Some(context) => Ok(Some(context.client().to_string())),
+        None => Err(
+            "handler produced an input_required result on a thread without an authenticated \
+             client — the authorization context was lost before signing the requestState",
+        ),
+    }
+}
+
 /// Verdict d'une **erreur de schéma interne** (validateur exécuteur
 /// indisponible) : `-32603` avec un message neutre — jamais `-32602` (ce
 /// n'est pas la faute du client), jamais le détail interne (URL de schéma,
@@ -208,9 +232,10 @@ impl ServerCore {
     ///   vérifiable : refus net, le handler n'est pas atteint).
     /// * `requestState` présent → jeton vérifié (taille, structure
     ///   base64url, HMAC-SHA256, version, méthode liée, digest des
-    ///   paramètres saillants, tour, échéance) ou refus `-32602` — un état
-    ///   altéré, expiré, émis sous une autre clé ou lié à une autre requête
-    ///   n'atteint jamais le handler.
+    ///   paramètres saillants, identité de l'appelant sous autorisation,
+    ///   tour, échéance) ou refus `-32602` — un état altéré, expiré, émis
+    ///   sous une autre clé, lié à une autre requête ou émis pour un autre
+    ///   client n'atteint jamais le handler.
     /// * `inputResponses` présent → structure validée (objet de
     ///   valeurs-objets ; les clés non reconnues sont ignorées, comme le
     ///   permet la spec), sinon `-32602`.
@@ -280,6 +305,19 @@ impl ServerCore {
                 "requestState is bound to the original request — replay it with unchanged parameters",
             ));
         }
+        // Liaison à l'appelant : sous autorisation, le jeton n'est valable
+        // que pour le client authentifié qui l'a obtenu — B ne peut pas
+        // hériter de l'état (ni d'une décision) propre à A. Sans
+        // vérificateur, il n'y a pas d'identité à lier : `sub` est ignoré.
+        if self.auth_gate.is_some() {
+            let Some(bound_sub) = payload_obj.get("sub").and_then(Value::as_str) else {
+                return Err(invalid("requestState was not issued for this client"));
+            };
+            let current = auth::current();
+            if current.as_ref().map(AuthContext::client) != Some(bound_sub) {
+                return Err(invalid("requestState was issued for another client"));
+            }
+        }
         let turn = match payload_obj.get("turn").and_then(Value::as_u64) {
             Some(turn) if (1..=u64::from(u32::MAX)).contains(&turn) => turn as u32,
             _ => return Err(invalid("requestState payload turn is invalid")),
@@ -333,7 +371,8 @@ impl ServerCore {
     /// capacité absente → `-32021` avec la forme officielle
     /// `data.requiredCapabilities`). Frappe ensuite un `requestState`
     /// opaque signé (HMAC-SHA256, TTL, liaison méthode/paramètres
-    /// saillants/tour) portant l'état du handler — **aucun état de
+    /// saillants/tour, identité de l'appelant quand l'autorisation est
+    /// active) portant l'état du handler — **aucun état de
     /// connexion** n'est retenu : le rejeu peut atterrir sur toute instance
     /// partageant la clé.
     ///
@@ -426,7 +465,15 @@ impl ServerCore {
         }
         // 5. Jeton signé — le plus petit état stateless compatible : le
         //    jeton porte tout ce qu'il faut pour reprendre, rien ne vit en
-        //    dehors de lui (ni session, ni connexion, ni process).
+        //    dehors de lui (ni session, ni connexion, ni process). Sous
+        //    autorisation, l'identité de l'appelant entre dans le jeton :
+        //    un client B ne peut pas rejouer le jeton émis pour A. Identité
+        //    absente sous autorisation → refus immédiat (`-32603`) : un jeton
+        //    sans `sub` serait refusé à tous les rejeux (impasse).
+        let subject = match mrtr_subject(self.auth_gate.is_some()) {
+            Ok(subject) => subject,
+            Err(message) => return internal(message.to_string()),
+        };
         let digest = digest_salient(&salient_params(method, params));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -436,6 +483,7 @@ impl ServerCore {
             v: 1,
             method,
             digest: &digest,
+            sub: subject.as_deref(),
             turn: round.turn,
             exp: now.saturating_add(self.request_state_ttl.as_secs()),
             state: spec.state.as_ref(),
@@ -1415,5 +1463,46 @@ impl ServerCore {
             ),
             status,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sans autorisation, aucun `sub` n'entre dans le jeton : il n'y a pas
+    /// d'identité à lier, le jeton reste rejouable (chemin historique).
+    #[test]
+    fn sans_autorisation_le_jeton_ne_porte_pas_de_subject() {
+        assert_eq!(mrtr_subject(false), Ok(None));
+    }
+
+    /// Autorisation active mais identité absente du fil : refus explicite,
+    /// jamais un jeton sans `sub` (tous les rejeux seraient refusés — impasse
+    /// fonctionnelle pour le client).
+    #[test]
+    fn une_identite_absente_refuse_l_emission() {
+        assert!(
+            auth::current().is_none(),
+            "aucun contexte d'autorisation ne doit être lié dans ce fil de test"
+        );
+        let erreur = mrtr_subject(true).expect_err("un jeton sans sub est une impasse");
+        assert!(
+            erreur.contains("authenticated client"),
+            "message de bogue serveur attendu : {erreur}"
+        );
+    }
+
+    /// Autorisation active et identité liée : le `sub` est celui du client
+    /// authentifié ; sans autorisation, il reste ignoré même si un contexte
+    /// traîne sur le fil.
+    #[test]
+    fn sous_autorisation_le_jeton_porte_le_client() {
+        let _scope = auth::bind(Some(
+            crate::auth::AuthContext::new("client-a", crate::auth::ProofMethod::Application)
+                .with_right("confirmer.droit"),
+        ));
+        assert_eq!(mrtr_subject(true), Ok(Some("client-a".to_string())));
+        assert_eq!(mrtr_subject(false), Ok(None));
     }
 }

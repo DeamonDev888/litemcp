@@ -7,22 +7,32 @@
 //! et **doit** refuser un jeton qui échoue à la vérification.
 //!
 //! Le plus petit modèle compatible **stateless** : le jeton porte lui-même
-//! tout ce qu'il faut pour reprendre (méthode, digest des paramètres
-//! saillants, id d'origine, expiration, tour, charge utile du handler) et il
-//! est authentifié par HMAC-SHA256 avec une clé du serveur —
+//! tout ce qu'il faut pour reprendre (version du format, méthode, digest des
+//! paramètres saillants, tour, échéance, identité de l'appelant quand
+//! l'autorisation est active, charge utile du handler) et il est authentifié
+//! par HMAC-SHA256 avec une clé du serveur —
 //! `base64url(payload_json) "." base64url(hmac_sha256(payload))`.
 //!
-//! Aucune dépendance : SHA-256 et HMAC-SHA256 sont implémentés ici (ils sont
-//! couverts par des vecteurs de la RFC 6234 / RFC 4231, voir les tests).
+//! L'`id` JSON-RPC n'est **volontairement pas lié** : la spec MRTR exige un
+//! id différent au rejeu. Ce qui est lié : la version, la méthode, le digest
+//! des paramètres saillants, le tour, l'échéance et — quand l'autorisation
+//! est active — l'identité authentifiée de l'appelant.
+//!
+//! La signature ne dépend d'aucune crate : SHA-256 et HMAC-SHA256 sont
+//! implémentés ici (ils sont couverts par des vecteurs de la RFC 6234 /
+//! RFC 4231, voir les tests) ; seule la clé vient du CSPRNG de l'OS
+//! (`getrandom::fill`).
 //!
 //! ## Durée de vie
 //!
 //! Un jeton est valide **au plus** `request_state_ttl` (défaut 10 min) à
 //! partir de sa frappe. Il est **porteur** (bearer) : quiconque le détient
-//! peut le présenter ; la liaison méthode/paramètres/id limite sa réutilisation
-//! à la requête d'origine, le TTL borne la fenêtre de rejeu — mais **la
-//! consommation unique n'est pas garantie** par le jeton (la spec le dit :
-//! un serveur qui exige « au plus une fois » doit l'imposer de son côté).
+//! peut le présenter — sous autorisation, la liaison à l'identité de
+//! l'appelant réserve le rejeu à ce client. La liaison méthode/paramètres
+//! saillants/tour/échéance limite sa réutilisation à la requête d'origine, le
+//! TTL borne la fenêtre de rejeu — mais **la consommation unique n'est pas
+//! garantie** par le jeton (la spec le dit : un serveur qui exige « au plus
+//! une fois » doit l'imposer de son côté).
 //! Le jeton est **signé, pas chiffré** : le client peut le décoder — n'y
 //! mettez aucun secret. La clé est celle du process (ou celle fournie par
 //! l'opérateur, partagée par la flotte) : un redémarrage sans clé partagée
@@ -92,9 +102,14 @@ pub(crate) fn verify_token(key: &[u8], token: &str) -> Result<Value, StateError>
     let payload_bytes = b64url_decode(payload_part)?;
     let signature = b64url_decode(signature_part)?;
     let expected = hmac_sha256(key, &payload_bytes);
-    // Comparaison à temps constant : `|` n'accumule pas de branche dépendant
-    // du contenu (même longueur vérifiée d'abord).
-    let mut diff = (signature.len() ^ expected.len()) as u8;
+    // Comparaison à temps constant, longueurs **explicitement** comparées :
+    // `(a.len() ^ b.len()) as u8` tronquerait 288 ^ 32 = 256 à 0 et
+    // accepterait « signature valide + 256 octets arbitraires » (malléabilité).
+    // `|` n'accumule pas de branche dépendant du contenu.
+    if signature.len() != expected.len() {
+        return Err(StateError::BadSignature);
+    }
+    let mut diff = 0u8;
     for (a, b) in signature.iter().zip(expected.iter()) {
         diff |= a ^ b;
     }
@@ -118,32 +133,28 @@ pub(crate) fn digest_salient(value: &Value) -> String {
     hex
 }
 
-/// Clé HMAC par défaut d'un process — récoltée via [`std::collections::hash_map::RandomState`]
-/// (dont les graines viennent de l'OS) mélangée au PID et à l'horloge.
+/// Clé HMAC par défaut d'un process — 32 octets du **CSPRNG du système**
+/// (`getrandom`), sans PID, horloge ni adresse mélangés.
 ///
 /// Ce n'est **pas** une clé partageable : elle ne survit ni au redémarrage ni
 /// à une seconde instance. Un déploiement en flotte (gateways, répliques,
 /// redémarrages) doit fournir `ServerBuilder::request_state_key`.
+///
+/// # Panique
+///
+/// Panique si le CSPRNG du système est indisponible (`getrandom::fill`
+/// échoue : seccomp, cible non supportée) : sans aléa de qualité, aucune clé
+/// n'est frappée — un serveur qui ne peut pas tirer une clé ne doit pas
+/// démarrer plutôt que de signer des jetons avec une clé devinable.
+///
+/// L'appel **peut bloquer** à l'amorçage précoce du système : `getrandom`
+/// attend que la source d'entropie soit initialisée, sans borne de temps.
+/// `ServerBuilder::new` récolte la clé dès la construction (avant que
+/// l'appelant puisse fournir la sienne) : les deux propriétés s'appliquent
+/// donc au constructeur.
 pub(crate) fn harvest_key() -> Vec<u8> {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let mut key = Vec::with_capacity(32);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    for round in 0..4u64 {
-        // Chaque `RandomState::new()` tire des graines distinctes ; les
-        // quatre hachages sont indépendants et couvrent 256 bits.
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u64(now);
-        hasher.write_u32(std::process::id());
-        hasher.write_u64(round);
-        hasher.write_usize(&key as *const _ as usize);
-        key.extend_from_slice(&hasher.finish().to_le_bytes());
-    }
+    let mut key = vec![0u8; 32];
+    getrandom::fill(&mut key).expect("the OS entropy source must provide the requestState key");
     key
 }
 
@@ -519,6 +530,32 @@ mod tests {
         // Clé différente → signature invalide (jamais « payload illisible »).
         assert_eq!(
             verify_token(b"another-key-another-key-another-k", &token).unwrap_err(),
+            StateError::BadSignature
+        );
+    }
+
+    #[test]
+    fn une_signature_de_longueur_differente_est_refusee() {
+        // Malléabilité : 32 octets corrects **suivis** de 256 octets
+        // arbitraires. `(288 ^ 32) as u8` vaut 0 — la seule comparaison de
+        // longueur doit refuser, pas la boucle sur les 32 premiers octets.
+        let key = b"0123456789abcdef0123456789abcdef";
+        let payload = serde_json::json!({ "v": 1, "m": "tools/call", "t": 1 });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let mut signature = Vec::with_capacity(32 + 256);
+        signature.extend_from_slice(&hmac_sha256(key, &bytes));
+        signature.extend_from_slice(&[0xab; 256]);
+        let token = format!("{}.{}", b64url_encode(&bytes), b64url_encode(&signature));
+        assert_eq!(
+            verify_token(key, &token).unwrap_err(),
+            StateError::BadSignature
+        );
+
+        // Signature tronquée (31 octets) : même refus.
+        signature.truncate(31);
+        let token = format!("{}.{}", b64url_encode(&bytes), b64url_encode(&signature));
+        assert_eq!(
+            verify_token(key, &token).unwrap_err(),
             StateError::BadSignature
         );
     }

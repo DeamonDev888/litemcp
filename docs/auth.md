@@ -208,6 +208,8 @@ par défaut — ce qui est approuvé est exactement ce qui s'exécute) :
 | `Denied` | le handler n'est jamais appelé | 403, `-32023`, `data.reason = "approval_denied"` |
 | `Pending { retry_after }` | rien n'est exécuté ni mis en file | 403, `-32023`, `data.reason = "approval_pending"`, `data.retryable = true`, `data.retryAfterMs` si fourni |
 
+Sur un élément **existant** dont l'appelant n'a pas le droit, la réponse reste `403` + `-32023` (`data.reason = "right_missing"`) ; un élément **absent** rend `Unknown tool/resource/prompt`. Cet écart est **assumé** : l'existence des noms n'est pas un secret, les listes sont déjà filtrées par appelant et `on_auth_decision` porte le motif réel, jamais le réseau (modèle de menace : [`SECURITE.md`](SECURITE.md)).
+
 Ce qui est exécuté est **exactement** ce qui a été soumis : le handler reçoit la même valeur `serde_json::Value`,
 sérialisée à l'identique (test : octets identiques capturés avant et après).
 
@@ -301,10 +303,13 @@ auditer, sans besoin pour MCP Control, qui a son propre socket et appelle `dispa
 
 1. Aucun secret dans une réponse, une erreur, un `Debug` ou un exemple (corps des 401 constant, `SigningKey` sans `Debug`
    lisible ni `Display`, clé privée effacée par `zeroize`) ; comparaisons en temps constant (signature, empreintes, digest).
-2. Aléa : uniquement celui du système d'exploitation (`RandomState` pour les nonces, `ring`/OS pour TLS) ; aucun générateur
-   ensemencé, aucune horloge comme graine. Échec fermé :
+2. Aléa : uniquement celui du système d'exploitation (`getrandom` — CSPRNG de l'OS — pour la graine Ed25519, les nonces
+   RFC 9421 et la clé HMAC des `requestState` ; `ring`/OS pour TLS) ; aucun générateur ensemencé, aucune horloge comme
+   graine. Sans entropie disponible, le tirage panique (`system_bytes`, documenté `# Panique`) : le serveur ne démarre pas
+   avec une clé faible. Échec fermé :
    tout cas non prévu (paramètre ou composant inconnu, `KeyStore` muet, panique du trait) aboutit à un refus.
-3. Aucune primitive asymétrique, aucun TLS, aucun aléa écrit à la main : uniquement `ed25519-dalek` et `rustls` ;
+3. Aucune primitive asymétrique, aucun TLS, aucun aléa écrit à la main : uniquement `ed25519-dalek`, `rustls` et
+   `getrandom` (interface d'entropie de l'OS, pas un générateur maison) ;
    aucune évaluation par un tiers n'est revendiquée.
 
 ## 11. Points non tranchés
@@ -318,7 +323,8 @@ auditer, sans besoin pour MCP Control, qui a son propre socket et appelle `dispa
 4. **Droits des gabarits de ressources** : `require_resource_right` accepte la clé `uriTemplate` (recommandé) / un
    droit unique pour tout `resources/*` / aucun filtrage des gabarits.
 5. **Existence des noms** : `-32602` pour un tool inconnu et `-32023` pour un tool interdit (recommandé, noms non
-   secrets) / un verdict indistinct (meilleure confidentialité, diagnostic dégradé).
+   secrets) / un verdict indistinct (meilleure confidentialité, diagnostic dégradé) — **décidé** (audit du 2026-11-20) :
+   maintenu, voir §5.
 6. **Certificat « généré si absent »** (plan L3 §5) : impossible sans écrire une clé privée sur disque — **décidé** :
    éphémère en mémoire (`self_signed_ephemeral`), l'application persiste si elle veut un épinglage stable.
    **Client (C9)** : aucun client HTTP n'existe dans le crate (0.11.0/0.12.0 est un serveur seul) — **décidé** : C9 =
@@ -330,6 +336,8 @@ auditer, sans besoin pour MCP Control, qui a son propre socket et appelle `dispa
 
 ## Révisions
 
+- 2026-11-20 — audit `docs/AUDIT-LITEMCP-2026-11-20.md` : aléa `getrandom` (§10.2), oracle d'existence documenté comme
+  propriété assumée (§5, §11).
 - 2026-11-15 — L3 : `dispatch_verified`/`AuthResponse` (C8), `PinnedServer` (C9 réduit), feature `tls` (TLS 1.3,
   `rcgen`), annonce `authRequired`/`certificateFingerprint`, RFC 9728 minimal, `completion/complete` filtré, transitives
   mesurées, `AuthDecisionEvent` à champs `Option`, arguments d'approbation = valeur exécutée (après défauts).

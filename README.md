@@ -2,7 +2,7 @@
 
 # LiteMCP
 
-**Votre programme Rust *est* le serveur MCP.** Streamable HTTP stateless — un `POST /mcp` par message, réponse `application/json` ou SSE request-scoped — zéro runtime async, deux dépendances directes : `serde`, `serde_json`.
+**Votre programme Rust *est* le serveur MCP.** Streamable HTTP stateless — un `POST /mcp` par message, réponse `application/json` ou SSE request-scoped — zéro runtime async, trois dépendances directes : `serde`, `serde_json` et un CSPRNG minuscule, `getrandom`.
 
 [![crates.io](https://img.shields.io/crates/v/litemcp.svg)](https://crates.io/crates/litemcp) [![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI)](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml) [![Docs](https://img.shields.io/docsrs/litemcp)](https://docs.rs/litemcp) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
@@ -18,7 +18,7 @@ Une **bibliothèque**, pas un serveur à lancer : vous ajoutez la dépendance à
 
 1. **Streamable HTTP uniquement** : un `POST /mcp` auto-suffisant par message, aucun flux permanent, aucune session, pas d'`initialize` obligatoire — la spec `2026-07-28`.
 2. **Zéro runtime async** : `std::net::TcpListener`, un thread par connexion ; aucun adaptateur tokio.
-3. **Deux dépendances directes** : `serde`, `serde_json` ; schémas et validation faits maison (module `zod`), macros `#[tool]` dans une crate locale sans dépendance.
+3. **Trois dépendances directes** : `serde`, `serde_json`, `getrandom` (CSPRNG du système d'exploitation pour toutes les clés et tous les nonces) ; schémas et validation faits maison (module `zod`), macros `#[tool]` dans une crate locale sans dépendance.
 4. **Mesuré et daté** : chaque chiffre est publié avec sa date, sa méthode et ses limites.
 
 Pour qui : une CLI qui expose deux outils sans framework web ; un test qui a besoin d'un vrai serveur sur un port ; un binaire embarqué (edge, IoT) ; un agent qui lance cinquante serveurs MCP.
@@ -208,19 +208,19 @@ Un endpoint, un verbe : `POST /mcp`. Réponse `application/json`, ou `text/event
 
 ## Features Cargo
 
-Deux features optionnelles au choix, additives : `macros` (défaut), `schemars`, `auth-sign`, `tls`. Le noyau n'a besoin d'aucune.
+Features additives : `macros` (défaut), `schemars`, `auth-sign`, `tls`. Le noyau n'a besoin d'aucune.
 
-| Configuration | Crates dans le build du consommateur | Ce que ça ajoute |
+| Configuration | Crates ajoutés au noyau | Ce que ça ajoute |
 |---|---|---|
-| `default` | **13** | les macros `#[tool]`/`#[resource]`/`#[prompt]` (crate locale `litemcp-macros`, aucune dépendance) |
-| `default-features = false` | **12** | rien de moins : le noyau complet |
-| `features = ["schemars"]` | **68** (+55) | `schemars` + `jsonschema` : `from_schemars::<T>()`, `from_json_schema`, `format` validés |
+| `default` | **+1** | les macros `#[tool]`/`#[resource]`/`#[prompt]` (crate locale `litemcp-macros`, aucune dépendance) |
+| `default-features = false` | **0** | rien de moins : le noyau complet |
+| `features = ["schemars"]` | **+55** | `schemars` + `jsonschema` : `from_schemars::<T>()`, `from_json_schema`, `format` validés |
 | `features = ["auth-sign"]` | **+16** | signature et vérification Ed25519 (RFC 9421 + RFC 9530), +85 Kio de binaire |
 | `features = ["tls"]` | **+17** | TLS 1.3 serveur (`rustls` + `ring`, jamais `tls12`) + certificat éphémère (`rcgen`), +657 Kio |
 
-*Comptés le 2026-11-13 (`cargo tree -e normal --prefix none`, dédoublonné, crate du consommateur exclue), Windows 11, rustc 1.99.1 ; deltas `auth-sign`/`tls` remesurés le 2026-11-15 (release `strip` + `lto = "fat"`).*
+*Deltas comptés le 2026-11-13 (`cargo tree -e normal --prefix none`, dédoublonné, crate du consommateur exclue), Windows 11, rustc 1.99.1 ; `auth-sign`/`tls` remesurés le 2026-11-15 (release `strip` + `lto = "fat"`). Les totaux absolus ne sont plus cités : l'entrée de `getrandom` dans le noyau (2026-11-20) décale le décompte et la campagne n'a pas été rejouée ; les deltas, eux, ne changent pas.*
 
-Deux précisions que le slogan « deux dépendances » cache : les dépendances **directes** sont bien `serde` et `serde_json`, mais un build par défaut compile aussi `serde_derive`, donc `syn`, `quote`, `proc-macro2`, `unicode-ident` — ils viennent de `serde`, pas de `litemcp-macros`. Et le binaire d'un serveur à un outil pèse **≈ 1 Mio** (961 Kio mesurés, release `lto = "fat"` + `strip`), pas les 263 Kio annoncés auparavant : méthode et chiffres antérieurs dans [`docs/MESURES.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/MESURES.md#tailles-de-binaire).
+Ce que le slogan « trois dépendances » ne dit pas : les dépendances **directes** sont `serde`, `serde_json` et `getrandom` — le CSPRNG du système d'exploitation, non optionnel parce que le cœur en tire la clé HMAC des `requestState` même sans feature. Un build par défaut compile aussi `serde_derive`, donc `syn`, `quote`, `proc-macro2`, `unicode-ident` — ils viennent de `serde`, pas de `litemcp-macros`. Et le binaire d'un serveur à un outil pèse **≈ 1 Mio** (961 Kio mesurés, release `lto = "fat"` + `strip`), pas les 263 Kio annoncés auparavant : méthode et chiffres antérieurs dans [`docs/MESURES.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/MESURES.md#tailles-de-binaire).
 
 ## Configuration et valeurs par défaut
 
@@ -292,12 +292,12 @@ Soit **×2,1** sur la latence moyenne et **×1,7** sur la mémoire face au meill
 
 - **TLS et authentification forte** : TLS 1.3 serveur et signature de requêtes sont **dans la lib** (features `tls` et `auth-sign`, [guide](#authentification-012)) ; restent à la périphérie l'OIDC/SAML, l'OAuth 2.1 pour clients à jeton, le mTLS, le rate-limit par identité et la terminaison TLS mutualisée.
 - **CORS : liste blanche seulement** : `.allow_origins` ouvre le cross-origin aux seules origines déclarées — préflight `OPTIONS` → `204` avec `Access-Control-Allow-Origin` (l'origine listée, echoée une à une, jamais `*`) et `Vary: Origin`, et les réponses `POST` de ces origines portent les mêmes en-têtes ; une origine non listée reste refusée en `403`, sans aucun en-tête CORS. Pas de `Access-Control-Allow-Credentials`, et les rejets de transport (`400`/`413`/`415`) partent avant le verdict CORS : côté navigateur ils apparaissent comme une erreur CORS, pas comme leur statut exact.
-- **`Host` : une règle par défaut, pas une authentification** : `ServerBuilder::allowed_hosts` confronte l'autorité reçue au listener **avant le routage** — `421 Misdirected Request` pour tout nom pleinement qualifié non déclaré (`attaquant.example`) ou toute IP étrangère. Par défaut sont acceptées l'IP effective du listener, le bouclage et tout **nom court** non qualifié (`localhost`, `mon-service`, mais aussi un nom sans point non déclaré) : ce n'est pas une liste blanche exhaustive, et le port de l'autorité est ignoré. Derrière un reverse proxy, déclarez le nom public.
+- **`Host` : une règle par défaut, pas une authentification** : `ServerBuilder::allowed_hosts` confronte l'autorité reçue au listener **avant le routage** — `421 Misdirected Request` pour tout nom pleinement qualifié non déclaré (`attaquant.example`) ou toute IP étrangère. Par défaut sont acceptées l'IP effective du listener, le bouclage et tout **nom court** non qualifié (`localhost`, `mon-service`, mais aussi un nom sans point non déclaré) : ce n'est pas une liste blanche exhaustive, et le port de l'autorité est ignoré ; une liste `.allowed_hosts` non vide **s'ajoute** à ces autorités, elle ne les remplace pas. Derrière un reverse proxy, déclarez le nom public.
 - **Annulation coopérative, jamais préemptive** : la fermeture d'un flux SSE lève un drapeau (`litemcp::cancel::is_cancelled`) que le handler consulte **s'il le veut** ; rien ne l'interrompt (Rust n'a pas d'annulation de thread). `tool_timeout` (30 s par défaut) borne la réponse, pas les effets de bord en cours ; `notifications/cancelled` n'est pas implémentée.
 - **`structuredContent` d'un `isError`** : avec un `outputSchema` publié, le champ est **omis** sur un échec (page *Tools* : tout résultat structuré doit conformer au schéma publié) — le détail de l'erreur reste dans `content` ; sans `outputSchema` publié, la forme `{"error": …}` historique est conservée.
 - **Pas de pagination** (`cursor` ignoré, pas de `nextCursor`), **pas de souscriptions** (`subscriptions/listen` absent : les clients s'appuient sur `ttlMs` = 60 s), extension **`tasks`** non implémentée.
 - **Pas de `chunked` entrant** : tout `Transfer-Encoding` est refusé (`400`) ; un proxy qui re-chunke doit dé-chunker.
-- **CI : trois systèmes, couverture inégale** (`.github/workflows/ci.yml`) : la matrice complète (défaut, toutes features, sans défaut, features isolées `macros` / `schemars` / `auth-sign` / `tls`, MSRV 1.85, rustdoc strict, simulations du pipeline de publication) tourne sous `ubuntu-latest` ; les jobs `windows-latest` et `macos-latest` lancent la suite en configuration par défaut **et** en `--all-features`, mais ni clippy, ni rustdoc, ni les features isolées — un écart propre à une plateforme sous une feature isolée n'y serait pas vu. Pour rejouer la suite localement : [`docs/TESTS.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/TESTS.md).
+- **CI : trois systèmes, couverture inégale** (`.github/workflows/ci.yml`) : la matrice complète (défaut, toutes features, sans défaut, features isolées `macros` / `schemars` / `auth-sign` / `tls`, MSRV 1.85, rustdoc strict, simulations du pipeline de publication dans `cargo test --workspace`) tourne sous `ubuntu-latest` ; les jobs `windows-latest` et `macos-latest` lancent la suite en configuration par défaut **et** en `--all-features`, mais ni clippy, ni rustdoc, ni les features isolées — un écart propre à une plateforme sous une feature isolée n'y serait pas vu. Pour rejouer la suite localement : [`docs/TESTS.md`](https://github.com/DeamonDev888/litemcp/blob/main/docs/TESTS.md).
 
 ## Licence
 

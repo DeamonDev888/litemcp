@@ -58,8 +58,8 @@ pub struct SigningKey {
 }
 
 impl SigningKey {
-    /// Génère une paire avec l'aléa du **système** (aucun générateur
-    /// ensemencé, aucune horloge comme graine).
+    /// Génère une paire avec l'aléa du **système** — CSPRNG de l'OS via
+    /// `getrandom`, aucun générateur ensemencé, aucune horloge comme graine.
     #[must_use]
     pub fn generate() -> Self {
         Self {

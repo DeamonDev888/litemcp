@@ -34,7 +34,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       # Configuration minimale servie par `default-features = false` : le noyau
-      # (serde + serde_json) doit être clippy-propre sans aucune feature.
+      # (serde, serde_json, getrandom) doit être clippy-propre sans aucune feature.
       - name: Clippy (sans features par defaut)
         run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
       - name: Tests
@@ -74,13 +74,12 @@ jobs:
       # hello`) : ils doivent compiler dans la configuration la plus large.
       - name: Exemples (toutes features)
         run: cargo build --examples --all-features
-      # Les garde-fous du pipeline de publication (scripts/release-tests.ps1 :
+      # Les garde-fous du pipeline de publication (créé `release-tool` :
       # tag incohérent, tests rouges, version déjà publiée, réseau
-      # indisponible, contenu des paquets) tournent aussi sur chaque PR —
-      # aucune publication, aucun secret. `tests/release_pipeline.rs` couvre
-      # la structure des workflows via `cargo test` ci-dessus.
-      - name: Simulations du pipeline de publication
-        run: pwsh -NoProfile -File scripts/release-tests.ps1
+      # indisponible, contenu des paquets) tournent sur chaque job de test —
+      # les simulations vivent dans `release-tool/tests/simulations.rs`, donc
+      # `cargo test --workspace` ci-dessus les exécute sans publication ni
+      # secret. `tests/release_pipeline.rs` couvre la structure des workflows.
       - name: Doc (rustdoc strict)
         env:
           RUSTDOCFLAGS: -D warnings

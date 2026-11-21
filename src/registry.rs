@@ -30,12 +30,22 @@
 //! (autre process, autre port ou autre instance) ni une course
 //! lecture→suppression ne peut effacer l'annonce d'une instance vivante plus
 //! récente.
+//!
+//! Le dossier partagé est **validé à chaque usage** (répertoire réel — un lien
+//! symbolique, ou une jonction Windows, est refusé —, mode exactement `0700`,
+//! écriture prouvée par une sonde d'appartenance) : un dossier pré-créé
+//! `0777` par un autre utilisateur local, ou remplacé par un lien symbolique,
+//! n'est jamais utilisé — l'annonce est alors abandonnée en silence, comme
+//! tout échec d'écriture ; un dossier à nous mais trop ouvert est resserré en
+//! `0700`. La validation s'applique aussi **à la lecture** : le sweep
+//! anti-zombie valide le dossier avant de le parcourir (voir
+//! [`crate::antizombie::sweep_registry`]).
 //! ⚠️ Le fichier publie la ligne de commande (`args`) : ne passez pas de
 //! secrets par argv — préférez les variables d'environnement ou un fichier
 //! de configuration.
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,6 +87,20 @@ pub(crate) fn is_safe_name(name: &str) -> bool {
         && name.len() <= 100
         && !name.contains("..")
         && !name.contains(['/', '\\', ':'])
+}
+
+/// Suffixe **aléatoire** de 16 hexadécimaux (8 octets du CSPRNG du système,
+/// `getrandom`) — nommage de la sonde d'appartenance et du fichier temporaire
+/// d'écriture. Ce n'est **pas** un secret (rien de confidentiel ne porte ce
+/// nom) : l'aléa empêche seulement qu'un voisin local devine le nom et le
+/// pré-crée pour faire échouer la validation ou détourner l'écriture. Repli
+/// sur `None` quand la source d'entropie est indisponible : l'appelant garde
+/// alors son nommage historique (PID + séquence ou horloge), moins résistant
+/// mais fonctionnel — une annonce ne doit pas dépendre de l'entropie.
+fn random_suffix() -> Option<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).ok()?;
+    Some(format!("{:016x}", u64::from_be_bytes(bytes)))
 }
 
 /// Écrit l'annonce `127.0.0.1:<port>` — **forme historique**, à ne réserver
@@ -290,7 +314,10 @@ const LOCK_STALE: Duration = Duration::from_secs(2);
 /// check-then-delete d'origine (une annonce plus récente supprimée entre la
 /// lecture et le retrait d'une instance plus ancienne) est fermée par
 /// construction. `None` = verrou non acquis dans [`LOCK_ACQUIRE_TIMEOUT`]
-/// (concurrent vivant) — l'appelant renonce, le fichier reste et sera rejugé.
+/// (concurrent vivant) **ou** dossier de registre non validé (absent, trop
+/// largement partagé, d'un autre utilisateur — voir
+/// [`validate_private_dir`]) — l'appelant renonce, le fichier reste et sera
+/// rejugé.
 /// Les verrous sont des **dossiers** `<nom>.lock` : ignorés par tous les
 /// lecteurs (le sweep et MCP Control ne lisent que les `.json`).
 pub(crate) fn with_name_lock<T>(name: &str, f: impl FnOnce() -> T) -> Option<T> {
@@ -307,7 +334,16 @@ pub(crate) fn with_name_lock_for<T>(
     if !is_safe_name(name) {
         return None;
     }
-    let lock = registry_dir().join(format!("{name}.lock"));
+    // Le dossier partagé est la **seule porte d'entrée** du registre : il
+    // est validé avant tout verrou (répertoire réel, privé, à nous — voir
+    // [`validate_private_dir`]). Absent, hostile ou détourné : `None`, comme
+    // un verrou non acquis — aucune section critique ne tourne sous un
+    // verrou qu'un autre utilisateur local contrôle.
+    let dir = registry_dir();
+    if validate_private_dir(&dir).is_err() {
+        return None;
+    }
+    let lock = dir.join(format!("{name}.lock"));
     // `checked_add` : une constante de péremption démesurée ne peut pas
     // paniquer ; `None` = aucune échéance (l'attente reste bornée par les
     // verrous frais, jamais par un `+` qui déborde).
@@ -357,17 +393,253 @@ fn lock_is_stale(lock: &Path, stale_after: Duration) -> bool {
 /// Crée le dossier d'annonce, récursivement — sous Unix avec le mode `0700`
 /// : le dossier publie exe, argv et cwd de ses occupants, il ne doit pas
 /// être traversable par les autres utilisateurs.
+///
+/// **La création ne prouve pas la privauté** : `DirBuilder::recursive(true)`
+/// rend `Ok(())` sans rien faire quand le chemin existe déjà, et le dossier
+/// vit dans le temp **partagé**, où un autre utilisateur local peut l'avoir
+/// pré-créé (`0777`) ou avoir planté un lien symbolique à sa place. Le mode
+/// `0700` ne protège que la création ; le dossier est donc validé après
+/// coup par [`validate_private_dir`] — refus d'un dossier qu'un autre
+/// contrôle, resserrement d'un dossier à nous qui s'écarte de `0700` (trop
+/// ouvert aux autres, ou `0300` : sans bit de lecture, l'annonce serait
+/// invisible à son lecteur).
 #[cfg(unix)]
 pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
-    builder.create(dir)
+    builder.create(dir)?;
+    validate_private_dir(dir)
 }
 
+/// Variante non-Unix : `create_dir_all` (comportement inchangé), puis
+/// vérification que le chemin est bien un **répertoire réel**.
 #[cfg(not(unix))]
 pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dir)
+    fs::create_dir_all(dir)?;
+    validate_private_dir(dir)
+}
+
+/// Le dossier d'annonce est-il utilisable **en privé** ? Répertoire réel,
+/// écriture effectivement possible pour nous sous **notre** identité, et mode
+/// exactement `0700` (Unix : bits propriétaire complets, aucun bit de
+/// groupe/autres).
+///
+/// `symlink_metadata` et non `metadata` : un lien symbolique planté au
+/// chemin du registre est refusé, jamais suivi — sinon un autre utilisateur
+/// local redirigerait lectures et écritures vers un dossier qu'il contrôle,
+/// en laissant croire au mode du répertoire d'arrivée.
+///
+/// **Contrôle de propriété sans `libc`** : le crate n'a pas `libc` et
+/// n'ajoutera aucun `unsafe`. `MetadataExt::uid()` donne le propriétaire du
+/// dossier mais pas l'euid du process ; un dossier `0700` appartenant à un
+/// autre utilisateur refuse l'écriture, donc une sonde créée en
+/// `create_new` **dans** le dossier échoue — c'est le contrôle effectif.
+/// Quand elle réussit, l'uid de la sonde doit être celui du dossier (un
+/// dossier où l'on écrit sous une autre identité n'est pas privé). La
+/// sonde (`.probe-<pid>-<aléa>`) est supprimée **au mieux** : un échec de
+/// suppression n'invalide pas le verdict et ne laisse au pire qu'un fichier
+/// inoffensif, qu'aucun lecteur ne prend pour une annonce.
+///
+/// **Mode** : un dossier à nous qui s'écarte de `0700` est **resserré**, pas
+/// refusé — on répare ce qui nous appartient. Trop ouvert (`0755`, `0777`),
+/// il publie exe, argv et cwd de ses occupants. Trop fermé pour ses propres
+/// lecteurs (`0300` : la sonde et l'écriture réussissent, mais MCP Control,
+/// même utilisateur, ne peut pas `read_dir` — l'annonce serait invisible),
+/// il priverait l'intégration de l'annonce sans aucune erreur. Un dossier
+/// d'un autre utilisateur ne peut pas emprunter ce chemin : la sonde
+/// échouerait ou son uid différerait.
+///
+/// Erreurs : `AlreadyExists` si le chemin existe sans être un répertoire
+/// réel (lien symbolique, jonction Windows, fichier) ; `PermissionDenied` si
+/// la sonde est refusée faute de droits, si son uid n'est pas celui du
+/// dossier, ou si le mode reste différent de `0700` après resserrement ; les
+/// autres échecs d'E/S sont rendus tels quels (kind conservé).
+#[cfg(unix)]
+pub(crate) fn validate_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let meta = fs::symlink_metadata(dir)?;
+    let file_type = meta.file_type();
+    if file_type.is_symlink() || !file_type.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} n'est pas un répertoire réel (lien symbolique ou fichier)",
+                dir.display()
+            ),
+        ));
+    }
+    // La propriété se prouve **avant** le mode : c'est elle qui distingue un
+    // dossier que nous avons créé (mode à resserrer) d'un dossier pré-créé
+    // par un autre utilisateur local (à refuser, quel que soit son mode).
+    probe_ownership(dir, meta.uid())?;
+    if meta.permissions().mode() & 0o777 == 0o700 {
+        return Ok(());
+    }
+    // Dossier à nous, mais pas exactement `0700` : trop ouvert (`0755`,
+    // `0777`), il publie exe, argv et cwd des occupants ; trop fermé (`0300`),
+    // il rend l'annonce invisible à MCP Control (même utilisateur, mais sans
+    // bit de lecture). Dans les deux cas, on resserre en `0700` : le refus
+    // silencieux priverait l'intégration de l'annonce sans que rien ne le
+    // signale. Un dossier **étranger** ne peut pas arriver ici : la sonde
+    // aurait échoué ou son uid différerait.
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{} n'a pas pu être resserré en 0700 : {error}",
+                dir.display()
+            ),
+        )
+    })?;
+    let mode = fs::symlink_metadata(dir)?.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} n'est pas en 0700 après resserrement (mode {:04o}) : registre non privé",
+                dir.display(),
+                mode
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Variante non-Unix : le chemin doit être un **répertoire réel** (jamais un
+/// lien symbolique, une **jonction** ou un fichier).
+///
+/// Sous Windows, un **point d'analyse** (`FILE_ATTRIBUTE_REPARSE_POINT` :
+/// jonction de répertoire, lien symbolique, point de montage) est refusé
+/// explicitement. Mesure sur la toolchain 1.85 (`symlink_metadata` d'une
+/// jonction créée par `mklink /J`) : `is_symlink()` vaut déjà `true` et
+/// `is_dir()` `false` — le contrôle `is_symlink()/!is_dir()` la refusait donc
+/// déjà. Le test explicite du bit rend le refus **indépendant de la
+/// classification de `FileType`** (autres tags de reparse point, évolution
+/// de la std) ; `metadata`, qui suit la redirection, la verrait comme un
+/// répertoire — d'où `symlink_metadata`. Le bit est lu par
+/// `MetadataExt::file_attributes`, sans `unsafe` ni dépendance.
+///
+/// **Limite restante** : le contrôle d'ACL et de propriétaire n'est pas fait
+/// (une ACL Windows ne se résume pas à un bit de mode, et `%TEMP%` est un
+/// dossier par utilisateur). Un `TEMP` pointé sur un dossier partagé reste
+/// donc hors du modèle de menace : le registre y accepte un dossier réel
+/// créé par un autre utilisateur.
+#[cfg(not(unix))]
+pub(crate) fn validate_private_dir(dir: &Path) -> std::io::Result<()> {
+    let meta = fs::symlink_metadata(dir)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        // `FILE_ATTRIBUTE_REPARSE_POINT` — tout point d'analyse (jonction de
+        // répertoire, lien symbolique, point de montage de volume) est
+        // refusé : le répertoire du registre doit être l'objet lui-même.
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} n'est pas un répertoire réel (point d'analyse ou jonction)",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    let file_type = meta.file_type();
+    if file_type.is_symlink() || !file_type.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} n'est pas un répertoire réel (lien symbolique ou fichier)",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Sonde d'appartenance — voir [`validate_private_dir`] : `create_new` d'un
+/// fichier `.probe-<pid>-<aléa>` dans `dir`, uid comparé à celui du dossier,
+/// fichier retiré au mieux. Le suffixe vient du CSPRNG de l'OS (voir
+/// [`random_suffix`]) : un voisin local ne peut pas deviner le nom pour le
+/// pré-créer (faire échouer la validation) ni le remplacer pendant la
+/// mesure. Ce n'est pas un secret, seulement un nom non devinable.
+#[cfg(unix)]
+fn probe_ownership(dir: &Path, owner: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut probe = None;
+    let mut last_error = None;
+    // Un nom déjà pris (résidu d'une validation tuée, collision improbable
+    // des 8 octets aléatoires) est contourné par un nouveau tirage. Sans
+    // entropie disponible, le repli reprend PID + séquence (nommage
+    // historique) : la validation reste fonctionnelle.
+    for _ in 0..4 {
+        let suffix = random_suffix()
+            .unwrap_or_else(|| PROBE_SEQ.fetch_add(1, Ordering::Relaxed).to_string());
+        let path = dir.join(format!(".probe-{}-{suffix}", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                drop(file);
+                probe = Some(path);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => last_error = Some(error),
+            Err(error) => {
+                // Dossier appartenant à un autre utilisateur (0700 : écriture
+                // refusée) ou système de fichiers en lecture seule : refus,
+                // jamais d'usage d'un dossier qu'on ne prouve pas posséder.
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "sonde d'écriture refusée dans {} (dossier d'un autre utilisateur ?) : {error}",
+                        dir.display()
+                    ),
+                ));
+            }
+        }
+    }
+    let Some(probe) = probe else {
+        let error = last_error.unwrap_or_else(|| io::Error::other("sonde impossible"));
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "sonde d'écriture impossible dans {} : {error}",
+                dir.display()
+            ),
+        ));
+    };
+    // `symlink_metadata` : une substitution de la sonde par un lien ne fait
+    // pas lire la cible ; l'uid lu est celui de l'objet réellement créé.
+    let probe_uid = fs::symlink_metadata(&probe).map(|meta| meta.uid());
+    // Nettoyage **au mieux** : un échec (droits, verrou antivirus) n'invalide
+    // pas le verdict — il ne reste qu'un fichier vide au nom hors nommage
+    // d'annonce, qu'aucun lecteur ne prend pour une annonce et que le sweep
+    // ignore.
+    let _ = fs::remove_file(&probe);
+    match probe_uid {
+        Ok(uid) if uid == owner => Ok(()),
+        Ok(uid) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} : la sonde appartient à l'uid {uid}, pas au propriétaire du dossier ({owner})",
+                dir.display()
+            ),
+        )),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "sonde d'écriture illisible dans {} : {error}",
+                dir.display()
+            ),
+        )),
+    }
 }
 
 /// Ouvre `path` en création **exclusive** (`create_new` : échoue si le nom
@@ -393,33 +665,43 @@ fn open_exclusive(path: &Path) -> std::io::Result<fs::File> {
         .open(path)
 }
 
-/// Écrit `body` dans `path` de façon **atomique**, sans suivre un éventuel
-/// lien symbolique déjà planté à la destination.
+/// Écrit `body` dans `path` de façon **atomique** pour les lecteurs.
 ///
 /// Le dossier d'annonce est **partagé** (temp du système) : un process local
-/// peut y créer des fichiers. Parades :
-/// - le contenu part d'abord dans un fichier temporaire à nom
-///   **imprévisible** (PID + nanos) créé exclusivement (voir
-///   [`open_exclusive`]) — un reliquat de crash est retiré puis la création
-///   repart (`remove_file` ne suit pas un symlink) ;
-/// - juste avant le rename, le temporaire est re-vérifié : s'il a été
-///   substitué par un lien symbolique entre-temps, il est jeté — le rename
-///   ne déplacera jamais un lien ;
-/// - `fs::rename` remplace la destination **sans la suivre** (il écrase le
-///   lien lui-même, pas sa cible) et un lecteur concurrent ne voit jamais un
-///   JSON partiel : l'ancien fichier ou le nouveau, jamais les deux mêlés.
+/// peut y créer des fichiers. Parades, et ce qu'elles garantissent vraiment :
+/// - le contenu part d'abord dans un fichier temporaire au nom **aléatoire**
+///   (`<nom>.json.<pid>.<aléa>.tmp`, 8 octets du CSPRNG de l'OS) créé
+///   exclusivement (voir [`open_exclusive`]) : un nom devinable ne peut pas
+///   être pré-créé pour faire échouer l'écriture ; ce n'est pas un secret ;
+/// - le temporaire est re-vérifié juste avant le rename : un lien substitué
+///   est jeté. Ce contrôle **n'est pas atomique** — une substitution entre
+///   la vérification et `fs::rename` reste possible (TOCTOU sur le dossier
+///   parent), et un lien planté au nom du temporaire serait alors renommé
+///   tel quel. Fermer cette fenêtre demande `openat`/`renameat2`, hors de
+///   portée sans `unsafe` ni dépendance ; elle n'est pas revendiquée ici ;
+/// - `create_new` empêche d'**écrire dans** un fichier existant (`O_EXCL`),
+///   et `fs::rename` remplace l'entrée de destination **sans la suivre** :
+///   un lien déjà planté à `<nom>.json` est écrasé, pas sa cible. Un lecteur
+///   concurrent ne voit jamais un JSON partiel : l'ancien fichier ou le
+///   nouveau, jamais les deux mêlés.
 fn write_atomically(path: &Path, body: &str) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
+    // Nom aléatoire (8 octets du CSPRNG de l'OS) : un voisin local ne peut ni
+    // pré-créer le temporaire pour faire échouer l'écriture ni le deviner
+    // pour le remplacer. Sans entropie disponible, repli sur l'horloge (nom
+    // historique) — l'atomicité ne dépend pas du nom.
+    let suffix = random_suffix().unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos().to_string())
+            .unwrap_or_else(|_| "0".to_string())
+    });
     let mut tmp_name = path.as_os_str().to_os_string();
-    tmp_name.push(format!(".{}.{}.tmp", std::process::id(), nanos));
+    tmp_name.push(format!(".{}.{suffix}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp_name);
     let mut file = match open_exclusive(&tmp) {
         Ok(file) => file,
         Err(_) => {
-            // Reliquat (crash précédent) ou collision à la même nanoseconde :
+            // Reliquat (crash précédent) ou collision improbable du suffixe :
             // `remove_file` retire un éventuel symlink sans suivre sa cible,
             // puis une seule nouvelle tentative exclusive part.
             let _ = fs::remove_file(&tmp);
@@ -434,8 +716,9 @@ fn write_atomically(path: &Path, body: &str) {
         return;
     }
     drop(file);
-    // Dernier garde TOCTOU : le temporaire ne doit pas avoir été substitué
-    // par un lien symbolique entre l'écriture et le rename.
+    // Garde **au mieux** avant le rename : réduit la fenêtre, ne la ferme pas
+    // (voir la doc : sans `openat`, la vérification et le rename ne sont pas
+    // atomiques). Un lien détecté ici est jeté.
     match fs::symlink_metadata(&tmp) {
         Ok(meta) if meta.file_type().is_symlink() => {
             let _ = fs::remove_file(&tmp);
@@ -467,13 +750,17 @@ mod tests {
         assert_eq!(v["pid"], std::process::id());
         assert!(v["exe"].as_str().unwrap().contains("litemcp"));
         assert!(!v["cwd"].as_str().unwrap().is_empty());
-        // L'écriture atomique ne laisse pas de fichier temporaire derrière.
+        // L'écriture atomique ne laisse pas de fichier temporaire derrière —
+        // pour CETTE annonce : le dossier de registre est partagé et un test
+        // parallèle peut y avoir un tmp en vol au moment de la lecture (le
+        // scan global rendait le test instable sans rien prouver de plus).
         let leftovers: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|nom| nom.starts_with("litemcp-test-annonce.json.") && nom.ends_with(".tmp"))
             .collect();
         assert!(
-            !leftovers.iter().any(|f| f.contains(".tmp")),
+            leftovers.is_empty(),
             "aucun fichier temporaire ne doit subsister : {leftovers:?}"
         );
         retract("litemcp-test-annonce", 8123);
@@ -655,5 +942,254 @@ mod tests {
             "le verrou périmé est cassé, la section tourne"
         );
         assert!(!lock.exists(), "le verrou cassé repart propre");
+    }
+
+    /// Le registre vit dans le temp **partagé** : la validation du dossier est
+    /// testée sur des dossiers scratch, jamais sur le dossier réel ni via
+    /// `TMPDIR` (aucune mutation de l'environnement — les tests d'un même
+    /// processus tournent en parallèle).
+    #[cfg(unix)]
+    mod dossier_prive {
+        use super::*;
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+        /// Chemin scratch propre à un test : supprimé avant et après usage.
+        fn scratch(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "litemcp-test-dirprive-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let _ = fs::remove_file(&dir);
+            dir
+        }
+
+        fn poser_mode(dir: &Path, mode: u32) {
+            fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        /// La sonde d'appartenance ne doit pas subsister dans le chemin
+        /// nominal : le retrait est fait **au mieux** (best effort, aucune
+        /// panique s'il échoue), et ces cas-là ne doivent laisser aucun
+        /// résidu.
+        fn sans_residu_sonde(dir: &Path) {
+            let residus: Vec<String> = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|nom| nom.starts_with(".probe-"))
+                .collect();
+            assert!(residus.is_empty(), "sondes résiduelles : {residus:?}");
+        }
+
+        /// Un dossier à nous mais trop ouvert (`0777`, créé par un appelant
+        /// antérieur ou par `create_dir_all` qui applique l'umask) est
+        /// **resserré** en `0700` plutôt que refusé : le registre publie exe,
+        /// argv et cwd, et un refus silencieux priverait MCP Control de
+        /// l'annonce sans que rien ne le signale. Un dossier d'un **autre**
+        /// utilisateur, lui, ne peut pas emprunter ce chemin : la sonde
+        /// échouerait (0700) ou son uid différerait (0777).
+        #[test]
+        fn un_dossier_preexistant_ouvert_aux_autres_est_resserre() {
+            let dir = scratch("0777");
+            fs::DirBuilder::new().create(&dir).unwrap();
+            poser_mode(&dir, 0o777);
+            create_private_dir(&dir).expect("dossier à nous : resserré, pas refusé");
+            assert_eq!(
+                fs::symlink_metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "le mode trop large est corrigé en 0700"
+            );
+            sans_residu_sonde(&dir);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Un dossier à nous en `0300` (écriture + traversée, **sans
+        /// lecture**) passait la validation (aucun bit de groupe/autres) : la
+        /// sonde et l'écriture réussissaient, mais MCP Control — même
+        /// utilisateur — ne pouvait pas `read_dir` : l'annonce était invisible,
+        /// sans erreur. Le dossier est désormais resserré en `0700`, comme un
+        /// dossier trop ouvert : on répare ce qui nous appartient.
+        #[test]
+        fn un_dossier_0300_a_nous_est_resserre_en_0700() {
+            let dir = scratch("0300");
+            fs::DirBuilder::new().create(&dir).unwrap();
+            poser_mode(&dir, 0o300);
+            create_private_dir(&dir).expect("dossier à nous : resserré, pas refusé");
+            let mode = fs::symlink_metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "les bits de lecture du propriétaire sont rétablis (mode {mode:04o})"
+            );
+            sans_residu_sonde(&dir);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Un dossier dont la sonde ne peut pas prouver la propriété est
+        /// refusé : mode déjà privé d'un autre utilisateur (`0700` étranger),
+        /// l'écriture de la sonde est refusée par le système.
+        ///
+        /// Ignoré sous `root` : l'euid 0 traverse les bits de mode, aucune
+        /// écriture ne peut être refusée de cette façon (le contrôle reste
+        /// vrai pour un serveur non privilégié, le cas visé).
+        #[test]
+        fn un_dossier_non_inscriptible_est_refuse() {
+            let dir = scratch("etroit");
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            // Le dossier vient d'être créé par nous : son uid **est** notre
+            // euid. Pas de `libc` pour `geteuid`, et aucun `unsafe`.
+            if fs::metadata(&dir).unwrap().uid() == 0 {
+                let _ = fs::remove_dir_all(&dir);
+                return;
+            }
+            poser_mode(&dir, 0o500);
+            let error = create_private_dir(&dir).expect_err("dossier non inscriptible : refus");
+            assert!(
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+                ),
+                "{error}"
+            );
+            poser_mode(&dir, 0o700);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn un_lien_symbolique_vers_un_dossier_est_refuse() {
+            let cible = scratch("cible");
+            fs::DirBuilder::new().mode(0o700).create(&cible).unwrap();
+            let lien = scratch("lien");
+            std::os::unix::fs::symlink(&cible, &lien).unwrap();
+            // `create_dir_all` réussit en silence sur un lien vers un
+            // dossier : c'est exactement l'angle mort que la validation
+            // ferme.
+            let error = create_private_dir(&lien).expect_err("lien : refus, jamais suivi");
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+            assert!(
+                fs::symlink_metadata(&lien)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "le lien n'est pas remplacé"
+            );
+            let _ = fs::remove_file(&lien);
+            let _ = fs::remove_dir_all(&cible);
+        }
+
+        #[test]
+        fn un_fichier_regulier_au_chemin_est_refuse() {
+            let dir = scratch("fichier");
+            fs::write(&dir, b"pas un dossier").unwrap();
+            let error = create_private_dir(&dir).expect_err("un fichier n'est pas un dossier");
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+            assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_file());
+            let _ = fs::remove_file(&dir);
+        }
+
+        #[test]
+        fn un_dossier_absent_est_cree_en_0700() {
+            let dir = scratch("absent");
+            create_private_dir(&dir).expect("création 0700");
+            let meta = fs::symlink_metadata(&dir).unwrap();
+            assert!(meta.file_type().is_dir(), "un répertoire réel est créé");
+            assert_eq!(
+                meta.permissions().mode() & 0o077,
+                0,
+                "aucun bit de groupe/autres (mode {:04o})",
+                meta.permissions().mode() & 0o777
+            );
+            assert_eq!(meta.permissions().mode() & 0o700, 0o700);
+            sans_residu_sonde(&dir);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn un_dossier_0700_a_nous_est_accepte() {
+            let dir = scratch("0700");
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            poser_mode(&dir, 0o700);
+            create_private_dir(&dir).expect("dossier privé et à nous : accepté");
+            sans_residu_sonde(&dir);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Windows : `create_dir_all` inchangé, mais le chemin doit être un
+    /// répertoire réel — un fichier n'est jamais pris pour le registre.
+    #[cfg(not(unix))]
+    #[test]
+    fn le_chemin_du_registre_doit_etre_un_repertoire() {
+        let dir = std::env::temp_dir().join(format!(
+            "litemcp-test-dirprive-fichier-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&dir);
+        fs::write(&dir, b"pas un dossier").unwrap();
+        assert!(
+            create_private_dir(&dir).is_err(),
+            "un fichier au chemin du registre est refusé"
+        );
+        let _ = fs::remove_file(&dir);
+        create_private_dir(&dir).expect("dossier absent : créé");
+        assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_dir());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Sous Windows, une **jonction** est un point d'analyse : `read_dir` et
+    /// les écritures la suivent. Elle est refusée par le contrôle explicite
+    /// `FILE_ATTRIBUTE_REPARSE_POINT` (mesure 1.85 : `symlink_metadata` la
+    /// rend déjà `is_symlink() == true`, mais le refus ne doit pas dépendre
+    /// de cette classification).
+    ///
+    /// `mklink /J` ne demande pas de privilège particulier (contrairement aux
+    /// liens symboliques) ; si la création échoue (stratégie, volume), le cas
+    /// n'est pas couvrable ici : test auto-ignoré.
+    #[cfg(windows)]
+    #[test]
+    fn une_jonction_est_refusee() {
+        let cible = std::env::temp_dir().join(format!(
+            "litemcp-test-jonction-cible-{}",
+            std::process::id()
+        ));
+        let lien =
+            std::env::temp_dir().join(format!("litemcp-test-jonction-lien-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cible);
+        let _ = fs::remove_dir(&lien);
+        fs::create_dir_all(&cible).unwrap();
+        let created = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&lien)
+            .arg(&cible)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !created {
+            let _ = fs::remove_dir_all(&cible);
+            return;
+        }
+        let error = create_private_dir(&lien).expect_err("jonction : refus, jamais suivie");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        // Le refus vient bien du contrôle explicite des points d'analyse, pas
+        // seulement de `!is_dir()` : `symlink_metadata` d'une jonction rend
+        // déjà `is_dir() == false` sur la toolchain 1.85 (mesuré), mais le
+        // message distingue la branche.
+        assert!(
+            error.to_string().contains("point d'analyse"),
+            "le refus doit venir du contrôle de reparse point : {error}"
+        );
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            assert_eq!(
+                fs::symlink_metadata(&lien).unwrap().file_attributes()
+                    & FILE_ATTRIBUTE_REPARSE_POINT,
+                FILE_ATTRIBUTE_REPARSE_POINT,
+                "la jonction n'est pas remplacée"
+            );
+        }
+        // `remove_dir` retire la jonction elle-même, jamais la cible.
+        let _ = fs::remove_dir(&lien);
+        let _ = fs::remove_dir_all(&cible);
     }
 }

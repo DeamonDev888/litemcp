@@ -1,12 +1,12 @@
 [workspace]
-members = [".", "litemcp-macros"]
+members = [".", "litemcp-macros", "release-tool"]
 
 [package]
 name = "litemcp"
 version = "0.12.0"
 edition = "2024"
 rust-version = "1.85"
-description = "LiteMCP — la lib MCP la plus légère en mémoire et la plus rapide : votre serveur MCP en quelques lignes. Streamable HTTP stateless (POST/SSE sur un socket bindé), zéro runtime async, serde uniquement."
+description = "LiteMCP — la lib MCP la plus légère en mémoire et la plus rapide : votre serveur MCP en quelques lignes. Streamable HTTP stateless (POST/SSE sur un socket bindé), zéro runtime async, trois dépendances directes (serde, serde_json, getrandom)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DeamonDev888/litemcp"
 readme = "README.md"
@@ -31,7 +31,8 @@ macros = ["dep:litemcp-macros"]
 schemars = ["dep:schemars", "dep:jsonschema"]
 # Signature et vérification de requêtes (RFC 9421 + RFC 9530, profil de
 # docs/auth.md) : Ed25519 par `ed25519-dalek`, version exacte. Sans la
-# feature, le crate garde serde + serde_json et rien d'autre.
+# feature, le crate garde ses trois dépendances directes (`serde`, `serde_json`,
+# `getrandom`) et rien d'autre.
 auth-sign = ["dep:ed25519-dalek"]
 # TLS 1.3 serveur (docs/auth.md §8) : `rustls` + `ring`, plus `rcgen` pour le
 # certificat auto-signé **en mémoire** (`self_signed_ephemeral`). Sans `tls12`
@@ -43,13 +44,23 @@ tls = ["dep:rustls", "dep:rcgen"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# CSPRNG du système d'exploitation pour **toutes** les clés et tous les
+# nonces du crate : graine Ed25519, nonces RFC 9421 et clé HMAC des
+# `requestState`. `getrandom` interroge l'API d'entropie de l'OS (pas de
+# générateur ensemencé, pas d'horloge). L'astuce `RandomState`/SipHash qui
+# précédait était un contournement : la std n'en tire les graines qu'une fois
+# par fil et son algorithme n'est pas spécifié — ce n'est pas une source de
+# clés. Dépendance **non optionnelle** : le cœur (`harvest_key`) en dépend
+# même sans feature.
+getrandom = "0.4"
 litemcp-macros = { path = "litemcp-macros", version = "0.4.2", optional = true }
 schemars = { version = "1", optional = true }
 jsonschema = { version = "0.60", default-features = false, optional = true }
 # DL1 = a : la seule crate cryptographique du lot L2. Pas de `default-features`
-# (`alloc`/`std` inutiles ici), `rand_core` pour l'aléa du système et
-# `zeroize` pour effacer la graine à la destruction de `SigningKey`.
-ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["rand_core", "zeroize"], optional = true }
+# (`alloc`/`std` inutiles ici), `zeroize` pour effacer la graine à la
+# destruction de `SigningKey`. L'aléa ne vient **pas** de cette crate : la
+# graine est tirée par `getrandom` (CSPRNG de l'OS) dans le cœur.
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"], optional = true }
 # TLS 1.3 seulement : `ring` comme fournisseur, `std`. Jamais `tls12`, jamais
 # `aws-lc` (cmake/NASM sous Windows). Version épinglée (docs/auth.md §7).
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"], optional = true }
@@ -59,7 +70,7 @@ rcgen = { version = "=0.14.7", default-features = false, features = ["ring"], op
 
 [dev-dependencies]
 # Fuzz du transport HTTP (tests/fuzz_http.rs) — dev uniquement, le cœur du
-# crate garde exactement serde + serde_json.
+# crate garde exactement `serde`, `serde_json` et `getrandom`.
 proptest = "1"
 # Client TLS des tests d'intégration (tests/auth_tls_2026_11_15.rs) : même
 # version que le serveur, avec `tls12` côté client pour **prouver** qu'un

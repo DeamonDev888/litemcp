@@ -25,6 +25,13 @@
 //!    un fichier **illisible** (partage Windows, droits, verrou) reste une
 //!    annonce possible : erreur d'accès = doute, conservé (`skipped`),
 //!    jamais détruit.
+//!    **La lecture est durcie** : le dossier partagé est validé avant tout
+//!    parcours (voir [`sweep_registry`]), seules les entrées **fichiers
+//!    réguliers** sont ouvertes (lien symbolique, dossier, FIFO — dont
+//!    l'ouverture bloquerait le bind —, périphérique : ignorés), la lecture
+//!    est plafonnée à 64 Kio, l'objet ouvert doit être celui inspecté, et
+//!    sous Unix un fichier d'un autre uid que le dossier n'est ni lu ni
+//!    sondé.
 //!    Les annonces d'instances vivantes vérifiées, les fichiers d'un schéma
 //!    inconnu et l'annonce du process courant sont laissés intacts.
 //! 2. **Rien ne reste accroché.** À la fin de vie du serveur lié (arrêt
@@ -62,6 +69,8 @@
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -88,6 +97,12 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// épuisement ; un dossier d'annonce normal contient de l'ordre de l'unité de
 /// fichiers.
 pub const SWEEP_BUDGET: Duration = Duration::from_secs(2);
+
+/// Taille maximale lue dans un fichier d'annonce — une annonce réelle fait
+/// moins de 2 Kio (nom, version, chemin d'exe, argv, cwd) ; le plafond borne
+/// la lecture d'un fichier étranger volumineux, d'un fichier sparse ou d'un
+/// lien déguisé en entrée régulière.
+const ANNOUNCEMENT_MAX_BYTES: u64 = 64 * 1024;
 
 /// Âge au-delà duquel un `.tmp` du registre est un débris (l'écriture d'une
 /// annonce se termine en millisecondes) — un `.tmp` récent peut être le
@@ -122,13 +137,18 @@ pub struct SweepReport {
     /// conservé et compté dans [`Self::skipped`]. Un retrait impossible
     /// n'est jamais compté ici non plus.
     pub corrupt: usize,
-    /// Fichiers d'un schéma inconnu (JSON valide sans `port` utilisable)
-    /// et fichiers qui ne peuvent pas être des annonces au vu du **nommage**
-    /// (`.json` hors nommage d'annonce — nom vide, trop long, `..`,
-    /// séparateur, `:` — et `.tmp` hors nommage de tmp d'annonce
-    /// `<nom>.json.<pid>.<nanos>.tmp`) — laissés en place : ils pourraient
+    /// Entrées **pas des annonces** — laissées en place, sans lecture ni
+    /// sonde quand le type l'interdit : fichiers d'un schéma inconnu (JSON
+    /// valide sans `port` utilisable), entrées qui ne peuvent pas être des
+    /// annonces au vu du **nommage** (`.json` hors nommage d'annonce — nom
+    /// vide, trop long, `..`, séparateur, `:` — et `.tmp` hors nommage de tmp
+    /// d'annonce), entrées qui ne sont **pas des fichiers réguliers**
+    /// (dossier, lien symbolique, FIFO, socket, périphérique) et, sous Unix,
+    /// fichiers dont l'uid diffère de celui du dossier. Ils pourraient
     /// appartenir à une version future du format d'annonce, ou être les
-    /// données d'un dossier arbitraire que [`sweep_dir`] n'a pas à détruire.
+    /// données d'un dossier arbitraire que [`sweep_dir`] n'a pas à détruire ;
+    /// le resserrement en `0700` ne nettoyant pas les dépôts antérieurs d'un
+    /// voisin local, c'est ce compteur qui les neutralise.
     pub foreign: usize,
     /// Annonces du process courant — ignorées : le serveur lié les gère
     /// lui-même (retrait dans le `Drop` de
@@ -137,10 +157,12 @@ pub struct SweepReport {
     /// Fichiers `.tmp` orphelins (plus vieux que [`DEBRIS_AGE`]) retirés.
     pub debris: usize,
     /// Fichiers `.json` laissés **sans sonde** : budget
-    /// [`SWEEP_BUDGET`] de sondes épuisé, fichier illisible (partage,
-    /// droits — l'annonce d'une instance vivante peut être momentanément
-    /// inaccessible : jamais détruite sur un doute), suppression impossible
-    /// (droits, verrou — y compris le retrait d'un débris), ou remplacés
+    /// [`SWEEP_BUDGET`] de sondes épuisé, fichier **au-delà du plafond de
+    /// lecture** (64 Kio — jamais lu, jamais détruit), fichier illisible
+    /// (partage, droits — l'annonce d'une instance vivante peut être
+    /// momentanément inaccessible : jamais détruite sur un doute), fichier
+    /// remplacé entre l'inspection et l'ouverture, suppression impossible
+    /// (droits, verrou — y compris le retrait d'un débris), ou remplacé
     /// entre la sonde et la décision (une annonce plus récente a été
     /// écrite) — laissés en place, rejugés au prochain sweep.
     pub skipped: usize,
@@ -253,16 +275,37 @@ impl ZombieState {
 
 /// Passe le registre d'annonce partagé au peigne fin —
 /// [`registry_dir`](crate::registry::registry_dir). Voir [`sweep_dir`].
+///
+/// Le dossier est **validé avant toute lecture**
+/// (`validate_private_dir`, dans `crate::registry`) :
+/// répertoire réel (Unix : à nous, mode `0700` ; Windows : hors point
+/// d'analyse). Refusé (absent, lien symbolique ou jonction, dossier d'un
+/// autre utilisateur, resserrement impossible) : rapport **vide**, rien n'est
+/// lu ni sondé — un dossier 0777 pré-créé par un voisin local ne peut donc
+/// pas déclencher de sonde `GET /health` ni bloquer le bind avec un FIFO.
 #[must_use]
 pub fn sweep_registry() -> SweepReport {
-    sweep_dir(&crate::registry::registry_dir())
+    sweep_registry_at(&crate::registry::registry_dir())
 }
 
-/// Le nom d'un **tmp d'annonce** — `<nom>.json.<pid>.<nanos>.tmp`, le nommage
-/// exact écrit par `registry::write_atomically` (deux segments **numériques**
-/// entre `.json.` et `.tmp`, précédés d'un nom d'annonce sûr). Un `.tmp` qui
-/// ne porte pas ce nommage n'est jamais un débris d'annonce : fichier
-/// étranger, respecté par le sweep.
+/// [`sweep_registry`] sur un dossier explicite — la validation est la même.
+/// Privé : les tests exercent le refus sur un dossier scratch (le dossier
+/// réel de la machine n'est jamais mis en scène).
+#[must_use]
+fn sweep_registry_at(dir: &Path) -> SweepReport {
+    if crate::registry::validate_private_dir(dir).is_err() {
+        return SweepReport::default();
+    }
+    sweep_dir(dir)
+}
+
+/// Le nom d'un **tmp d'annonce** — `<nom>.json.<pid>.<suffixe>.tmp`, le
+/// nommage écrit par `registry::write_atomically` : nom d'annonce sûr, PID,
+/// puis soit 8 octets du CSPRNG en hexadécimal (16 caractères — nommage
+/// actuel), soit l'ancien suffixe en nanosecondes (tous chiffres, versions
+/// antérieures). Les deux sont reconnus pour que les reliques d'une version
+/// antérieure soient nettoyées. Un `.tmp` qui ne porte pas ce nommage n'est
+/// jamais un débris d'annonce : fichier étranger, respecté par le sweep.
 fn announcement_tmp_name(name: &str) -> bool {
     let Some(core) = name.strip_suffix(".tmp") else {
         return false;
@@ -273,11 +316,12 @@ fn announcement_tmp_name(name: &str) -> bool {
     let tail = &core[pos + ".json.".len()..];
     let mut segments = tail.split('.');
     match (segments.next(), segments.next(), segments.next()) {
-        (Some(pid), Some(nanos), None) => {
+        (Some(pid), Some(suffix), None) => {
             !pid.is_empty()
-                && !nanos.is_empty()
+                && !suffix.is_empty()
                 && pid.bytes().all(|b| b.is_ascii_digit())
-                && nanos.bytes().all(|b| b.is_ascii_digit())
+                && ((suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit()))
+                    || suffix.bytes().all(|b| b.is_ascii_digit()))
                 && crate::registry::is_safe_name(&core[..pos])
         }
         _ => false,
@@ -297,6 +341,59 @@ fn announcement_stem(name: &str) -> Option<&str> {
     }
 }
 
+/// Pourquoi une entrée n'a pas pu être lue comme une annonce — chaque refus
+/// a une conséquence différente dans le bilan (voir [`sweep_dir`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadRefusal {
+    /// Entrée qui n'est pas un fichier régulier (dossier, lien symbolique,
+    /// FIFO, socket, périphérique) : jamais ouverte.
+    NotARegularFile,
+    /// Plus de 64 Kio : ce n'est pas une annonce, et la lire serait une
+    /// lecture non bornée.
+    TooLarge,
+    /// Illisible (droits, partage Windows, verrou), ou **remplacée** entre
+    /// l'inspection et l'ouverture (l'objet ouvert n'est pas celui inspecté).
+    Unreadable,
+}
+
+/// Lit une annonce **sans se laisser détourner** : `inspected` est le
+/// `symlink_metadata` déjà pris sur l'entrée, et l'objet réellement ouvert
+/// doit être **le même** (Unix : `dev` + `ino` lus par `fstat` sur le
+/// descripteur) — un fichier remplacé par un lien ou un autre fichier après
+/// l'inspection est refusé, pas suivi. La lecture est plafonnée à 64 Kio
+/// (constante privée `ANNOUNCEMENT_MAX_BYTES`) : un fichier plus gros n'est
+/// pas une annonce, et le lire épuiserait la mémoire sur un fichier sparse ou
+/// un lien vers un périphérique.
+fn read_announcement(path: &Path, inspected: &fs::Metadata) -> Result<Vec<u8>, ReadRefusal> {
+    let file_type = inspected.file_type();
+    if !file_type.is_file() || file_type.is_symlink() {
+        return Err(ReadRefusal::NotARegularFile);
+    }
+    let file = fs::File::open(path).map_err(|_| ReadRefusal::Unreadable)?;
+    // L'objet réellement ouvert doit être celui inspecté : `fstat` sur le
+    // descripteur, comparé au `symlink_metadata` — un remplacement par un
+    // lien (ou un autre fichier) entre les deux est refusé, pas suivi.
+    #[cfg(unix)]
+    {
+        let opened = file.metadata().map_err(|_| ReadRefusal::Unreadable)?;
+        if (opened.dev(), opened.ino()) != (inspected.dev(), inspected.ino()) {
+            return Err(ReadRefusal::Unreadable);
+        }
+    }
+    let mut body = Vec::new();
+    if file
+        .take(ANNOUNCEMENT_MAX_BYTES + 1)
+        .read_to_end(&mut body)
+        .is_err()
+    {
+        return Err(ReadRefusal::Unreadable);
+    }
+    if body.len() as u64 > ANNOUNCEMENT_MAX_BYTES {
+        return Err(ReadRefusal::TooLarge);
+    }
+    Ok(body)
+}
+
 /// Passe `dir` au peigne fin : retire les annonces **usurpées** (l'adresse
 /// publiée répond avec une identité d'instance différente — décision
 /// re-vérifiée sous le verrou du nom), les `.json` au contenu non-UTF-8 ou
@@ -314,10 +411,29 @@ fn announcement_stem(name: &str) -> Option<&str> {
 /// sont détruits que les fichiers qui portent LE nommage d'annonce écrit par
 /// [`crate::registry`] — `<nom>.json` (nom sûr, voir
 /// `registry::is_safe_name`) et son tmp d'écriture
-/// `<nom>.json.<pid>.<nanos>.tmp`. Tout autre fichier (`.tmp` utilisateur,
+/// `<nom>.json.<pid>.<aléa>.tmp` (ou l'ancien suffixe en nanosecondes, encore
+/// reconnu). Tout autre fichier (`.tmp` utilisateur,
 /// `.json` de données au nom hors nommage) est compté [`SweepReport::foreign`]
 /// et respecté, où que soit le dossier : un nettoyage périodique sur un
 /// dossier de données ne détruit jamais un fichier étranger.
+///
+/// **Lecture durcie** : seules les entrées **fichiers réguliers** sont
+/// ouvertes — l'entrée est inspectée par `symlink_metadata` (jamais
+/// `metadata` : aucun lien n'est suivi), et un dossier, un lien symbolique,
+/// un FIFO (dont l'ouverture bloquerait le sweep), une socket ou un
+/// périphérique est compté [`SweepReport::foreign`] sans être ouvert. La
+/// lecture est plafonnée à 64 Kio (constante privée
+/// `ANNOUNCEMENT_MAX_BYTES` — une annonce réelle fait moins de 2 Kio) ;
+/// au-delà, le fichier est laissé en place (`skipped`), jamais détruit.
+/// L'objet **ouvert** doit être celui inspecté (Unix : `dev` + `ino` lus par
+/// `fstat`) : un fichier remplacé par un lien entre l'inspection et
+/// l'ouverture est refusé, pas suivi. Sous Unix, un fichier dont l'uid
+/// diffère de celui du dossier est ignoré — le resserrement en `0700` ne
+/// nettoie pas les dépôts antérieurs d'un voisin local. **Reste hors de
+/// portée** : un remplacement par un FIFO *entre* l'inspection et
+/// l'ouverture bloquerait l'ouverture (pas d'`O_NONBLOCK` portable sans
+/// constante système) — fenêtre de course sur un dossier déjà partagé, non
+/// revendiquée.
 ///
 /// **Limite assumée** : un `.json` au contenu non parsable dont le nom
 /// ressemble exactement à un nom d'annonce (`<nom>.json`, nom sûr) reste
@@ -342,15 +458,44 @@ pub fn sweep_dir(dir: &Path) -> SweepReport {
     // intervalles où le scheduler retire le CPU au thread n'en font pas
     // partie.
     let mut probe_spent = Duration::ZERO;
+    // Propriétaire du dossier (Unix) : toutes les annonces sont écrites sous
+    // notre identité. Un fichier d'un autre uid déposé dans un dossier
+    // partagé qui nous appartient — le resserrement en 0700 ne nettoie pas
+    // l'existant — n'est ni lu ni sondé. Dossier non inspectable : pas de
+    // filtre (le parcours, lui, a déjà réussi).
+    #[cfg(unix)]
+    let dir_uid = fs::symlink_metadata(dir).ok().map(|meta| meta.uid());
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
             continue;
         };
+        let is_tmp = name.ends_with(".tmp");
+        if !is_tmp && !name.ends_with(".json") {
+            continue; // jamais une annonce : respecté, pas compté
+        }
+        // Type décidé sur `symlink_metadata` — jamais `metadata` : le sweep
+        // ne suit aucun lien. Tout ce qui n'est pas un **fichier régulier**
+        // (dossier, lien symbolique, FIFO, socket, périphérique) est ignoré
+        // sans être ouvert : un FIFO nommé `.json` bloquerait le bind à
+        // l'ouverture, un lien ferait sortir du dossier.
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue; // disparue entre `read_dir` et l'inspection
+        };
+        let file_type = meta.file_type();
+        if !file_type.is_file() || file_type.is_symlink() {
+            report.foreign += 1;
+            continue;
+        }
+        #[cfg(unix)]
+        if dir_uid.is_some_and(|owner| meta.uid() != owner) {
+            report.foreign += 1;
+            continue;
+        }
         // Débris d'écriture : les `.tmp` de `write_atomically` ne sont
         // jamais lus par les consommateurs. Un `.tmp` **récent** peut être
         // celui d'un écrivain vivant — seul un orphelin (vieux) part.
-        if name.ends_with(".tmp") {
+        if is_tmp {
             if announcement_tmp_name(name) {
                 if older_than(&path, DEBRIS_AGE) && fs::remove_file(&path).is_ok() {
                     report.debris += 1;
@@ -363,9 +508,6 @@ pub fn sweep_dir(dir: &Path) -> SweepReport {
             report.foreign += 1;
             continue;
         }
-        if !name.ends_with(".json") {
-            continue; // jamais une annonce : respecté
-        }
         // Nommage : `<nom>.json` où `nom` est un nom d'annonce sûr. Un
         // `.json` dont le nom ne peut pas être celui d'une annonce est un
         // fichier étranger (données d'un dossier arbitraire) : respecté
@@ -375,14 +517,22 @@ pub fn sweep_dir(dir: &Path) -> SweepReport {
             report.foreign += 1;
             continue;
         }
-        let body = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                // Illisible (partage Windows, droits, verrou) : l'annonce
-                // d'une instance VIVANTE peut être momentanément
-                // inaccessible — ce n'est pas une preuve de débris. Doute :
-                // conservée sans sonde, rejugée au prochain sweep.
+        let body = match read_announcement(&path, &meta) {
+            Ok(body) => body,
+            Err(ReadRefusal::TooLarge | ReadRefusal::Unreadable) => {
+                // Trop gros (une annonce réelle fait moins de 2 Kio) : le
+                // fichier n'est pas lu — la lecture serait non bornée — et
+                // n'est pas détruit : ce n'est pas un débris prouvé.
+                // Illisible (partage Windows, droits, verrou) ou remplacé
+                // entre l'inspection et l'ouverture : l'annonce d'une
+                // instance VIVANTE peut être momentanément inaccessible —
+                // doute, conservée sans sonde, rejugée au prochain sweep.
                 report.skipped += 1;
+                continue;
+            }
+            // Défensif : le type et le propriétaire sont déjà contrôlés.
+            Err(ReadRefusal::NotARegularFile) => {
+                report.foreign += 1;
                 continue;
             }
         };
@@ -458,9 +608,30 @@ pub fn sweep_dir(dir: &Path) -> SweepReport {
             continue;
         };
         let removed = crate::registry::with_name_lock(name, || {
-            let relecture = fs::read_to_string(&path)
-                .ok()
-                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok());
+            // Relecture **durcie** : même contrôle de type, de propriétaire,
+            // de taille et d'identité d'objet que la lecture initiale. Un
+            // fichier remplacé par un lien entre la sonde et le retrait
+            // n'est pas suivi — et n'est jamais supprimé sur un doute.
+            let relecture = match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {
+                    #[cfg(unix)]
+                    let owned = dir_uid.is_none_or(|owner| meta.uid() == owner);
+                    #[cfg(not(unix))]
+                    let owned = true;
+                    if owned {
+                        read_announcement(&path, &meta).ok().and_then(|body| {
+                            serde_json::from_slice::<serde_json::Value>(&body).ok()
+                        })
+                    } else {
+                        None
+                    }
+                }
+                Ok(_) => None,
+                // Disparue : un sweep concurrent ou le propriétaire l'a
+                // retirée — même verdict qu'un retrait effectué. Une autre
+                // erreur n'est pas une preuve : conservée.
+                Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+            };
             match relecture {
                 // Toujours la même annonce étrangère (même identité) : le
                 // verdict tient — retrait.
@@ -479,9 +650,10 @@ pub fn sweep_dir(dir: &Path) -> SweepReport {
                 // Remplacée entre-temps (redémarrage) : respectée — c'est
                 // désormais l'annonce d'une autre (nouvelle) instance.
                 Some(_) => false,
-                // Disparue : un sweep concurrent ou le propriétaire l'a
-                // retirée — même verdict.
-                None => true,
+                // Illisible, remplacée par autre chose, ou devenue non
+                // régulière : aucune preuve que ce soit encore l'annonce
+                // sondée — conservée, rejugée au prochain sweep.
+                None => false,
             }
         });
         match removed {
@@ -904,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn un_fichier_illisible_est_conserve_en_doute_jamais_detruit() {
+    fn une_entree_non_reguliere_est_ignoree_jamais_detruite() {
         let dir = std::env::temp_dir().join(format!(
             "litemcp-az-debris-{}-{}",
             std::process::id(),
@@ -914,9 +1086,8 @@ mod tests {
                 .subsec_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
-        // Un **dossier** nommé `*.json` : lecture impossible. Ce n'est pas
-        // une preuve de débris (un fichier peut être momentanément
-        // inaccessible : partage Windows, droits, verrou) — conservé.
+        // Un **dossier** nommé `*.json` : ce n'est pas un fichier, donc
+        // jamais une annonce — ignoré (compté étranger), jamais ouvert.
         let blocked = dir.join("bloque.json");
         fs::create_dir(&blocked).unwrap();
         // Un vrai débris non parsable (contenu lu), lui, part.
@@ -930,8 +1101,12 @@ mod tests {
             "seul le débris effectivement retiré est compté corrupt : {report:?}"
         );
         assert_eq!(
-            report.skipped, 1,
-            "un fichier illisible est conservé et compté skipped : {report:?}"
+            report.foreign, 1,
+            "un dossier nommé .json n'est pas un fichier d'annonce : {report:?}"
+        );
+        assert_eq!(
+            report.skipped, 0,
+            "une entrée non régulière n'est ni lue ni « illisible » : {report:?}"
         );
         assert!(blocked.exists(), "un doute ne détruit jamais le fichier");
         let _ = fs::remove_dir_all(&dir);
@@ -1043,6 +1218,260 @@ mod tests {
                 + report.debris,
             4
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // Durcissement de la lecture (revue 2026-11-20, § 2.1 et 3.1)
+    // ------------------------------------------------------------------
+
+    /// Chemin scratch unique, **non créé** — pour les cas où le test doit
+    /// poser lui-même le type d'entrée (lien, FIFO).
+    fn chemin_scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "litemcp-az-lecture-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Dossier scratch vide, créé pour le test.
+    fn dossier_scratch(tag: &str) -> std::path::PathBuf {
+        let dir = chemin_scratch(tag);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Annonce **complète** (addr + instance) pointant vers `addr` : si le
+    /// sweep la lisait, la sonde ouvrirait une connexion vers l'auditeur.
+    fn annonce_complete(addr: SocketAddr, instance: u64) -> String {
+        serde_json::json!({
+            "name": "piegee", "version": "1.0.0", "addr": addr.to_string(),
+            "port": addr.port(), "instance": instance,
+            "pid": u64::from(u32::MAX - 1),
+        })
+        .to_string()
+    }
+
+    /// Auditeur muet qui **compte** les connexions acceptées (sans jamais
+    /// répondre) : le compteur dit si le sweep a sondé.
+    fn auditeur_compteur() -> (SocketAddr, std::sync::Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let compte = std::sync::Arc::new(AtomicUsize::new(0));
+        let compteur = std::sync::Arc::clone(&compte);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+                compteur.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        (addr, compte)
+    }
+
+    /// Connexions comptées après une connexion de **contrôle** (la nôtre) :
+    /// 1 = le sweep n'a pas sondé ; plus de 1 = il a ouvert une connexion.
+    fn connexions_apres_controle(addr: SocketAddr, compte: &AtomicUsize) -> usize {
+        let _controle = TcpStream::connect(addr).expect("auditeur de contrôle joignable");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while compte.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // L'acceptation est asynchrone : laisse à une éventuelle connexion de
+        // sonde le temps d'être comptée avant de conclure.
+        std::thread::sleep(Duration::from_millis(50));
+        compte.load(Ordering::Relaxed)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn un_lien_symbolique_vers_une_annonce_hors_dossier_est_ignore() {
+        let dir = dossier_scratch("lien");
+        let dehors = dossier_scratch("lien-cible");
+        let (addr, compte) = auditeur_compteur();
+        // La cible est une annonce **valide** hors du dossier : suivre le lien
+        // la lirait et la sonde partirait vers l'auditeur.
+        let cible = dehors.join("piegee.json");
+        fs::write(&cible, annonce_complete(addr, 0xAAAA_AAAA_AAAA_AAAA)).unwrap();
+        let lien = dir.join("piegee.json");
+        std::os::unix::fs::symlink(&cible, &lien).unwrap();
+
+        let report = sweep_dir(&dir);
+        assert!(
+            fs::symlink_metadata(&lien).is_ok(),
+            "le lien n'est pas détruit : {report:?}"
+        );
+        assert_eq!(
+            report.foreign, 1,
+            "un lien n'est pas un fichier d'annonce : {report:?}"
+        );
+        assert_eq!(
+            report.skipped, 0,
+            "un lien n'est même pas ouvert : {report:?}"
+        );
+        assert!(cible.exists(), "la cible hors dossier est intacte");
+        assert_eq!(
+            connexions_apres_controle(addr, &compte),
+            1,
+            "aucune sonde ne doit partir d'un lien : {report:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dehors);
+    }
+
+    #[test]
+    fn un_fichier_au_dela_du_plafond_n_est_ni_lu_ni_sonde() {
+        let dir = dossier_scratch("volumineux");
+        let (addr, compte) = auditeur_compteur();
+        // JSON **valide** complété d'espaces : sans plafond, le parseur
+        // l'accepterait et la sonde partirait. Le plafond seul décide.
+        let mut body = annonce_complete(addr, 0xBBBB_BBBB_BBBB_BBBB);
+        body.push_str(&" ".repeat(ANNOUNCEMENT_MAX_BYTES as usize + 1));
+        let path = dir.join("volumineuse.json");
+        fs::write(&path, body).unwrap();
+
+        let report = sweep_dir(&dir);
+        assert_eq!(
+            report.skipped, 1,
+            "au-delà du plafond : laissé sans lecture : {report:?}"
+        );
+        assert_eq!(
+            report.corrupt, 0,
+            "un fichier trop gros n'est jamais détruit : {report:?}"
+        );
+        assert!(path.exists(), "le fichier reste en place");
+        assert_eq!(
+            connexions_apres_controle(addr, &compte),
+            1,
+            "aucune sonde ne part d'un fichier non lu"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Le nommage des `.tmp` d'annonce couvre le suffixe aléatoire actuel
+    /// **et** l'ancien suffixe en nanosecondes (reliques à nettoyer).
+    #[test]
+    fn le_nommage_des_tmp_couvre_l_alea_et_l_ancien_suffixe() {
+        assert!(announcement_tmp_name(
+            "annonce.json.123.0123456789abcdef.tmp"
+        ));
+        assert!(announcement_tmp_name("annonce.json.123.456.tmp"));
+        assert!(!announcement_tmp_name(
+            "annonce.json.123.0123456789abcde.tmp"
+        ));
+        assert!(!announcement_tmp_name("annonce.json.123..tmp"));
+        assert!(!announcement_tmp_name("sauvegarde.tmp"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn un_fifo_nomme_json_est_ignore_sans_bloquer_le_sweep() {
+        let dir = dossier_scratch("fifo");
+        let fifo = dir.join("x.json");
+        let created = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !created {
+            // Pas de `mkfifo` (ou système de fichiers qui le refuse) : le cas
+            // n'est pas couvrable ici — sans `unsafe`, pas de `mkfifo(3)`
+            // direct. Le test s'auto-ignore plutôt que d'échouer.
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        // Le sweep tourne dans un thread : s'il ouvrait le FIFO, il
+        // bloquerait indéfiniment (aucun écrivain) — le délai le prouve.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dossier = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(sweep_dir(&dossier));
+        });
+        let report = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("un FIFO nommé .json ne doit pas bloquer le sweep");
+        assert_eq!(
+            report.foreign, 1,
+            "un FIFO n'est pas un fichier d'annonce : {report:?}"
+        );
+        assert!(
+            fs::symlink_metadata(&fifo).is_ok(),
+            "le FIFO n'est pas détruit"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn un_dossier_de_registre_non_valide_n_est_ni_lu_ni_sonde() {
+        let cible = dossier_scratch("registre-cible");
+        let (addr, compte) = auditeur_compteur();
+        fs::write(
+            cible.join("piegee.json"),
+            annonce_complete(addr, 0xCCCC_CCCC_CCCC_CCCC),
+        )
+        .unwrap();
+        // Un lien symbolique au chemin du registre : `validate_private_dir`
+        // le refuse (jamais suivi) — le sweep doit rendre un rapport vide
+        // **avant** toute lecture, donc aucune sonde ne part.
+        let lien = chemin_scratch("registre-lien");
+        std::os::unix::fs::symlink(&cible, &lien).unwrap();
+
+        let report = sweep_registry_at(&lien);
+        assert!(
+            report.is_empty(),
+            "dossier non validé : rapport vide, rien n'est lu : {report:?}"
+        );
+        assert_eq!(
+            connexions_apres_controle(addr, &compte),
+            1,
+            "aucune sonde ne part d'un dossier non validé"
+        );
+        assert!(
+            cible.join("piegee.json").exists(),
+            "aucun fichier n'est touché"
+        );
+        let _ = fs::remove_file(&lien);
+        let _ = fs::remove_dir_all(&cible);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn un_fichier_d_un_autre_uid_est_ignore_sans_lecture() {
+        let dir = dossier_scratch("uid");
+        let (addr, compte) = auditeur_compteur();
+        let path = dir.join("etranger.json");
+        fs::write(&path, annonce_complete(addr, 0xDDDD_DDDD_DDDD_DDDD)).unwrap();
+        // Changer le propriétaire exige root (conteneur Linux) : sans ce
+        // droit, le cas n'est pas couvrable — test auto-ignoré.
+        let changed = std::process::Command::new("chown")
+            .args(["12345:12345"])
+            .arg(&path)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !changed {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let report = sweep_dir(&dir);
+        assert_eq!(
+            report.foreign, 1,
+            "uid différent du dossier : ignoré : {report:?}"
+        );
+        assert_eq!(
+            connexions_apres_controle(addr, &compte),
+            1,
+            "un fichier d'un autre uid n'est jamais sondé"
+        );
+        assert!(path.exists(), "le fichier d'un autre uid n'est pas détruit");
         let _ = fs::remove_dir_all(&dir);
     }
 }

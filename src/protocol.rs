@@ -194,7 +194,8 @@ pub mod embedded_request {
 /// Le noyau fait le reste du chemin : validation des requêtes embarquées
 /// (méthode embarquable + capacité client déclarée, sinon `-32021`), frappe
 /// d'un `requestState` opaque signé (HMAC-SHA256, TTL, liaison
-/// méthode/paramètres/id) portant `state`, et sérialisation fil
+/// méthode/paramètres saillants/tour, identité de l'appelant sous
+/// autorisation) portant `state`, et sérialisation fil
 /// `{ resultType: "input_required", inputRequests?, requestState }`.
 ///
 /// ```
@@ -278,7 +279,8 @@ impl InputRequiredSpec {
     }
 
     /// Charge utile **opaque** restituée au handler au tour suivant, une fois
-    /// le `requestState` vérifié (HMAC + TTL + liaison méthode/paramètres/id).
+    /// le `requestState` vérifié (HMAC + TTL + liaison méthode/paramètres
+    /// saillants/tour, identité de l'appelant sous autorisation).
     /// Signée, **pas chiffrée** : n'y mettez aucun secret. Bornée (8 Kio
     /// sérialisés — au-delà, refus en `-32603`).
     #[must_use]
@@ -431,8 +433,8 @@ impl TextContent {
 ///
 /// `data` est **base64** : [`ImageContent::from_bytes`] encode les octets
 /// réels — un binaire n'est jamais déguisé en texte JSON pour simuler le
-/// support. L'encodage est interne (le crate garde exactement deux
-/// dépendances : `serde`, `serde_json`).
+/// support. L'encodage est interne (aucune crate d'encodage : le cœur
+/// n'ajoute que `getrandom` à `serde` et `serde_json`).
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageContent {
     #[serde(rename = "type")]
@@ -654,9 +656,10 @@ pub struct BlobResourceContents {
     pub blob: String,
 }
 
-/// Encodage base64 (alphabet standard, avec padding) — **interne** : le
-/// crate garde exactement deux dépendances (`serde`, `serde_json`),
-/// l'encodage des charges binaires (images, audio, blobs) vit ici.
+/// Encodage base64 (alphabet standard, avec padding) — **interne** : aucune
+/// crate d'encodage n'est tirée (`serde`, `serde_json` et `getrandom` sont
+/// les seules dépendances directes du cœur), l'encodage des charges
+/// binaires (images, audio, blobs) vit ici.
 pub(crate) fn encode_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

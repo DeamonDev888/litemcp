@@ -45,7 +45,7 @@ Trois passes consécutives, même machine, même session :
 | Coût binaire | — | +360 Ko (+80 %) | maison plus légère |
 | Dépendances ajoutées | 0 | +4 (ascii, chunked_transfer, httpdate, log) | maison plus légère |
 
-**Décision tranchée par les chiffres** : la route maison reste le seul backend — plus rapide en régime keep-alive (le cas d'un agent qui parle à ses serveurs), plus légère en deps et en binaire. Le backend alternatif a été **retiré du dépôt** : le crate garde exactement deux dépendances (`serde`, `serde_json`).
+**Décision tranchée par les chiffres** : la route maison reste le seul backend — plus rapide en régime keep-alive (le cas d'un agent qui parle à ses serveurs), plus légère en deps et en binaire. Le backend alternatif a été **retiré du dépôt** : le crate garde trois dépendances directes (`serde`, `serde_json`, `getrandom` depuis le 2026-11-20 ; deux à la date de la décision).
 
 **Optimisations « léger & rapide »** (A/B dos à dos, même machine et même session) :
 
@@ -55,7 +55,7 @@ Trois passes consécutives, même machine, même session :
 | p50 / p99 keep-alive | 0,085–0,112 / 0,157–0,166 ms | **0,061 / 0,095–0,123 ms** | plus serré |
 | Mémoire de lecture par connexion | 8 Ko | **4 Ko** | 1 Mio au plafond de 256 connexions |
 
-Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** par réponse — avant : deux syscalls, deux paquets avec nodelay), parsing d'en-têtes **zéro allocation** (`Origin`/`Host`/`Accept`/`Connection` réduits à des verdicts, sans chaînes ni `Vec`), buffers de lecture réutilisés sur toute la connexion keep-alive, **zéro clone des arguments** dans le dispatch (`params` déplacé hors du JSON parsé, handler et validation travaillent par référence), `route`/`allow_origins` partagés par `Arc`. Dépendances inchangées : toujours exactement deux (`serde`, `serde_json`).
+Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** par réponse — avant : deux syscalls, deux paquets avec nodelay), parsing d'en-têtes **zéro allocation** (`Origin`/`Host`/`Accept`/`Connection` réduits à des verdicts, sans chaînes ni `Vec`), buffers de lecture réutilisés sur toute la connexion keep-alive, **zéro clone des arguments** dans le dispatch (`params` déplacé hors du JSON parsé, handler et validation travaillent par référence), `route`/`allow_origins` partagés par `Arc`. Dépendances inchangées à l'époque : deux (`serde`, `serde_json`) ; elles sont trois depuis le 2026-11-20, `getrandom` fournissant l'aléa.
 
 ## SLO — cibles et campagnes figées
 
@@ -70,7 +70,7 @@ Les leviers : réponse HTTP assemblée dans un seul buffer (**un seul write** pa
 
 `examples/slo` mesure lui-même ses bornes : démarrage in-process, 2 300 requêtes keep-alive (warmup déduit) et `VmRSS` avant/après via `/proc/self/status` (n/a hors Linux) ; il envoie l'enveloppe stricte (3 en-têtes + 2 clés `_meta`) et rend ses chiffres sur le profil par défaut (voir [`BENCH.md`](BENCH.md)).
 
-Les comptes de tests cités dans les anciennes campagnes (**547 / 504 / 481**) sont périmés : mesurés le 2026-11-17, la suite donne **828** tests avec toutes les features, **649** avec le jeu par défaut et **624** sans aucune feature (0 échec) — tous exécutés sous Windows 11 (rustc 1.99.1) ; la CI, elle, tourne sous Linux (matrice complète), et sous Windows et macOS (suite par défaut **et** toutes features).
+Les comptes de tests cités dans les anciennes campagnes (**547 / 504 / 481**) sont périmés : mesurés le 2026-11-20, la suite donne **840** tests avec toutes les features, **661** avec le jeu par défaut et **636** sans aucune feature (0 échec) — tous exécutés sous Windows 11 (rustc 1.99.1) ; la CI, elle, tourne sous Linux (matrice complète), et sous Windows et macOS (suite par défaut **et** toutes features).
 
 ## Tailles de binaire
 
