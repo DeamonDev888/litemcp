@@ -1312,8 +1312,13 @@ fn plafond_d_ecriture_releve_laisse_passer_une_reponse_lente() {
     // A3 (contre-revue) : le défaut (`read_timeout` 300 ms → échéance 1 s)
     // coupe une grosse réponse lue à 32 Kio toutes les 25 ms (~3,2 s) —
     // un client lent mais légitime, servi **en entier** avant L1.
-    // `.write_deadline(10 s)` relève le plafond : la réponse passe.
-    let addr = spawn_gros(Duration::from_secs(10));
+    // `.write_deadline(30 s)` relève le plafond : la réponse passe. Le
+    // plafond doit couvrir la cadence du **lecteur le plus lent** : sur les
+    // runners macOS, le drain des ~8,4 Mo prend ~14 s (granularité des
+    // sleeps + lectures plus petites) contre ~3 s ailleurs — le plafond à
+    // 10 s y coupait la réponse à ~6 Mo (échec CI macOS 2026-11-21 :
+    // « réponse tronquée : 6 031 543 octets reçus sur ~8,4 Mo »).
+    let addr = spawn_gros(Duration::from_secs(30));
     let mut stream = TcpStream::connect(addr).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
