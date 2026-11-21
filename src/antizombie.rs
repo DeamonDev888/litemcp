@@ -865,11 +865,20 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         assert!(port_alive(port), "un auditeur réel répond sur le bouclage");
         drop(listener);
-        assert!(
-            !port_alive(port),
-            "sans auditeur, le bouclage ne répond pas — un non-réponse \
-             n'est pas une preuve de mort (voir la sonde d'identité)"
-        );
+        // macOS : un connect vers un port dont l'auditeur vient de tomber
+        // peut réussir un instant (connexions orphelines du backlog du
+        // listener + coalescence des timers) — la non-réponse se manifeste
+        // avec un léger retard. On sonde jusqu'au refus dans une fenêtre
+        // bornée ; passé ce délai, l'assertion tombe pour de vrai.
+        let echeance = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        while port_alive(port) {
+            assert!(
+                std::time::Instant::now() < echeance,
+                "sans auditeur, le bouclage ne répond pas — un non-réponse \
+                 n'est pas une preuve de mort (voir la sonde d'identité)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[test]
