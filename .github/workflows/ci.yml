@@ -140,7 +140,8 @@ jobs:
   # Garde-fou d'attribution : un trailer `Co-Authored-By: Claude …` inscrit le
   # compte @claude dans la liste des contributeurs du dépôt, d'où il ne peut
   # plus être retiré sans réécrire l'historique public (le commit de v0.12.0 en
-  # porte un, conservé). Aucun commit nouveau ne doit en ajouter.
+  # porte un, conservé). Aucun commit nouveau ne doit en ajouter. Le motif est
+  # ancré en début de ligne : un trailer, pas une simple mention en prose.
   attribution:
     runs-on: ubuntu-latest
     steps:
@@ -165,7 +166,7 @@ jobs:
             echo "aucun commit nouveau a verifier"
             exit 0
           fi
-          if git log --format=%B $commits | grep -Eai 'co-authored-by:.*claude|noreply@anthropic\.com|claude-session:'; then
+          if git log --format=%B $commits | grep -Eai '^[[:space:]]*co-authored-by:.*(claude|anthropic)|^[[:space:]]*claude-session:'; then
             echo "::error::attribution IA detectee dans un message de commit (voir ci-dessus)"
             exit 1
           fi

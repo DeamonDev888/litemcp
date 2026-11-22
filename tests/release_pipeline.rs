@@ -595,11 +595,7 @@ fn ci_refuse_les_trailers_d_attribution_ia() {
         return;
     };
     let job = job_block(&ci, "attribution").expect("le job `attribution` doit exister dans ci.yml");
-    for motif in [
-        "co-authored-by:.*claude",
-        "noreply@anthropic",
-        "claude-session:",
-    ] {
+    for motif in ["co-authored-by:.*(claude|anthropic)", "claude-session:"] {
         assert!(
             job.contains(motif),
             "le job `attribution` doit refuser `{motif}` : {job}"
