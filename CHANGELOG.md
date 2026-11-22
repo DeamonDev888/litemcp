@@ -28,7 +28,7 @@ Tests, CI et dépôt, plus un changement interne sans rupture d'API.
 - `scripts/release.ps1` et `scripts/release-tests.ps1` sont réellement retirés de l'arbre. Le changelog 0.12.1 les annonçait supprimés, mais ils étaient encore suivis. Le commentaire de `ci.yml` renvoie à `release-tool verify`.
 - Renvois vers des fichiers absents du dépôt (rapports d'audit, feuille de route, sondes internes) retirés du README, de la doc et des commentaires de tests. Le lien mort de feuille de route du README est supprimé.
 - `actions/checkout` épinglé sur `v7.0.1` (runtime Node 24) dans les quatre workflows, toujours **par SHA de commit** (politique vérifiée par `tests/release_pipeline.rs`).
-- CI : job `attribution` qui refuse tout trailer `Co-Authored-By: Claude …`, `noreply@anthropic.com` ou `Claude-Session:` dans les commits nouveaux. Le trailer du commit de v0.12.0 reste dans l'historique (pas de réécriture publique) : il inscrit le compte `@claude` dans les contributeurs, et seul un blocage du compte côté GitHub ou un support GitHub peut le retirer sans réécrire.
+- CI : job `attribution` qui refuse, dans les commits nouveaux, tout trailer d'attribution IA (`Co-Authored-By` visant Claude/Anthropic, `Claude-Session:`) ; le motif est ancré en début de ligne, une mention en prose ne le déclenche pas. Contexte : le tag `v0.12.0` pointe encore le commit d'avant l'amend qui porte ce trailer (arbre **identique** à `main`, seul le message diffère), et c'est lui qui avait inscrit `@claude` dans les contributeurs ; `main` n'en contient aucun, et l'index GitHub ne le liste plus.
 
 ## [0.12.1] - 2026-11-21
 
