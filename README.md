@@ -2,7 +2,9 @@
 
 # LiteMCP
 
-**Votre programme Rust *est* le serveur MCP.** Streamable HTTP stateless — un `POST /mcp` par message, réponse `application/json` ou SSE request-scoped — zéro runtime async, trois dépendances directes : `serde`, `serde_json` et un CSPRNG minuscule, `getrandom`.
+**Transformez votre code Rust en serveur MCP en quelques lignes, sans runtime async.**
+
+Déclarez vos outils, ressources et prompts comme des fonctions ordinaires : LiteMCP les sert en Streamable HTTP (`POST /mcp`, réponse JSON ou SSE). Le cœur ne dépend que de `serde`, `serde_json` et `getrandom`.
 
 [![crates.io](https://img.shields.io/crates/v/litemcp.svg)](https://crates.io/crates/litemcp) [![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI)](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml) [![Docs](https://img.shields.io/docsrs/litemcp)](https://docs.rs/litemcp) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
