@@ -709,7 +709,11 @@ fn obs_fold_header_line_is_400() {
 fn over_capacity_connections_get_503() {
     let bound = ServerBuilder::new("cap", "0.2.0")
         .tool("ok", "Répond ok", |_args| Ok(serde_json::json!({})))
-        .read_timeout(std::time::Duration::from_millis(300))
+        // 5 s : le porteur du slot doit survivre a la gigue d'acceptation du
+        // runner. A 300 ms, la fenetre utile n'etait que de 150 ms : la sonde
+        // pouvait etre acceptee apres l'expiration, slot libre, aucun 503
+        // (echec CI macOS 2026-11-22, `over_capacity_connections_get_503`).
+        .read_timeout(std::time::Duration::from_secs(5))
         .max_connections(1)
         .bind("127.0.0.1:0")
         .unwrap();
@@ -1315,7 +1319,11 @@ fn saturated_server_delivers_the_503_to_a_client_that_wrote_first() {
     // (16/20 réponses perdues). Le drain + shutdown(Write) le corrige.
     let bound = ServerBuilder::new("cap", "0.2.0")
         .tool("ok", "Répond ok", |_args| Ok(serde_json::json!({})))
-        .read_timeout(std::time::Duration::from_millis(300))
+        // 5 s : le porteur du slot doit survivre a la gigue d'acceptation du
+        // runner. A 300 ms, la fenetre utile n'etait que de 150 ms : la sonde
+        // pouvait etre acceptee apres l'expiration, slot libre, aucun 503
+        // (echec CI macOS 2026-11-22, `over_capacity_connections_get_503`).
+        .read_timeout(std::time::Duration::from_secs(5))
         .max_connections(1)
         .bind("127.0.0.1:0")
         .unwrap();
