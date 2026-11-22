@@ -583,3 +583,26 @@ fn macros_package_ships_both_licenses() {
         );
     }
 }
+
+/// Garde-fou d'attribution : le trailer `Co-Authored-By: Claude …` du commit
+/// de v0.12.0 reste dans l'historique (aucune réécriture décidée), et c'est
+/// lui qui inscrit le compte @claude dans les contributeurs du dépôt. Le job
+/// `attribution` est la seule protection durable contre un nouveau trailer :
+/// il doit rester dans `ci.yml` et couvrir les trois motifs.
+#[test]
+fn ci_refuse_les_trailers_d_attribution_ia() {
+    let Some(ci) = workflow("ci.yml") else {
+        return;
+    };
+    let job = job_block(&ci, "attribution").expect("le job `attribution` doit exister dans ci.yml");
+    for motif in [
+        "co-authored-by:.*claude",
+        "noreply@anthropic",
+        "claude-session:",
+    ] {
+        assert!(
+            job.contains(motif),
+            "le job `attribution` doit refuser `{motif}` : {job}"
+        );
+    }
+}

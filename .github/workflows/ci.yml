@@ -136,3 +136,37 @@ jobs:
           tool: cargo-deny
       - name: Advisories
         run: cargo deny check advisories
+
+  # Garde-fou d'attribution : un trailer `Co-Authored-By: Claude …` inscrit le
+  # compte @claude dans la liste des contributeurs du dépôt, d'où il ne peut
+  # plus être retiré sans réécrire l'historique public (le commit de v0.12.0 en
+  # porte un, conservé). Aucun commit nouveau ne doit en ajouter.
+  attribution:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Aucun trailer d'attribution IA
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            commits="$(git rev-list -n 1 HEAD)"
+          else
+            commits="$(git rev-list "$base"..HEAD)"
+          fi
+          if [ -z "$commits" ]; then
+            echo "aucun commit nouveau a verifier"
+            exit 0
+          fi
+          if git log --format=%B $commits | grep -Eai 'co-authored-by:.*claude|noreply@anthropic\.com|claude-session:'; then
+            echo "::error::attribution IA detectee dans un message de commit (voir ci-dessus)"
+            exit 1
+          fi
+          echo "aucune attribution IA dans $(printf '%s\n' "$commits" | wc -l) commit(s)"
