@@ -92,12 +92,29 @@ fn c2_pipelining_legitime_reste_servi() {
 // Le timeout de lecture du socket ne doit plus fuir entre requêtes.
 #[test]
 fn m1_timeout_de_lecture_nest_plus_herite() {
-    let addr = spawn_with_timeout(Duration::from_millis(400));
+    let addr = spawn_with_timeout(Duration::from_secs(2));
     let mut a = TcpStream::connect(addr).unwrap();
     a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
-    // Requête 1 : corps dribblé en 7 tranches de 100 ms (dans le budget de
-    // 800 ms) → le socket se voit resserrer son timeout.
+    // read_timeout R = 2 s, budget de requête 2R = 4 s. Le resserrement
+    // (`tighten_read_timeout`) n'agit qu'avant un `fill_buf` lancé quand il
+    // reste moins de R au budget, et pose alors le timeout au budget restant.
+    //
+    // Requête 1 : tout le message sauf trois octets part tout de suite, puis
+    // un octet à 1,5 s, un à S = 2,6 s et le dernier 100 ms plus tard (pour
+    // qu'il n'arrive pas dans le même segment). Chaque attente du serveur
+    // (1,5 s, 1,1 s, 0,1 s) reste sous le timeout par opération R ; le
+    // `fill_buf` lancé à S, lui, démarre avec moins de R au budget et
+    // resserre le timeout à T = 4 − 2,6 ≈ 1,4 s.
+    //
+    // Pourquoi cette forme : la gigue d'un runner (macOS : coalescence des
+    // timers) ne fait qu'allonger S, donc baisser T ; S garde 1,3 s de marge
+    // sous le budget de 4 s, chaque attente 0,5 s sous R. L'ancien dribble en
+    // tranches régulières terminait au mieux avec T ≈ 1,6–2 s : un gap de
+    // 1,5 s passait même timeout hérité — le test ne détectait plus la
+    // régression (vérifié en supprimant la restauration dans
+    // `handle_connection`), et la version encore antérieure (R = 400 ms)
+    // dépassait le budget sur macOS (CI 2026-11-19, 2026-11-21, 2026-11-22).
     let corps = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
     let head = format!(
         "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -105,45 +122,27 @@ fn m1_timeout_de_lecture_nest_plus_herite() {
     );
     let mut buf = head.into_bytes();
     buf.extend_from_slice(corps);
-    let pas = buf.len() / 7;
-    let mut sent = 0usize;
-    // Dribble **autocalibré** : chaque pause vise à finir le corps vers 85 %
-    // du budget de requête (read_timeout × 2 = 800 ms ici), quel que soit le
-    // runner. Les pauses fixes de 100 ms dépassaient le budget sur les
-    // runners macOS (dérive des sleeps + ordonnancement) : `read_body`
-    // répondait alors `400 truncated or slow request body` à la requête 1
-    // (échecs CI macOS 2026-11-19 et 2026-11-21). Le resserrement du timeout
-    // reste engagé en fin de dribble (budget restant < read_timeout), ce que
-    // la requête 2 met ensuite à l'épreuve.
-    let debut_dribble = std::time::Instant::now();
-    while sent < buf.len() {
-        let fin = (sent + pas).min(buf.len());
-        if a.write_all(&buf[sent..fin]).is_err() {
-            break;
-        }
-        sent = fin;
-        if sent < buf.len() {
-            // Pause = budget restant ÷ tranches restantes, bornée [10, 120]
-            // ms : ample sur un runner rapide, resserrée sur un runner lent —
-            // le dribble finit toujours dans le budget.
-            let cible = 680u64.saturating_sub(debut_dribble.elapsed().as_millis() as u64);
-            let restants = ((buf.len() - sent).div_ceil(pas.max(1))) as u64;
-            let pause = (cible / restants.max(1)).clamp(10, 120);
-            std::thread::sleep(Duration::from_millis(pause));
-        }
+    let (debut, fin) = buf.split_at(buf.len() - 3);
+    a.write_all(debut).unwrap();
+    for (pause_ms, octet) in [(1500, 0), (1100, 1), (100, 2)] {
+        std::thread::sleep(Duration::from_millis(pause_ms));
+        a.write_all(&fin[octet..=octet]).unwrap();
     }
     let (st1, _) = read_response(&mut a);
     assert_eq!(st1, "200", "la requête 1 doit réussir");
 
-    // Requête 2 : gap de 300 ms — LÉGAL (300 < read_timeout 400).
-    let gap = Duration::from_millis(300);
+    // Requête 2 : gap G = 1,7 s entre la ligne de requête et la fin des
+    // en-têtes. Légal sous R = 2 s (0,3 s de marge, la gigue d'un `sleep` se
+    // compte en millisecondes), illégal sous le T ≤ 1,4 s hérité : le test
+    // ne passe que si le timeout est restauré entre les requêtes.
+    let gap = Duration::from_millis(1700);
     a.write_all(b"GET /health HTTP/1.1\r\n").unwrap();
     std::thread::sleep(gap);
     a.write_all(b"Host: t\r\n\r\n").unwrap();
     let (st2, _) = read_response(&mut a);
     assert_eq!(
         st2, "200",
-        "la requête 2 (gap légal de 300 ms) doit être servie : le timeout de socket \
+        "la requête 2 (gap légal de 1700 ms) doit être servie : le timeout de socket \
          ne doit pas être hérité de la requête précédente"
     );
 }

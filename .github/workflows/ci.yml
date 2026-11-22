@@ -47,7 +47,7 @@ jobs:
       # servies aux utilisateurs. Tests complets sans les features par défaut,
       # puis CHAQUE feature isolée : testée, pas seulement compilée (une cible
       # de test cassée sous `--features schemars` seule passait la CI). Le gate
-      # de release (`scripts/release.ps1 verify`) exécute les mêmes commandes.
+      # de release (`cargo run -p release-tool -- verify`) exécute les mêmes commandes.
       - name: Tests (sans features par defaut)
         run: cargo test --workspace --no-default-features
       - name: Feature macros isolee

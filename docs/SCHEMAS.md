@@ -96,7 +96,7 @@ ServerBuilder::new("app", "1.0.0")
 
 ## Défauts connus (audit du 2026-11-13)
 
-Relevés par les sondes de l'audit (`.zwork/rapports-2026-11-13/sonde-schemas`), **tous corrigés** par le lot C1 (2026-11-13), puis par le lot D1 pour les deux résidus (bornes de tous les entiers, `Option<T>` + `default`) — le tableau garde la trace du défaut et du comportement retenu :
+Relevés par les sondes de l'audit du 2026-11-13, **tous corrigés** par le lot C1 (2026-11-13), puis par le lot D1 pour les deux résidus (bornes de tous les entiers, `Option<T>` + `default`) — le tableau garde la trace du défaut et du comportement retenu :
 
 | # | Défaut (avant correctif) | Effet (avant correctif) | Comportement actuel |
 |---|---|---|---|

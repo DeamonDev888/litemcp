@@ -81,7 +81,7 @@ Les chiffres de 2026-10-28 (**263 Kio** minimal, **320 Kio** par défaut, **596 
 | Un serveur, un outil `add` en `tool_typed` + schéma `zod` | **984 064 o (961 Kio)** | **984 064 o (961 Kio)** |
 | `cargo build --release --example hello` (3 registres + annotations) | — | **1 015 808 o (992 Kio)** |
 
-Deux enseignements : les macros ne coûtent **rien** quand elles ne sont pas utilisées (le linker élimine `litemcp-macros`, d'où deux binaires identiques au byte près), et un serveur à un outil tient dans **≈ 1 Mio**, pas dans 263 Kio. L'écart avec les chiffres publiés n'a pas été expliqué ; ils sont donc retirés du README plutôt que corrigés à l'estime. Le code exact du consommateur de mesure est conservé avec les sondes d'audit (`.zwork/rapports-2026-11-13/size-min`, `size-def`).
+Deux enseignements : les macros ne coûtent **rien** quand elles ne sont pas utilisées (le linker élimine `litemcp-macros`, d'où deux binaires identiques au byte près), et un serveur à un outil tient dans **≈ 1 Mio**, pas dans 263 Kio. L'écart avec les chiffres publiés n'a pas été expliqué ; ils sont donc retirés du README plutôt que corrigés à l'estime. Le code exact du consommateur de mesure est conservé avec les sondes d'audit (hors dépôt).
 
 ## Comparatif — ViteMCP (TypeScript)
 

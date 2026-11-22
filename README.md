@@ -305,4 +305,4 @@ Soit **×2,1** sur la latence moyenne et **×1,7** sur la mémoire face au meill
 
 `MIT OR Apache-2.0` — [LICENSE-MIT](LICENSE-MIT) · [LICENSE-APACHE](LICENSE-APACHE)
 
-Historique : [CHANGELOG.md](CHANGELOG.md) (politique de versioning incluse) · feuille de route : [docs/ROADMAP.md](https://github.com/DeamonDev888/litemcp/blob/main/docs/ROADMAP.md) · pipeline de publication : [docs/RELEASE.md](https://github.com/DeamonDev888/litemcp/blob/main/docs/RELEASE.md).
+Historique : [CHANGELOG.md](CHANGELOG.md) (politique de versioning incluse) · pipeline de publication : [docs/RELEASE.md](https://github.com/DeamonDev888/litemcp/blob/main/docs/RELEASE.md).

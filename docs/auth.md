@@ -336,7 +336,7 @@ auditer, sans besoin pour MCP Control, qui a son propre socket et appelle `dispa
 
 ## Révisions
 
-- 2026-11-20 — audit `docs/AUDIT-LITEMCP-2026-11-20.md` : aléa `getrandom` (§10.2), oracle d'existence documenté comme
+- 2026-11-20 — audit interne du 2026-11-20 : aléa `getrandom` (§10.2), oracle d'existence documenté comme
   propriété assumée (§5, §11).
 - 2026-11-15 — L3 : `dispatch_verified`/`AuthResponse` (C8), `PinnedServer` (C9 réduit), feature `tls` (TLS 1.3,
   `rcgen`), annonce `authRequired`/`certificateFingerprint`, RFC 9728 minimal, `completion/complete` filtré, transitives

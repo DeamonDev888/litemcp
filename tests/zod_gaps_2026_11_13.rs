@@ -10,7 +10,7 @@
 //! lui-même qui doit être une valeur valide du schéma interne.
 //!
 //! Le constat m1 (A4 — `serde_json` exigé chez l'appelant) est prouvé par la
-//! crate-sonde externe `.zwork/corrections-2026-11-13/sonde-a4/`.
+//! crate-sonde externe de l'audit du 2026-11-13 (hors dépôt).
 
 use litemcp::prelude::*;
 use serde_json::{Value, json};

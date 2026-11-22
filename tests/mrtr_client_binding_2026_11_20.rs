@@ -1,5 +1,5 @@
 //! MRTR — liaison du `requestState` à l'identité de l'appelant (constat n° 2
-//! de `docs/AUDIT-LITEMCP-2026-11-20.md`).
+//! de l'audit interne du 2026-11-20).
 //!
 //! Sous autorisation, un jeton émis pour le client A ne doit pas être
 //! rejouable par B, même quand B détient le même droit sur l'outil : sinon B

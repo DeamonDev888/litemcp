@@ -204,7 +204,7 @@ construction ajouté à `tests/schemars.rs`).
 
 Re-mesure par un agent distinct de la campagne, **machine au repos** (cible de compilation
 dédiée, aucun autre `cargo` en parallèle), cinq runs consécutifs de la commande de la §1,
-médianes par scénario — journaux bruts : `.zwork/rapports-2026-11-13/logs-L6/bench-5runs.log`.
+médianes par scénario (journaux bruts conservés hors dépôt).
 
 | Scénario | Publié (§4/§5) | Re-mesuré (médiane de 5) | Écart |
 |---|---:|---:|---|

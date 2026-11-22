@@ -10,9 +10,23 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - **0.x** jusqu'à la conformance officielle MCP verte (suite 2026-07-28, mode serveur, 0 FAILURE) ; la mention **1.0** attend ce jalon.
 - Chaque version publiée est taguée `vX.Y.Z` sur le commit exact dont elle est issue (`.cargo_vcs_info.json` vérifié avant `cargo publish`).
 
+## [Unreleased]
+
+Aucun changement de code ni d'API : tests, CI et dépôt.
+
+### Corrigé (CI)
+
+- **macOS : `m1_timeout_de_lecture_nest_plus_herite`** échouait depuis 0.12.1 (« la requête 1 doit réussir ») : le dribble en tranches régulières dépassait le budget de requête sur les runners macOS. La version intermédiaire passait, mais **ne détectait plus la régression**, ce qui a été vérifié en supprimant la restauration du timeout dans `handle_connection` : le timeout resserré restait au-dessus du gap testé. Le test resserre maintenant le timeout à 2,6 s (T ≈ 1,4 s, chaque attente du serveur sous `read_timeout`) puis exige un gap légal de 1,7 s. Il échoue bien si la restauration manque. La gigue d'un runner ne fait qu'allonger S, donc baisser T ; la détection suppose que le départ du budget de requête n'est pas retardé de plus de 0,3 s — c'est la marge retenue.
+- Tests sensibles à la plateforme sur macOS : `drain 431` (sonde précoce témoin, borne de libération faisant foi).
+
+### Dépôt
+
+- `scripts/release.ps1` et `scripts/release-tests.ps1` sont réellement retirés de l'arbre. Le changelog 0.12.1 les annonçait supprimés, mais ils étaient encore suivis. Le commentaire de `ci.yml` renvoie à `release-tool verify`.
+- Renvois vers des fichiers absents du dépôt (rapports d'audit, feuille de route, sondes internes) retirés du README, de la doc et des commentaires de tests. Le lien mort de feuille de route du README est supprimé.
+
 ## [0.12.1] - 2026-11-21
 
-**Correctifs de l'audit du 2026-11-20** (`docs/AUDIT-LITEMCP-2026-11-20.md`) : aléa cryptographique, liaison du `requestState` à l'appelant, dossier de registre, file de handlers, comparaison HMAC, plus les points d'information. Une seule rupture côté dépendances : `getrandom` devient une dépendance directe du cœur. Aucune rupture d'API.
+**Correctifs de l'audit du 2026-11-20** (rapport interne, hors dépôt) : aléa cryptographique, liaison du `requestState` à l'appelant, dossier de registre, file de handlers, comparaison HMAC, plus les points d'information. Une seule rupture côté dépendances : `getrandom` devient une dépendance directe du cœur. Aucune rupture d'API.
 
 ### Sécurité
 
@@ -36,7 +50,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 - **`.allowed_hosts`** (n° 7) : la règle est écrite noir sur blanc — tout nom **sans point** est accepté par défaut (nom court non qualifié), un nom pleinement qualifié ou un littéral d'adresse étranger rend `421 Misdirected Request`, et une liste non vide s'**ajoute** aux autorités locales.
 - **Oracle d'existence (n° 6) : assumé et documenté.** Un élément existant non autorisé rend `403` + `-32023` / `right_missing`, un élément absent `-32602` / `Unknown …` : l'existence des noms n'est pas un secret (les listes sont déjà filtrées par appelant, le journal `on_auth_decision` garde le motif réel, jamais le réseau). Si le masquage devenait une exigence, c'est un changement de politique ciblé — répondre « inconnu » aux deux cas — et non un correctif.
-- `docs/auth.md` §10.2 (aléa), `docs/TESTS.md` (comptes et dépendances), `docs/MESURES.md`, `docs/ROADMAP.md`, `docs/SECURITE.md` alignés ; `cargo tree` du noyau : `getrandom`, `serde`, `serde_json`. Les limites assumées (rename non atomique face à un échange de dossier, ACL Windows non contrôlée — `%TEMP%` est par utilisateur —, sonde supprimée au mieux si le système de fichiers refuse le retrait) sont écrites là où elles se lisent, pas seulement dans les rapports d'audit.
+- `docs/auth.md` §10.2 (aléa), `docs/TESTS.md` (comptes et dépendances), `docs/MESURES.md`, `docs/SECURITE.md` alignés ; `cargo tree` du noyau : `getrandom`, `serde`, `serde_json`. Les limites assumées (rename non atomique face à un échange de dossier, ACL Windows non contrôlée — `%TEMP%` est par utilisateur —, sonde supprimée au mieux si le système de fichiers refuse le retrait) sont écrites là où elles se lisent, pas seulement dans les rapports d'audit.
 - **`cargo doc` passe dans les trois configurations de features** : deux liens intra-doc de l'en-tête de `src/lib.rs` pointaient vers `crate::schemars` (module derrière la feature `schemars`) et cassaient `RUSTDOCFLAGS=-D warnings cargo doc` dans toute configuration sans `--all-features` — défaut préexistant, masqué jusqu'ici parce que la CI ne documente qu'en `--all-features`. Les deux références sont rendues en code spans neutres, valables partout.
 
 **CI rouge à 0.12.0 — diagnostic et correctifs (2026-11-21)** : les jobs `windows`/`test` (ubuntu)/`macos` et `advisories` échouaient depuis 0.12.0 (0.11.0 : seul `windows` rouge).
@@ -110,7 +124,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 - **`antizombie::sweep_dir` ne détruit plus que le nommage d'annonce (audit transport § 5.2)** : le sweep retirait **tout** `.json` non parsable et **tout** `.tmp` de plus de 60 s — destructeur s'il était lancé sur un dossier de données. Seuls sont désormais traités les fichiers qui portent le nommage écrit par `registry` : `<nom>.json` (nom accepté par `registry::is_safe_name` — ni vide, ni `.`, ni `..`, ni séparateur, ni `:`, ni plus de 100 octets) et le tmp d'écriture `<nom>.json.<pid>.<nanos>.tmp` (deux segments numériques). Tout autre fichier est compté `SweepReport::foreign` et laissé intact, sans lecture. Limite assumée et documentée : un `.json` non parsable dont le nom est exactement celui d'une annonce reste indistinguable d'un débris et est retiré ;
 
-- **`#[tool(default(...))]` n'exige plus `serde_json` chez l'appelant (audit schémas m1)** : la macro émettait `::serde_json::Value`, introuvable dans une crate qui ne dépend que de `litemcp` (`E0433`, span sur tout l'attribut `#[tool(...)]`). Le code généré référence désormais `::litemcp::serde_json::Value` et `litemcp` ré-exporte publiquement `serde_json` : la dépendance directe n'est plus nécessaire et la version de `serde_json` reste celle de `litemcp`. Vérifié par la sonde `.zwork/corrections-2026-11-13/sonde-a4/` (crate ne dépendant que de `litemcp`) en configuration par défaut **et** en `--no-default-features --features macros` ;
+- **`#[tool(default(...))]` n'exige plus `serde_json` chez l'appelant (audit schémas m1)** : la macro émettait `::serde_json::Value`, introuvable dans une crate qui ne dépend que de `litemcp` (`E0433`, span sur tout l'attribut `#[tool(...)]`). Le code généré référence désormais `::litemcp::serde_json::Value` et `litemcp` ré-exporte publiquement `serde_json` : la dépendance directe n'est plus nécessaire et la version de `serde_json` reste celle de `litemcp`. Vérifié par une sonde interne (hors dépôt, crate ne dépendant que de `litemcp`) en configuration par défaut **et** en `--no-default-features --features macros` ;
 
 - **L'erreur `initialize` du profil strict nomme les versions servies (page *Versioning*, `2026-07-28`)** : « A server that supports only modern versions SHOULD name the protocol versions it supports in any error it returns to an initialize request » — le `-32601 Unknown method: initialize` (HTTP 404) porte désormais `data: {"supported": ["2026-07-28"]}` (`protocol::SUPPORTED_VERSIONS`), même convention que le `-32022`. Additif : les autres méthodes inconnues restent sans `data` et le profil strict ne change pas par ailleurs ; en profil legacy, `initialize` réussit (négociation), le chemin d'erreur n'y existe pas ;
 
@@ -160,7 +174,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 - **`tests/interop_2026_11_08.rs::allow_origins_still_works_for_explicit_deployments`** : le serveur de test déclare `.allowed_hosts(["proxy.example"])` — depuis L1 un `Host` public non déclaré rend `421` ; aucune assertion modifiée ;
 
-- **`.zwork/sondes-macros/`** (neuf, hors paquet) : deux crates-sondes à dépendance `path` vers `litemcp` (`sonde-async`, `sonde-span`) et leur `verifier.ps1` — figent le **message** et la **colonne** de chaque diagnostic de macro, sans `trybuild` ;
+- **Sondes internes de macros** (hors dépôt et hors paquet) : deux crates-sondes à dépendance `path` vers `litemcp` (`sonde-async`, `sonde-span`) et leur `verifier.ps1` — figent le **message** et la **colonne** de chaque diagnostic de macro, sans `trybuild` ;
 
 - **`tests/dispatch_verdict.rs::dispatch_et_dispatch_request_sans_entetes_rendent_le_meme_corps`** : l'assertion d'équivalence `dispatch` / `dispatch_request` est conservée et complétée par les **octets JSON-RPC exacts** des sept corps (deux `-32602` distincts, `-32022` avec `data.supported`, `-32600` sur `id: null`, `-32700` sur JSON invalide, `tools/list` complet, notification sans réponse) — l'équivalence seule était tautologique ;
 
@@ -240,7 +254,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 - **`litemcp-macros` 0.4.1 — aucun contenu nouveau sous une version déjà publiée** : la 0.4.0 est en ligne sur crates.io sans les derniers correctifs des macros ni les licences MIT/Apache ajoutées depuis. La réutiliser publierait un contenu différent sous une version immuable (crates.io refuse la republication et le pipeline traiterait « already uploaded » comme déjà publié). La crate passe en **0.4.1** et l'exigence de la dépendance racine est alignée (`litemcp-macros = { …, version = "0.4.1" }`) ; la racine passe en **0.10.5**, son manifeste changeant lui aussi (exigence 0.4.1) alors que la 0.10.4 est déjà publiée. Ordre de publication inchangé : macros puis racine (`docs/RELEASE.md`). Aucun changement d'API ;
 - **Matrice de features dans la CI et dans le gate de release** — `--all-features` ne prouvait rien des configurations réellement servies aux utilisateurs. `ci.yml` exécute désormais `cargo test --workspace --no-default-features` puis chaque feature isolément (`macros`, `schemars`), et `scripts/release.ps1 verify` rejoue les trois mêmes commandes avant toute publication : le gate de release ne peut pas être plus laxiste que la CI ;
 - **Rustdoc strict en CI et en release** — `cargo doc` est construit avec `RUSTDOCFLAGS=-D warnings` sur tout le workspace ; le dernier lien explicite redondant de `ServerCore` (`src/antizombie.rs`) disparaît ([`ServerCore`] résout le même item). Un lien intra-doc cassé ou redondant rompt maintenant la publication au lieu de passer en avertissement ;
-- **Paquets sans avertissement `audit_target`** — la sonde d'audit privée (`examples/audit_target.rs`, ignorée par Git) était découverte par cargo comme exemple, absente du paquet et signalée à chaque `cargo package` (« ignoring example `audit_target`… »). Elle vit désormais dans `.zwork/audit_target.rs` (hors crate, jamais publiée ; procédure d'exécution dans son en-tête) et le manifeste conserve une exclusion explicite en défense en profondeur si une copie réapparaît le temps d'une campagne. Les deux paquets s'empaquettent sans avertissement, sans changement d'API.
+- **Paquets sans avertissement `audit_target`** — la sonde d'audit privée (`examples/audit_target.rs`, ignorée par Git) était découverte par cargo comme exemple, absente du paquet et signalée à chaque `cargo package` (« ignoring example `audit_target`… »). Elle vit désormais hors du crate (jamais publiée ; procédure d'exécution dans son en-tête) et le manifeste conserve une exclusion explicite en défense en profondeur si une copie réapparaît le temps d'une campagne. Les deux paquets s'empaquettent sans avertissement, sans changement d'API.
 
 ### Tests
 
@@ -481,7 +495,7 @@ Quatre manques signalés à l'usage, tous comblés :
 - **Compte de tests du README** (P3) : « 109 tests » / « 134 tests » → **154** ;
 - **Chiffres du README re-mesurés pour 0.5.1** (P3) : la taille de binaire annoncée (385 Ko) et la latence ne correspondaient plus au code courant — remesuré sur la machine de release : binaire **minimal 148 Kio** (151 552 o), démo `hello` **596 Kio** (610 816 o), keep-alive **0,077–0,086 ms** (3 passes), p50 0,062–0,065 ms, connexions neuves **1 576–1 759 conn/s**, démarrage in-process **5,4 ms**. Les campagnes Linux du 2026-10-24 restent citées à part (serveur dédié) ;
 - **Exemple `curl` du README rendu exact** (P3) : la réponse montrait une forme abrégée (sans `resultType` ni `_meta`) — désormais identique à la sortie réelle ;
-- **Lien `docs/ROADMAP.md` pointé sur GitHub** (P3) : `docs/` est exclu du paquet crates.io (`exclude = [".github", "docs"]`) — le lien relatif était mort sur crates.io et docs.rs ;
+- **Lien vers la feuille de route pointé sur GitHub** (P3) : `docs/` est exclu du paquet crates.io (`exclude = [".github", "docs"]`) — le lien relatif était mort sur crates.io et docs.rs ;
 - **Command Center déplacé en fin de README** (P3) : c'est un **client** consommateur de la lib, pas un composant — la section le présentait au milieu du document, comme une intégration de la lib ;
 - **Suite de tests** : 10 tests de régression dédiés (`tests/audit_2026_10_24.rs`) couvrant les cinq correctifs ci-dessus.
 

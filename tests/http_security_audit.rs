@@ -1154,7 +1154,7 @@ fn client_qui_ne_lit_pas_est_coupe_a_l_echeance_globale() {
     // serveur considère la réponse écrite : rien n'est coupé. Sans borne par
     // tentative, l'appel bloqué ne rend la main qu'au `WRITE_TIMEOUT` (10 s).
     // Les deux mécanismes sont donc nécessaires, et le test tombe si l'un
-    // manque — voir `.zwork/rapports-2026-11-13/LB-echeance-ecriture.md`.
+    // manque (rapport interne LB du 2026-11-13).
     let charge = "x".repeat(7 * 1024 * 1024);
     let bound = ServerBuilder::new("lent", "1.0.0")
         .legacy(true)
