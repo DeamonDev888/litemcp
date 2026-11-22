@@ -12,7 +12,11 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
-Aucun changement de code ni d'API : tests, CI et dépôt.
+Tests, CI et dépôt, plus un changement interne sans rupture d'API.
+
+### Modifié
+
+- **Clé HMAC des `requestState` tirée paresseusement** (point 3.5 de la revue) : `ServerBuilder::new` ne consomme plus d'entropie ; la clé est tirée au premier `core()`/`bind()`, une seule fois, puis partagée par les clones (snapshots de gateway) et les appels suivants. Une clé fournie par `request_state_key` reste prioritaire et n'entraîne aucun tirage. La panique documentée (CSPRNG indisponible) se déplace de `new()` vers `core()`/`bind()`.
 
 ### Corrigé (CI)
 

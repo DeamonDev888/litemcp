@@ -769,9 +769,11 @@ pub struct ServerBuilder {
     max_response_bytes: usize,
     /// Profil protocolaire (strict MCP 2026-07-28 ou legacy).
     protocol_profile: ProtocolProfile,
-    /// Clé HMAC de signature des `requestState` MRTR — récoltée au build
-    /// (mono-instance) ou fournie via [`Self::request_state_key`] (flotte).
-    request_state_key: Arc<Vec<u8>>,
+    /// Clé HMAC de signature des `requestState` MRTR — fournie via
+    /// [`Self::request_state_key`] (flotte) ou **tirée paresseusement** au
+    /// premier `core()`/`bind()` (mono-instance) : construire un builder ne
+    /// consomme aucune entropie tant qu'aucun noyau n'existe.
+    request_state_key: Arc<std::sync::OnceLock<Arc<Vec<u8>>>>,
     /// Durée de vie des `requestState` (défaut [`DEFAULT_REQUEST_STATE_TTL`]).
     request_state_ttl: Duration,
     /// Annonce au MCP Control (voir [`Self::announce`]).

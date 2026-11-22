@@ -136,14 +136,11 @@ fn published_root_kind(root: &Value) -> String {
 impl ServerBuilder {
     /// Nouveau builder — `name`/`version` sont les `serverInfo` MCP.
     ///
-    /// # Panique
-    ///
-    /// Tire **ici** la clé HMAC par défaut des `requestState`
-    /// (`request_state::harvest_key`, `getrandom`) : si le système
-    /// n'a pas d'entropie disponible (seccomp, cible non supportée), la
-    /// construction panique — même si l'appelant compte fournir sa propre clé
-    /// avec `request_state_key`. Sur une cible sans CSPRNG, fournir la clé
-    /// n'est pas une option : le crate n'a pas de repli faible par choix.
+    /// La clé HMAC par défaut des `requestState` n'est **pas** tirée ici : elle
+    /// l'est au premier noyau construit ([`Self::core`], [`Self::bind`]), et
+    /// jamais si l'appelant fournit la sienne avec [`Self::request_state_key`].
+    /// Construire un builder ne consomme donc aucune entropie, et un builder
+    /// abandonné avant tout noyau ne peut pas paniquer faute de CSPRNG.
     #[must_use]
     pub fn new(name: &str, version: &str) -> Self {
         Self {
@@ -178,7 +175,7 @@ impl ServerBuilder {
             request_hooks: Vec::new(),
             max_response_bytes: MAX_RESPONSE_BYTES,
             protocol_profile: ProtocolProfile::Strict2026_07_28,
-            request_state_key: Arc::new(harvest_key()),
+            request_state_key: Arc::new(std::sync::OnceLock::new()),
             request_state_ttl: DEFAULT_REQUEST_STATE_TTL,
             announce: false,
             anti_zombie: false,
@@ -353,7 +350,7 @@ impl ServerBuilder {
             !key.is_empty(),
             "request_state_key: la clé HMAC ne doit pas être vide"
         );
-        self.request_state_key = Arc::new(key.to_vec());
+        self.request_state_key = Arc::new(std::sync::OnceLock::from(Arc::new(key.to_vec())));
         self
     }
 
@@ -1556,8 +1553,23 @@ impl ServerBuilder {
     /// **Instantané** : le cœur capture les outils présents à cet instant.
     /// Un outil enregistré *après* l'appel n'y figure pas — utilisez
     /// [`ServerBuilder::bind`] pour un serveur complet.
+    ///
+    /// # Panique
+    ///
+    /// Tire la clé HMAC par défaut des `requestState` (`harvest_key`,
+    /// `getrandom`) si aucune clé n'a été fournie par
+    /// [`Self::request_state_key`] : sans entropie système (seccomp, cible non
+    /// supportée), la construction du noyau panique — le crate n'a pas de repli
+    /// faible par choix.
     #[must_use]
     pub fn core(&self) -> ServerCore {
+        // Point 3.5 : la clé est tirée **ici** (première construction du
+        // noyau), pas dans `new()` — un builder inutilisé ne consomme pas
+        // d'entropie, et une clé explicite n'en consomme jamais.
+        let request_state_key = Arc::clone(
+            self.request_state_key
+                .get_or_init(|| Arc::new(harvest_key())),
+        );
         let mut tools = self.tools.clone();
         self.merge_pending(&mut tools);
         let mut resources = self.resources.clone();
@@ -1596,7 +1608,7 @@ impl ServerBuilder {
             hooks: Arc::new(self.hooks.clone()),
             auth_gate,
             protocol_profile: self.protocol_profile,
-            request_state_key: Arc::clone(&self.request_state_key),
+            request_state_key,
             request_state_ttl: self.request_state_ttl,
             tools_list_cache: std::sync::OnceLock::new(),
             resources_list_cache: std::sync::OnceLock::new(),
@@ -1831,6 +1843,12 @@ impl ServerBuilder {
         // Compteur hissé AVANT les déplacements partiels de `self` ci-dessous.
         let inflight_handlers = self.inflight_counter();
         let handler_pool = self.handler_pool();
+        // Même raison pour la clé `requestState` : tirée ici si l'appelant n'a
+        // rien fourni (point 3.5 — jamais dans `new()`).
+        let request_state_key = Arc::clone(
+            self.request_state_key
+                .get_or_init(|| Arc::new(harvest_key())),
+        );
         let core = Arc::new(ServerCore {
             name: self.name,
             version: self.version,
@@ -1848,7 +1866,7 @@ impl ServerBuilder {
             hooks: Arc::new(self.hooks),
             auth_gate,
             protocol_profile: self.protocol_profile,
-            request_state_key: Arc::clone(&self.request_state_key),
+            request_state_key,
             request_state_ttl: self.request_state_ttl,
             tools_list_cache: std::sync::OnceLock::new(),
             resources_list_cache: std::sync::OnceLock::new(),
@@ -1937,6 +1955,63 @@ mod tests_l3_tool_timeout {
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "le handler doit être borné, pas attendu"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_cle_request_state_paresseuse {
+    use super::*;
+
+    /// Point 3.5 de la revue : la clé HMAC des `requestState` est tirée au
+    /// **premier noyau** ([`ServerBuilder::core`]), plus à `new()` — et jamais
+    /// quand l'appelant fournit la sienne.
+    #[test]
+    fn la_cle_est_tiree_a_core_et_jamais_a_new() {
+        let avant = crate::request_state::draws();
+        let builder = ServerBuilder::new("paresse", "1.0.0");
+        assert_eq!(
+            crate::request_state::draws(),
+            avant,
+            "ServerBuilder::new ne doit pas tirer la clé HMAC"
+        );
+
+        let _core = builder.core();
+        assert_eq!(
+            crate::request_state::draws(),
+            avant + 1,
+            "core() tire la clé une seule fois"
+        );
+
+        let avant = crate::request_state::draws();
+        let builder = ServerBuilder::new("paresse", "1.0.0")
+            .request_state_key(b"cle explicite de trente-deux octets");
+        let _core = builder.core();
+        assert_eq!(
+            crate::request_state::draws(),
+            avant,
+            "une clé explicite ne consomme aucune entropie"
+        );
+    }
+
+    /// Le tirage paresseux ne casse pas le partage : un clone (snapshot de
+    /// gateway) et les appels successifs à `core()` réutilisent la clé déjà
+    /// tirée — sinon un jeton émis par un snapshot ne se vérifierait plus dans
+    /// le suivant.
+    #[test]
+    fn clones_et_appels_partagent_la_cle_tiree() {
+        let builder = ServerBuilder::new("paresse", "1.0.0");
+        let clone = builder.clone();
+        let a = builder.core();
+        let b = clone.core();
+        assert_eq!(
+            &*a.request_state_key, &*b.request_state_key,
+            "un clone doit partager la clé tirée paresseusement"
+        );
+        let c = builder.core();
+        assert_eq!(
+            &*a.request_state_key, &*c.request_state_key,
+            "deux core() du même builder partagent la clé"
         );
     }
 }

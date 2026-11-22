@@ -133,6 +133,19 @@ pub(crate) fn digest_salient(value: &Value) -> String {
     hex
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tirages effectués **sur ce thread** — preuve, côté tests, que
+    /// `ServerBuilder::new` n'en fait aucun (point 3.5).
+    static DRAWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Nombre de clés tirées sur le thread courant — réservé aux tests.
+#[cfg(test)]
+pub(crate) fn draws() -> usize {
+    DRAWS.with(std::cell::Cell::get)
+}
+
 /// Clé HMAC par défaut d'un process — 32 octets du **CSPRNG du système**
 /// (`getrandom`), sans PID, horloge ni adresse mélangés.
 ///
@@ -149,10 +162,13 @@ pub(crate) fn digest_salient(value: &Value) -> String {
 ///
 /// L'appel **peut bloquer** à l'amorçage précoce du système : `getrandom`
 /// attend que la source d'entropie soit initialisée, sans borne de temps.
-/// `ServerBuilder::new` récolte la clé dès la construction (avant que
-/// l'appelant puisse fournir la sienne) : les deux propriétés s'appliquent
-/// donc au constructeur.
+/// `ServerBuilder::new` ne récolte plus rien : la clé est tirée au premier
+/// `core()`/`bind()` (point 3.5 de la revue), et jamais si l'appelant fournit
+/// la sienne — les deux propriétés s'appliquent donc à la construction du
+/// noyau, pas à celle du builder.
 pub(crate) fn harvest_key() -> Vec<u8> {
+    #[cfg(test)]
+    DRAWS.with(|draws| draws.set(draws.get() + 1));
     let mut key = vec![0u8; 32];
     getrandom::fill(&mut key).expect("the OS entropy source must provide the requestState key");
     key
