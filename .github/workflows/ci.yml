@@ -25,7 +25,7 @@ jobs:
     steps:
       # Actions épinglées par SHA de commit (même politique que les workflows
       # de publication) : un tag peut être déplacé, un SHA non.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
@@ -90,7 +90,7 @@ jobs:
     # pour ne pas bloquer le job principal sur la toolchain stable.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@ccc8c1f930153b792217f06c65a38f23a882993a # 1.85
       - name: Check MSRV
         run: cargo check --workspace --all-targets --all-features
@@ -102,7 +102,7 @@ jobs:
     # (TLS via `ring`, sans cmake ni NASM : vérifié sur Windows 11, rustc 1.99.1).
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Tests (configuration par defaut)
         run: cargo test --workspace
@@ -116,7 +116,7 @@ jobs:
     # Linux. Suite par défaut ET toutes features, comme pour Windows.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Tests (configuration par defaut)
         run: cargo test --workspace
@@ -130,7 +130,7 @@ jobs:
     # compatibles les plus récentes, ce qui est le but ici.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: taiki-e/install-action@98b24ef8830c90613ec3b57343df3abde2b66e56 # cargo-deny
         with:
           tool: cargo-deny
