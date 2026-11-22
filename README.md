@@ -8,7 +8,7 @@ Déclarez vos outils, ressources et prompts comme des fonctions ordinaires : Lit
 
 [![crates.io](https://img.shields.io/crates/v/litemcp.svg)](https://crates.io/crates/litemcp) [![CI](https://img.shields.io/github/actions/workflow/status/DeamonDev888/litemcp/ci.yml?label=CI)](https://github.com/DeamonDev888/litemcp/actions/workflows/ci.yml) [![Docs](https://img.shields.io/docsrs/litemcp)](https://docs.rs/litemcp) ![MSRV](https://img.shields.io/badge/MSRV-1.85-orange) ![Spec](https://img.shields.io/badge/MCP-2026--07--28-blue)
 
-[Premier serveur](#premier-serveur) · [Client](#brancher-un-client) · [Concepts](#concepts) · [Features](#features-cargo) · [Configuration](#configuration-et-valeurs-par-défaut) · [Sécurité](#sécurité) · [Conformité](#conformité-mcp) · [Performances](#performances) · [Limites](#limites) · [FAQ](https://github.com/DeamonDev888/litemcp/blob/main/docs/FAQ.md) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/)
+[Premier serveur](#premier-serveur) · [Client](#brancher-un-client) · [Concepts](#concepts) · [Features](#features-cargo) · [Configuration](#configuration-et-valeurs-par-défaut) · [Authentification](#authentification-012) · [Sécurité](#sécurité) · [Conformité](#conformité-mcp) · [Performances](#performances) · [Limites](#limites) · [FAQ](https://github.com/DeamonDev888/litemcp/blob/main/docs/FAQ.md) · [Tutoriel](https://deamondev888.github.io/litemcp-tuto/)
 
 </div>
 
@@ -101,7 +101,9 @@ La clé et le champ `type` varient d'un client à l'autre (`servers` dans VS Cod
 
 ## Authentification (0.12)
 
-Trois configurations, du plus simple au plus exposé — **sans vérificateur, le comportement du crate est strictement inchangé** (aucune allocation, aucun en-tête retenu).
+**Le problème résolu** : par défaut, quiconque joint le socket peut appeler vos outils. La 0.12 ajoute l'identité (qui parle), les droits (ce qu'il peut toucher) et la confidentialité (TLS).
+
+Trois configurations, **du plus ouvert au plus fermé** — et sans vérificateur, le comportement du crate est strictement inchangé (aucune allocation, aucun en-tête retenu).
 
 **1. Serveur ouvert** (ce que fait `cargo run --example hello`) : rien à changer.
 
@@ -133,6 +135,8 @@ let bound = ServerBuilder::new("calc", "1.0.0")
 # Ok(())
 # }
 ```
+
+> `TestKeyStore` est un magasin en mémoire pour les exemples et les harnais, **pas une implémentation de référence** : en production, fournissez votre `KeyStore` (persistance et chiffrement au repos sont à vous).
 
 Côté client, `auth::sign::Signer::headers(&RequestToSign)` produit les trois en-têtes du profil (Ed25519 RFC 8032, `Content-Digest` RFC 9530, `Signature-Input`/`Signature` RFC 9421) pour **n'importe quel** client HTTP : ajoutez `Content-Digest`, `Signature-Input` et `Signature` à la requête, tel quel. `cargo run --features auth-sign --example auth_sign` montre le vecteur de référence et cinq refus.
 
@@ -243,7 +247,7 @@ Tableau complet (`.on_call`, `.drain_timeout`, `handle.shutdown()`, `GET /health
 
 ## Sécurité
 
-**Modèle de menace assumé : une bibliothèque réseau, pas un service exposé.** Quiconque peut joindre le socket peut appeler vos outils — sauf si vous posez un **verrou de requête**, évalué avant même la lecture du corps :
+**Modèle de menace assumé : une bibliothèque réseau, pas un service exposé.** Quiconque peut joindre le socket peut appeler vos outils — sauf si vous activez l'[authentification par requêtes signées](#authentification-012), ou si vous posez un **verrou de requête**, évalué avant même la lecture du corps :
 
 ```rust
 use litemcp::prelude::*;
