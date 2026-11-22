@@ -1330,8 +1330,8 @@ fn plafond_d_ecriture_releve_laisse_passer_une_reponse_lente() {
     let mut buf = [0u8; 32 * 1024];
     loop {
         assert!(
-            start.elapsed() < Duration::from_secs(20),
-            "test bloqué après {recu} octets"
+            start.elapsed() < Duration::from_secs(40),
+            "test bloqué après {recu} octets (le plafond serveur est à 30 s : ce garde-fou ne doit jamais trancher avant lui)"
         );
         match stream.read(&mut buf) {
             Ok(0) => break,
