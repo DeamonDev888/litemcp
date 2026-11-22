@@ -29,6 +29,7 @@ Tests, CI et dépôt, plus un changement interne sans rupture d'API.
 - Renvois vers des fichiers absents du dépôt (rapports d'audit, feuille de route, sondes internes) retirés du README, de la doc et des commentaires de tests. Le lien mort de feuille de route du README est supprimé.
 - `actions/checkout` épinglé sur `v7.0.1` (runtime Node 24) dans les quatre workflows, toujours **par SHA de commit** (politique vérifiée par `tests/release_pipeline.rs`).
 - CI : job `attribution` qui refuse, dans les commits nouveaux, tout trailer d'attribution IA (`Co-Authored-By` visant Claude/Anthropic, `Claude-Session:`) ; le motif est ancré en début de ligne, une mention en prose ne le déclenche pas. Contexte : le tag `v0.12.0` pointe encore le commit d'avant l'amend qui porte ce trailer (arbre **identique** à `main`, seul le message diffère), et c'est lui qui avait inscrit `@claude` dans les contributeurs ; `main` n'en contient aucun, et l'index GitHub ne le liste plus.
+- Tests du registre isolés : chaque nom d'annonce est unique au processus (PID + compteur) et la tranche de ports de `registre_vie` est décalée par PID, si bien que deux `cargo test --workspace --all-features` simultanés ne se marchent plus dessus (vérifié trois tours de suite, 58 suites vertes de chaque côté). Chemin de production et API publique inchangés.
 
 ## [0.12.1] - 2026-11-21
 

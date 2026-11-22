@@ -28,7 +28,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Dossier de test unique — les sweeps n'y voient que nos fichiers, jamais
@@ -45,6 +45,16 @@ fn unique_dir(tag: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// Nom d'annonce unique au processus : le registre global est partagé par
+/// toutes les exécutions de tests de la machine. `PID` sépare les processus,
+/// le compteur les serveurs d'un même processus (un test peut en lancer
+/// plusieurs).
+fn nom_unique(base: &str) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{base}-{}-{seq}", std::process::id())
 }
 
 /// Dossier de registre partagé, prêt pour l'annonce : sous Unix le crate
@@ -89,16 +99,32 @@ fn write_full_announcement(dir: &Path, name: &str, addr: &str, instance: u64) ->
 /// « mort » que l'autre est en train de sonder (course de harnais observée :
 /// un serveur voisin prenait le port lâché → identité différente → usurpation
 /// « prouvée » alors que le scénario testé était bien un port vide).
-const SERVER_PORTS: std::ops::RangeInclusive<u16> = 23300..=23309;
+/// Tranche de ports propre à CE processus. Les numéros fixes sont partagés
+/// par toutes les exécutions de tests de la machine : deux `cargo test`
+/// simultanés se disputeraient les mêmes ports. Le PID décale la tranche de
+/// 40 numéros (10 serveurs + 10 sondes) ; `grab_fixed_port` et `dead_port`
+/// gardent leur repli sur un port éphémère si la tranche est occupée.
+fn base_ports() -> u16 {
+    static BASE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| 23000 + (std::process::id() % 120) as u16 * 40)
+}
+
+fn server_ports() -> std::ops::RangeInclusive<u16> {
+    let base = base_ports();
+    base..=base + 9
+}
 
 /// Ports de **sonde** (annonces sans auditeur) — aucun test de ce fichier ne
 /// les binde : un refus y reste un refus pendant toute la durée du sweep.
-const PROBE_PORTS: std::ops::RangeInclusive<u16> = 23310..=23319;
+fn probe_ports() -> std::ops::RangeInclusive<u16> {
+    let base = base_ports() + 10;
+    base..=base + 9
+}
 
 /// Un port **fixe et non réattribuable** de la tranche serveur (sous les
 /// plages éphémères) — pour réutiliser LE MÊME port entre deux serveurs.
 fn grab_fixed_port() -> SocketAddr {
-    for port in SERVER_PORTS {
+    for port in server_ports() {
         if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
             let addr = listener.local_addr().unwrap();
             drop(listener);
@@ -112,7 +138,7 @@ fn grab_fixed_port() -> SocketAddr {
 /// Un port libre **jamais bindé par les tests de ce fichier** (annonce sans
 /// aucun auditeur) — listener lâché immédiatement.
 fn dead_port() -> SocketAddr {
-    for port in PROBE_PORTS {
+    for port in probe_ports() {
         if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
             let addr = listener.local_addr().unwrap();
             drop(listener);
@@ -154,7 +180,7 @@ fn spawn_server(
     litemcp::http::ServerHandle,
     std::thread::JoinHandle<std::io::Result<()>>,
 ) {
-    let bound = ServerBuilder::new(&format!("ztest-regvie-{tag}"), "1.0.0")
+    let bound = ServerBuilder::new(&nom_unique(&format!("ztest-regvie-{tag}")), "1.0.0")
         .tool("ping", "Sonner", |_args| {
             Ok(serde_json::json!({ "pong": true }))
         })
@@ -255,7 +281,7 @@ fn annonce_sur_port_reutilise_par_une_autre_instance_est_retiree() {
 #[test]
 fn annonce_ipv6_est_probee_sur_l_adresse_publiee_et_conservee() {
     // Bind IPv6 : indisponible sur certaines machines — test conditionnel.
-    let Ok(bound) = ServerBuilder::new("ztest-regvie-v6", "1.0.0")
+    let Ok(bound) = ServerBuilder::new(&nom_unique("ztest-regvie-v6"), "1.0.0")
         .tool("ping", "Sonner", |_args| {
             Ok(serde_json::json!({ "pong": true }))
         })
@@ -312,7 +338,7 @@ fn bind_non_loopback_est_probee_sur_l_adresse_publiee_et_conservee() {
         return;
     };
     let dir = unique_dir("nonloop");
-    let Ok(bound) = ServerBuilder::new("ztest-regvie-ip", "1.0.0")
+    let Ok(bound) = ServerBuilder::new(&nom_unique("ztest-regvie-ip"), "1.0.0")
         .tool("ping", "Sonner", |_args| {
             Ok(serde_json::json!({ "pong": true }))
         })
@@ -417,7 +443,7 @@ fn l_annonce_reelle_publie_adresse_et_identite_puis_est_retiree() {
 fn handler_terminant_pendant_le_drain_est_compte_zero() {
     let started = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&started);
-    let bound = ServerBuilder::new("ztest-regvie-drain", "1.0.0")
+    let bound = ServerBuilder::new(&nom_unique("ztest-regvie-drain"), "1.0.0")
         .legacy(true)
         .tool("lent", "Termine pendant le drain", move |_args| {
             signal.store(true, Ordering::SeqCst);
@@ -509,11 +535,11 @@ fn annonces_et_retraits_concurrents_ne_detruisent_pas_la_plus_recente() {
     );
     let path = registry.join(format!("{name}.json"));
     let _ = fs::remove_file(&path);
-    let dernier_port_b = *SERVER_PORTS.start();
+    let dernier_port_b = *server_ports().start();
 
     for tour in 0..32u32 {
-        let port_a = SERVER_PORTS.start() + (tour % 10) as u16;
-        let port_b = SERVER_PORTS.start() + ((tour + 7) % 10) as u16;
+        let port_a = server_ports().start() + (tour % 10) as u16;
+        let port_b = server_ports().start() + ((tour + 7) % 10) as u16;
         // Instance A annonce, puis A se retire pendant que B annonce.
         litemcp::registry::announce(&name, "1.0.0", port_a);
         assert!(path.exists(), "tour {tour} : l'annonce A doit exister");

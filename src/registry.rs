@@ -735,16 +735,29 @@ fn write_atomically(path: &Path, body: &str) {
 mod tests {
     use super::*;
 
+    /// Nom d'annonce propre à CE processus et à CE test. Le registre est
+    /// **global** (`%TEMP%/litemcp-registry`) : deux `cargo test` simultanés
+    /// écriraient le même `<nom>.json` (et le même `<nom>.lock`) — l'un
+    /// écraserait ou verrouillerait l'annonce de l'autre. `PID` sépare les
+    /// processus, le compteur les tests d'un même processus (ils tournent en
+    /// parallèle). Calculé une seule fois par test, puis réutilisé tel quel.
+    fn nom_unique(base: &str) -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        format!("{base}-{}-{seq}", std::process::id())
+    }
+
     #[test]
     fn announce_et_retract_ecrivent_puis_suppriment_le_fichier() {
         let dir = registry_dir();
         create_private_dir(&dir).unwrap();
-        let path = dir.join("litemcp-test-annonce.json");
+        let nom = nom_unique("litemcp-test-annonce");
+        let path = dir.join(format!("{nom}.json"));
         let _ = fs::remove_file(&path);
-        announce("litemcp-test-annonce", "9.9.9", 8123);
+        announce(&nom, "9.9.9", 8123);
         let body = fs::read_to_string(&path).expect("l'annonce doit exister");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["name"], "litemcp-test-annonce");
+        assert_eq!(v["name"], nom.as_str());
         assert_eq!(v["version"], "9.9.9");
         assert_eq!(v["port"], 8123);
         assert_eq!(v["pid"], std::process::id());
@@ -754,16 +767,17 @@ mod tests {
         // pour CETTE annonce : le dossier de registre est partagé et un test
         // parallèle peut y avoir un tmp en vol au moment de la lecture (le
         // scan global rendait le test instable sans rien prouver de plus).
+        let prefixe = format!("{nom}.json.");
         let leftovers: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|nom| nom.starts_with("litemcp-test-annonce.json.") && nom.ends_with(".tmp"))
+            .filter(|fichier| fichier.starts_with(&prefixe) && fichier.ends_with(".tmp"))
             .collect();
         assert!(
             leftovers.is_empty(),
             "aucun fichier temporaire ne doit subsister : {leftovers:?}"
         );
-        retract("litemcp-test-annonce", 8123);
+        retract(&nom, 8123);
         assert!(!path.exists(), "retract doit supprimer sa propre annonce");
     }
 
@@ -791,39 +805,40 @@ mod tests {
     fn retract_ne_supprime_que_sa_propre_annonce() {
         let dir = registry_dir();
         create_private_dir(&dir).unwrap();
-        let path = dir.join("litemcp-test-etranger.json");
+        let nom = nom_unique("litemcp-test-etranger");
+        let path = dir.join(format!("{nom}.json"));
         let _ = fs::remove_file(&path);
         // Annonce d'une AUTRE instance (pid fictif) du même nom : notre
         // retract ne doit pas l'effacer.
         let foreign = serde_json::json!({
-            "name": "litemcp-test-etranger", "version": "1",
+            "name": nom.as_str(), "version": "1",
             "port": 1234, "pid": u64::from(u32::MAX - 1),
         });
         fs::write(&path, foreign.to_string()).unwrap();
-        retract("litemcp-test-etranger", 1234);
+        retract(&nom, 1234);
         assert!(path.exists(), "l'annonce d'un autre process doit survivre");
         // Même process, port DIFFÉRENT (instance plus récente) : survit.
         let newer = serde_json::json!({
-            "name": "litemcp-test-etranger", "version": "1",
+            "name": nom.as_str(), "version": "1",
             "port": 5678, "pid": std::process::id(),
         });
         fs::write(&path, newer.to_string()).unwrap();
-        retract("litemcp-test-etranger", 1234);
+        retract(&nom, 1234);
         assert!(
             path.exists(),
             "l'annonce d'une autre instance doit survivre"
         );
         // Corrompu : laissé en place (le lecteur a sa sonde de vie).
         fs::write(&path, "{corrompu").unwrap();
-        retract("litemcp-test-etranger", 1234);
+        retract(&nom, 1234);
         assert!(path.exists(), "un fichier corrompu n'est pas notre annonce");
         // Notre propre annonce (pid ET port du process courant) : supprimée.
         let ours = serde_json::json!({
-            "name": "litemcp-test-etranger", "version": "1",
+            "name": nom.as_str(), "version": "1",
             "port": 1234, "pid": std::process::id(),
         });
         fs::write(&path, ours.to_string()).unwrap();
-        retract("litemcp-test-etranger", 1234);
+        retract(&nom, 1234);
         assert!(!path.exists(), "notre annonce doit être supprimée");
     }
 
@@ -831,9 +846,10 @@ mod tests {
     fn port_zero_refuse() {
         let dir = registry_dir();
         create_private_dir(&dir).unwrap();
-        let path = dir.join("litemcp-test-port0.json");
+        let nom = nom_unique("litemcp-test-port0");
+        let path = dir.join(format!("{nom}.json"));
         let _ = fs::remove_file(&path);
-        announce("litemcp-test-port0", "1", 0);
+        announce(&nom, "1", 0);
         assert!(!path.exists(), "port 0 = pas d'annonce");
     }
 
@@ -841,11 +857,11 @@ mod tests {
     fn announce_at_publie_l_adresse_et_l_identite() {
         let dir = registry_dir();
         create_private_dir(&dir).unwrap();
-        let name = "litemcp-test-announce-at";
+        let name = nom_unique("litemcp-test-announce-at");
         let path = dir.join(format!("{name}.json"));
         let _ = fs::remove_file(&path);
         let addr: SocketAddr = "[::1]:23456".parse().unwrap();
-        announce_at(name, "1.0.0", addr, 0x0123_4567_89AB_CDEF);
+        announce_at(&name, "1.0.0", addr, 0x0123_4567_89AB_CDEF);
         let body = fs::read_to_string(&path).expect("l'annonce doit exister");
         let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -857,7 +873,7 @@ mod tests {
         assert_eq!(doc["pid"], std::process::id());
         // instance nulle : jamais publiée (identité invérifiable = inutile).
         let _ = fs::remove_file(&path);
-        announce_at(name, "1.0.0", addr, 0);
+        announce_at(&name, "1.0.0", addr, 0);
         assert!(!path.exists(), "instance 0 = pas d'annonce");
     }
 
@@ -879,17 +895,18 @@ mod tests {
     #[test]
     fn le_verrou_est_exclusif() {
         create_private_dir(&registry_dir()).unwrap();
-        let acquired = with_name_lock_for("litemcp-test-verrou-exclusif", LOCK_STALE, || {
+        let nom = nom_unique("litemcp-test-verrou-exclusif");
+        let acquired = with_name_lock_for(&nom, LOCK_STALE, || {
             // Verrou tenu et frais : un second acquire du même nom attend en
             // vain jusqu'au délai d'acquisition et renonce — jamais un accès
             // concurrent à la section critique.
-            let nested = with_name_lock_for("litemcp-test-verrou-exclusif", LOCK_STALE, || 1);
+            let nested = with_name_lock_for(&nom, LOCK_STALE, || 1);
             assert_eq!(nested, None, "verrou tenu : le second acquire renonce");
             2
         });
         assert_eq!(acquired, Some(2), "la section critique tourne sous verrou");
         assert_eq!(
-            with_name_lock_for("litemcp-test-verrou-exclusif", LOCK_STALE, || 3),
+            with_name_lock_for(&nom, LOCK_STALE, || 3),
             Some(3),
             "libéré : le suivant prend le verrou"
         );
@@ -898,11 +915,11 @@ mod tests {
     #[test]
     fn retract_est_serialise_par_le_verrou_de_nom() {
         create_private_dir(&registry_dir()).unwrap();
-        let name = "litemcp-test-retract-serie";
+        let name = nom_unique("litemcp-test-retract-serie");
         let path = registry_dir().join(format!("{name}.json"));
         let _ = fs::remove_file(&path);
         let ours = serde_json::json!({
-            "name": name, "version": "1", "port": 1234,
+            "name": name.as_str(), "version": "1", "port": 1234,
             "pid": std::process::id(),
         });
         fs::write(&path, ours.to_string()).unwrap();
@@ -911,7 +928,7 @@ mod tests {
         // concurrent RENONCE — il ne détruit pas l'annonce sur une décision
         // prise pendant qu'un autre process occupait la section critique.
         let nom = name.to_string();
-        let held = with_name_lock(name, || {
+        let held = with_name_lock(&name, || {
             let retire = std::thread::spawn(move || retract(&nom, 1234));
             std::thread::sleep(Duration::from_millis(300));
             retire.join().unwrap();
@@ -923,19 +940,19 @@ mod tests {
         );
 
         // Verrou libéré : le retrait exécute sa décision fraîche et détruit.
-        retract(name, 1234);
+        retract(&name, 1234);
         assert!(!path.exists(), "verrou libre : le retrait part normalement");
     }
 
     #[test]
     fn un_verrou_abandonne_est_casse_par_age() {
         create_private_dir(&registry_dir()).unwrap();
-        let name = "litemcp-test-verrou-mort";
+        let name = nom_unique("litemcp-test-verrou-mort");
         let lock = registry_dir().join(format!("{name}.lock"));
         // Simule un process tué pendant sa section critique : le dossier de
         // verrou reste, personne ne le libérera jamais.
         fs::create_dir(&lock).unwrap();
-        let result = with_name_lock_for(name, Duration::from_millis(0), || 42);
+        let result = with_name_lock_for(&name, Duration::from_millis(0), || 42);
         assert_eq!(
             result,
             Some(42),

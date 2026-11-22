@@ -610,11 +610,14 @@ fn le_document_rfc_9728_est_honnete_et_reserve_a_l_autorisation() {
 
 #[test]
 fn l_annonce_publie_l_authentification_sans_secret() {
-    let nom = "litemcp-test-l3-annonce";
+    // Nom unique au processus : le registre est global, deux `cargo test`
+    // simultanés écriraient le même fichier — l'un retirerait l'annonce de
+    // l'autre.
+    let nom = format!("litemcp-test-l3-annonce-{}", std::process::id());
     let empreinte = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     let adresse: SocketAddr = "127.0.0.1:23456".parse().unwrap();
     litemcp::registry::announce_at_with(
-        nom,
+        &nom,
         "1.0.0",
         adresse,
         0x1234_5678_9ABC_DEF0,
@@ -635,7 +638,7 @@ fn l_annonce_publie_l_authentification_sans_secret() {
             "l'annonce ne doit rien publier de secret ({interdit}) : {texte}"
         );
     }
-    litemcp::registry::retract(nom, 23456);
+    litemcp::registry::retract(&nom, 23456);
     assert!(!chemin.exists(), "retrait de l'annonce de test");
 }
 
