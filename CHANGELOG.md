@@ -17,6 +17,7 @@ Tests, CI et dépôt, plus un changement interne sans rupture d'API.
 ### Modifié
 
 - **Clé HMAC des `requestState` tirée paresseusement** (point 3.5 de la revue) : `ServerBuilder::new` ne consomme plus d'entropie ; la clé est tirée au premier `core()`/`bind()`, une seule fois, puis partagée par les clones (snapshots de gateway) et les appels suivants. Une clé fournie par `request_state_key` reste prioritaire et n'entraîne aucun tirage. La panique documentée (CSPRNG indisponible) se déplace de `new()` vers `core()`/`bind()`.
+- **Description du paquet** (`Cargo.toml`) : « trois dépendances directes » devient « un cœur qui ne dépend que de serde, serde_json et getrandom » — `litemcp-macros` est aussi une dépendance directe du build par défaut. Visible sur crates.io à la prochaine publication.
 
 ### Corrigé (CI)
 
