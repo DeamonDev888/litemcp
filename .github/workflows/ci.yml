@@ -139,9 +139,11 @@ jobs:
 
   # Garde-fou d'attribution : un trailer `Co-Authored-By: Claude …` inscrit le
   # compte @claude dans la liste des contributeurs du dépôt, d'où il ne peut
-  # plus être retiré sans réécrire l'historique public (le commit de v0.12.0 en
-  # porte un, conservé). Aucun commit nouveau ne doit en ajouter. Le motif est
-  # ancré en début de ligne : un trailer, pas une simple mention en prose.
+  # plus être retiré sans réécrire l'historique public. Aucun commit du dépôt
+  # n'en porte plus : le tag v0.12.0 a été déplacé sur le commit amendé de la
+  # release (arbre identique, message seul différent). Aucun commit nouveau ne
+  # doit en ajouter. Le motif est ancré en début de ligne : un trailer, pas une
+  # simple mention en prose.
   attribution:
     runs-on: ubuntu-latest
     steps:
