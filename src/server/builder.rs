@@ -133,6 +133,25 @@ fn published_root_kind(root: &Value) -> String {
     "racine sans type".to_string()
 }
 
+/// Joint les candidats de la liste `Access-Control-Allow-Headers` du
+/// préflight : dédupliqués **sans tenir compte de la casse** (les noms
+/// d'en-têtes sont insensibles à la casse, RFC 9110 §5.1), la première
+/// graphie gagne, et l'ordre d'annonce est l'ordre d'insertion (stable :
+/// base, signature, catalogue dans l'ordre du `BTreeMap`, déclarations
+/// utilisateur).
+fn joindre_en_tetes_preflight(candidats: impl IntoIterator<Item = String>) -> String {
+    let mut retenus: Vec<String> = Vec::new();
+    for nom in candidats {
+        if !retenus
+            .iter()
+            .any(|existant| existant.eq_ignore_ascii_case(&nom))
+        {
+            retenus.push(nom);
+        }
+    }
+    retenus.join(", ")
+}
+
 impl ServerBuilder {
     /// Nouveau builder — `name`/`version` sont les `serverInfo` MCP.
     ///
@@ -148,6 +167,7 @@ impl ServerBuilder {
             version: version.to_string(),
             route: "/mcp".to_string(),
             allow_origins: Vec::new(),
+            allow_preflight_headers: Vec::new(),
             allowed_hosts: Vec::new(),
             read_timeout: crate::http::READ_TIMEOUT,
             write_deadline: None,
@@ -675,6 +695,74 @@ impl ServerBuilder {
     #[must_use]
     pub fn allow_origins(mut self, origins: &[&str]) -> Self {
         self.allow_origins = origins.iter().map(|o| (*o).to_string()).collect();
+        self
+    }
+
+    /// Annonce un **en-tête de requête** supplémentaire dans la réponse de
+    /// préflight CORS (`OPTIONS`) — cumulable : chaque appel s'ajoute aux
+    /// précédents.
+    ///
+    /// La liste `Access-Control-Allow-Headers` est calculée **une fois au
+    /// bind** : liste de base (`Content-Type`, `Accept`,
+    /// `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`), complétée
+    /// automatiquement par les en-têtes de signature (`Content-Digest`,
+    /// `Signature-Input`, `Signature`) dès qu'un vérificateur
+    /// ([`Self::verifier`]) est configuré, puis par les `Mcp-Param-<suffixe>`
+    /// déclarés par les outils (SEP-2243). Cette méthode couvre le reste : un
+    /// en-tête que **votre** application consomme mais que le crate ne peut
+    /// pas deviner — un jeton `Authorization` lu par un hook
+    /// [`Self::on_request`], une clé d'API maison. Un navigateur rejette au
+    /// préflight toute requête portant un en-tête non annoncé : sans cette
+    /// déclaration, le client cross-origin autorisé par
+    /// [`Self::allow_origins`] restait bloqué.
+    ///
+    /// Les doublons sont éliminés sans tenir compte de la casse (la première
+    /// graphie gagne) et déclarer un en-tête déjà couvert par la liste
+    /// automatique est sans effet.
+    ///
+    /// # Panics
+    ///
+    /// Si `name` est vide ou contient autre chose que de l'ASCII (hors
+    /// espaces et `:`) — même contrat que les `x-mcp-header` de [`zod`].
+    ///
+    /// # Exemple
+    ///
+    /// ```no_run
+    /// use litemcp::prelude::*;
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// ServerBuilder::new("calc", "1.0.0")
+    ///     .tool("add", "Additionne", |_args| Ok(serde_json::json!({})))
+    ///     .on_request(|ctx| {
+    ///         ctx.header("Authorization")
+    ///             .and_then(|v| v.strip_prefix("Bearer "))
+    ///             .map(|_| ())
+    ///             .ok_or_else(|| {
+    ///                 RequestRejection::unauthorized("missing bearer token")
+    ///             })
+    ///     })
+    ///     // Le hook lit `Authorization` : le préflight doit l'annoncer au
+    ///     // navigateur, sinon la requête cross-origin est bloquée avant
+    ///     // même d'atteindre le hook.
+    ///     .allow_preflight_header("Authorization")
+    ///     .bind("127.0.0.1:23080")?
+    ///     .serve()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn allow_preflight_header(mut self, name: &str) -> Self {
+        assert!(
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii() && b != b' ' && b != b':'),
+            "litemcp : en-tête de préflight `{name}` invalide — nom ASCII non vide, sans espace ni `:` requis"
+        );
+        if !self
+            .allow_preflight_headers
+            .iter()
+            .any(|existant| existant.eq_ignore_ascii_case(name))
+        {
+            self.allow_preflight_headers.push(name.to_string());
+        }
         self
     }
 
@@ -1833,6 +1921,39 @@ impl ServerBuilder {
         apply_rights(&self.resource_rights, templates.iter_mut(), |def| {
             &mut def.required_rights
         });
+        // B3 (audit 2026-11-25) : la liste `Access-Control-Allow-Headers`
+        // du préflight CORS est calculée **une fois ici** (chemin froid du
+        // bind) — la liste figée d'avant bloquait tout client navigateur qui
+        // envoyait un en-tête légitime non annoncé : signature RFC 9421
+        // (`Content-Digest`, `Signature-Input`, `Signature`) dès qu'un
+        // vérificateur est configuré, jeton d'un hook utilisateur
+        // (`Authorization`), paramètre promu en en-tête (`Mcp-Param-*`,
+        // SEP-2243). Ordre annoncé : base, signature, paramètres promus
+        // (catalogue parcouru dans l'ordre du `BTreeMap`, donc stable), puis
+        // les déclarations utilisateur — dédupliqués sans tenir compte de la
+        // casse par `joindre_en_tetes_preflight`.
+        const EN_TETES_BASE: [&str; 5] = [
+            "Content-Type",
+            "Accept",
+            "MCP-Protocol-Version",
+            "Mcp-Method",
+            "Mcp-Name",
+        ];
+        const EN_TETES_SIGNATURE: [&str; 3] = ["Content-Digest", "Signature-Input", "Signature"];
+        let mut candidats: Vec<String> =
+            Vec::with_capacity(EN_TETES_BASE.len() + EN_TETES_SIGNATURE.len() + tools.len());
+        candidats.extend(EN_TETES_BASE.iter().map(|nom| (*nom).to_string()));
+        if self.verifier.is_some() {
+            candidats.extend(EN_TETES_SIGNATURE.iter().map(|nom| (*nom).to_string()));
+        }
+        for outil in tools.values() {
+            for parametre in &outil.mcp_params {
+                let suffixe = &parametre.header_suffix;
+                candidats.push(format!("Mcp-Param-{suffixe}"));
+            }
+        }
+        candidats.extend(self.allow_preflight_headers.iter().cloned());
+        let allow_preflight_headers = joindre_en_tetes_preflight(candidats);
         let auth_gate = self.auth_gate();
         let meta = json!({
             protocol::META_SERVER_INFO: ServerInfo {
@@ -1881,6 +2002,7 @@ impl ServerBuilder {
             core,
             route: Arc::new(self.route),
             allow_origins: Arc::new(self.allow_origins),
+            allow_preflight_headers,
             allowed_hosts: Arc::new(self.allowed_hosts),
             request_hooks: Arc::new(self.request_hooks),
             read_timeout: self.read_timeout,
@@ -2012,6 +2134,45 @@ mod tests_cle_request_state_paresseuse {
         assert_eq!(
             &*a.request_state_key, &*c.request_state_key,
             "deux core() du même builder partagent la clé"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_b3_preflight {
+    use super::*;
+
+    /// B3 : déduplication insensible à la casse (première graphie gagnante),
+    /// ordre d'insertion stable, doublons éliminés entre la base, les
+    /// paramètres promus et les déclarations utilisateur.
+    #[test]
+    fn la_jointure_dedoublonne_sans_tenir_compte_de_la_casse_et_garde_l_ordre() {
+        let liste = joindre_en_tetes_preflight(
+            [
+                "Content-Type",
+                "Accept",
+                "Content-Type",
+                "Mcp-Param-count",
+                "content-type",
+                "Authorization",
+                "authorization",
+            ]
+            .iter()
+            .map(|nom| (*nom).to_string()),
+        );
+        assert_eq!(
+            liste, "Content-Type, Accept, Mcp-Param-count, Authorization",
+            "chaque en-tête une seule fois, ordre d'insertion conservé"
+        );
+    }
+
+    /// Cas limites : liste vide et candidat unique.
+    #[test]
+    fn la_jointure_est_minimale() {
+        assert_eq!(joindre_en_tetes_preflight(std::iter::empty::<String>()), "");
+        assert_eq!(
+            joindre_en_tetes_preflight(["Authorization"].iter().map(|nom| (*nom).to_string())),
+            "Authorization"
         );
     }
 }

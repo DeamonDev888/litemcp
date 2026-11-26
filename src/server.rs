@@ -707,6 +707,11 @@ pub struct ServerBuilder {
     version: String,
     route: String,
     allow_origins: Vec<String>,
+    /// En-têtes de requête déclarés par l'utilisateur pour le préflight
+    /// CORS ([`Self::allow_preflight_header`]) — s'ajoutent, au bind, à la
+    /// liste calculée automatiquement (base, en-têtes de signature du
+    /// vérificateur, paramètres promus des outils).
+    allow_preflight_headers: Vec<String>,
     /// Hôtes acceptés dans l'en-tête `Host` — vide : règle locale par
     /// défaut, voir [`Self::allowed_hosts`].
     allowed_hosts: Vec<String>,

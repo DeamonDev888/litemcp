@@ -30,6 +30,10 @@ pub(super) struct ConnectionEnv<'a> {
     /// En-tête d'identité d'instance (`X-Instance-Id: …`) émis par la sonde
     /// `/health` — pré-formaté une fois par serveur lié (chemin froid).
     pub(super) instance_headers: &'a str,
+    /// Liste `Access-Control-Allow-Headers` du préflight CORS — pré-jointe
+    /// une fois par serveur lié (voir `ServerBuilder::finish`), annoncée
+    /// telle quelle (B3, audit 2026-11-25).
+    pub(super) allow_preflight_headers: &'a str,
     pub(super) read_timeout: Duration,
     /// Échéance globale d'écriture déjà résolue (plafond explicite ou défaut
     /// dérivé de `read_timeout`) — calculée une fois par serveur lié.
@@ -53,6 +57,7 @@ pub(super) fn handle_connection(stream: Conn, env: ConnectionEnv<'_>) -> std::io
         allowed_hosts,
         request_hooks,
         instance_headers,
+        allow_preflight_headers,
         read_timeout,
         write_budget,
         connection_ttl,
@@ -1281,7 +1286,14 @@ pub(super) fn handle_connection(stream: Conn, env: ConnectionEnv<'_>) -> std::io
                 )?;
                 return Ok(());
             };
-            respond_preflight(&mut stream, response_version, origin, !close, write_budget)?;
+            respond_preflight(
+                &mut stream,
+                response_version,
+                origin,
+                allow_preflight_headers,
+                !close,
+                write_budget,
+            )?;
             if close {
                 break;
             }

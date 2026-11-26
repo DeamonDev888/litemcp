@@ -9,21 +9,29 @@ use super::*;
 /// sur un `204`), l'origine autorisée **echoée** (jamais `*` : la liste
 /// `allow_origins` est un vote par origine, pas un wildcard) et `Vary:
 /// Origin` pour que les caches ne servent pas la réponse d'une autre origine.
+///
+/// `allow_headers` est la liste `Access-Control-Allow-Headers` **calculée
+/// une fois au bind** par `ServerBuilder::finish` (liste de base, en-têtes
+/// de signature du vérificateur, paramètres promus des outils, déclarations
+/// utilisateur — B3, audit 2026-11-25) : annoncer tous les en-têtes que le
+/// serveur accepte évite qu'un navigateur bloque au préflight un client
+/// cross-origin par ailleurs autorisé.
 pub(super) fn respond_preflight(
     stream: &mut Conn,
     version: &str,
     origin: &str,
+    allow_headers: &str,
     keep_alive: bool,
     write_budget: Duration,
 ) -> std::io::Result<()> {
-    let mut tete = String::with_capacity(256 + origin.len());
+    let mut tete = String::with_capacity(256 + origin.len() + allow_headers.len());
     let connection = if keep_alive { "keep-alive" } else { "close" };
     write!(
         tete,
         "{version} 204 No Content\r\n\
          Access-Control-Allow-Origin: {origin}\r\n\
          Access-Control-Allow-Methods: POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type, Accept, MCP-Protocol-Version, Mcp-Method, Mcp-Name\r\n\
+         Access-Control-Allow-Headers: {allow_headers}\r\n\
          Access-Control-Max-Age: 600\r\n\
          Vary: Origin\r\n\
          Connection: {connection}\r\n\r\n"

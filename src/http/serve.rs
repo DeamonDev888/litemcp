@@ -19,6 +19,11 @@ pub struct BoundServer {
     /// Hooks de requête ([`crate::ServerBuilder::on_request`]) — vide : le
     /// transport ne retient aucun en-tête et le chemin chaud est inchangé.
     pub(crate) request_hooks: Arc<Vec<Arc<RequestHook>>>,
+    /// Liste `Access-Control-Allow-Headers` du préflight CORS — calculée
+    /// **une fois au bind** (voir `ServerBuilder::finish`) et pré-jointe :
+    /// la connexion l'annonce sans aucune allocation (B3, audit
+    /// 2026-11-25).
+    pub(crate) allow_preflight_headers: String,
     pub(crate) read_timeout: Duration,
     /// Plafond **explicite** de l'échéance globale d'écriture (`None` :
     /// défaut dérivé de `read_timeout`, voir [`write_deadline`]).
@@ -325,6 +330,9 @@ impl BoundServer {
             // d'identité est pré-formaté une fois par serveur, cloné par
             // connexion (petite chaîne, chemin d'accept seulement).
             let instance_headers = instance_headers.clone();
+            // Même mécanique : la liste du préflight est pré-jointe au bind,
+            // clonée par connexion (petite chaîne, chemin d'accept).
+            let allow_preflight_headers = self.allow_preflight_headers.clone();
             let spawned = std::thread::Builder::new()
                 .name("litemcp-conn".into())
                 .spawn(move || {
@@ -344,6 +352,7 @@ impl BoundServer {
                             allowed_hosts: &allowed_hosts,
                             request_hooks: &request_hooks,
                             instance_headers: &instance_headers,
+                            allow_preflight_headers: &allow_preflight_headers,
                             read_timeout,
                             write_budget,
                             connection_ttl,

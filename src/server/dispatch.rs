@@ -18,7 +18,10 @@ enum McpParamType {
 #[derive(Debug, Clone)]
 pub(super) struct McpParamDef {
     property_name: String,
-    header_suffix: String,
+    /// Suffixe d'en-tête en minuscules (`count` pour `Mcp-Param-count`) —
+    /// lu par le builder pour annoncer les paramètres promus dans la liste
+    /// du préflight CORS (B3, audit 2026-11-25).
+    pub(super) header_suffix: String,
     param_type: McpParamType,
 }
 
