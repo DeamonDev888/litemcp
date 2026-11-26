@@ -1,7 +1,7 @@
 //! Cache de nonces **borné par clé** — voir `docs/auth.md` §2.3 et §11.7.
 //!
 //! Un nonce déjà vu pour un `keyid` est un rejeu. Le cache retient les nonces
-//! par clé, avec deux bornes indépendantes :
+//! par clé, avec trois bornes indépendantes :
 //!
 //! * **âge** — une entrée disparaît après `ttl` (120 s par défaut), la fenêtre
 //!   d'horloge du profil étant de ±60 s ;
@@ -9,10 +9,17 @@
 //!   encore dans la fenêtre n'est **jamais** évincé : un compartiment plein
 //!   refuse l'insertion (échec fermé), le vérificateur rend alors
 //!   `nonce_cache_full`.
+//! * **table** — la table des clés elle-même ne s'accumule pas : à la
+//!   création du compartiment d'un keyid nouveau au-delà du seuil
+//!   (`MAX_KEYS`), les compartiments entièrement expirés sortent de la table
+//!   (audit 2026-11-25, B8) ; les lectures (`contains`, `len`,
+//!   `entries_for`) ne comptent que les entrées non expirées et purgent
+//!   paresseusement au passage.
 //!
 //! Le refus est **toujours local à une clé** : une clé qui inonde son propre
 //! compartiment ne peut ni évincer les nonces d'une autre, ni faire grandir sa
-//! propre table au-delà de la borne. Aucun vidage global n'existe. Le temps est
+//! propre table au-delà de la borne. Aucun vidage global d'entrées valides n'existe (le seul balayage global,
+//! au seuil `MAX_KEYS`, ne retire que du déjà expiré). Le temps est
 //! mesuré avec [`Instant`] (monotone) : un recul de l'horloge murale ne prolonge
 //! ni ne raccourcit la rétention.
 //!
@@ -35,6 +42,27 @@ pub const DEFAULT_PER_KEY: usize = 4096;
 
 /// Rétention par défaut d'un nonce.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(120);
+
+/// Nombre de compartiments au-delà duquel la création d'un compartiment
+/// nouveau déclenche le nettoyage des compartiments morts (audit
+/// 2026-11-25, B8).
+///
+/// Sans ce seuil, la table des clés ne décroît jamais : `Bucket::purge` ne
+/// vise que les entrées d'un compartiment, jamais la table elle-même — chaque
+/// `keyid` ayant servi au moins une requête y laisse un compartiment pour
+/// toujours, même entièrement vidé par le ttl. Sur un serveur de longue
+/// durée, la rotation légitime des clés clientes (clients partis, clés
+/// retirées du magasin) ferait donc croître la table sans borne.
+///
+/// 1024 compartiments simultanés couvrent très au-delà des clés clientes
+/// réellement actives d'un serveur MCP. Le balayage de nettoyage ne touche
+/// que le front de chaque compartiment (O(nombre de compartiments),
+/// négligeable) et ne peut survenir qu'une fois par tranche de 1024 keyids
+/// nouveaux : coût amorti constant. Un compartiment mort disparaît donc au
+/// plus tard à l'arrivée de la 1024ᵉ clé nouvelle postérieure à
+/// l'expiration de sa dernière entrée ; les compartiments portant des
+/// entrées encore valides ne sont jamais retirés (aucune éviction).
+const MAX_KEYS: usize = 1024;
 
 /// Nonce de 16 octets (128 bits) tiré du générateur du système.
 pub type Nonce = [u8; 16];
@@ -136,12 +164,30 @@ impl NonceCache {
     ///
     /// Consultation seule : n'enregistre rien, ne crée aucun compartiment (un
     /// `keyid` inconnu ne peut donc pas faire grandir le cache).
+    ///
+    /// B8 (audit 2026-11-25) : la réponse ne vaut que pour un nonce **non
+    /// expiré** ; au passage, les entrées expirées du compartiment sont
+    /// purgées sous le verrou (purge paresseuse). Rapporter « absent » pour
+    /// un nonce expiré est sûr : la rétention (120 s par défaut) dépasse la
+    /// fenêtre de fraîcheur de la signature — `created` doit rester à ±60 s
+    /// de l'horloge du serveur (`docs/auth.md` §2.3) — et le vérificateur ne
+    /// consulte `contains` qu'après ce contrôle d'horloge. `nonce` et
+    /// `created` sont couverts par la signature : une requête rejouée porte
+    /// le `created` d'origine, l'attaquant ne peut le rafraîchir. Un nonce
+    /// enregistré à l'instant `t0` (nécessairement `created - 60 s <= t0`)
+    /// n'expire qu'à `t0 + ttl >= created + 60 s` : quand le cache l'oublie,
+    /// la fenêtre d'horloge a déjà refermé la porte sur ce message signé. À
+    /// l'instant limite exact où les deux fenêtres coïncident, le résidu est
+    /// de la même nature que le rejeu post-redémarrage déjà assumé (§11.7) :
+    /// sans fenêtre exploitable.
     #[must_use]
     pub fn contains(&self, keyid: &str, nonce: &Nonce) -> bool {
+        let now = Instant::now();
         match self.state.lock() {
-            Ok(state) => state
-                .get(keyid)
-                .is_some_and(|bucket| bucket.seen.contains(nonce)),
+            Ok(mut state) => state.get_mut(keyid).is_some_and(|bucket| {
+                bucket.purge(now, self.ttl);
+                bucket.seen.contains(nonce)
+            }),
             // Échec fermé : verrou empoisonné = « déjà vu ».
             Err(_) => true,
         }
@@ -173,16 +219,45 @@ impl NonceCache {
         let mut bucket = Bucket::default();
         let recorded = bucket.insert(nonce, now, self.per_key, self.ttl);
         if recorded == NonceInsert::Fresh {
+            // B8 (audit 2026-11-25) — croissance bornée : la table des clés
+            // doit rester finie elle aussi. À la création d'un compartiment
+            // nouveau au-delà de `MAX_KEYS` compartiments en table, chaque
+            // compartiment est purgé et ceux restés vides (toutes entrées
+            // expirées : clé retirée du magasin, client parti, rotation
+            // légitime) sortent de la table. Les compartiments portant des
+            // entrées encore valides ne sont jamais touchés : aucune
+            // éviction. Le balayage ne consulte que le front de chaque
+            // compartiment et ne peut survenir qu'une fois par tranche de
+            // `MAX_KEYS` keyids nouveaux (coût amorti constant).
+            if state.len() >= MAX_KEYS {
+                state.retain(|_, present| {
+                    present.purge(now, self.ttl);
+                    !present.seen.is_empty()
+                });
+            }
             state.insert(keyid.to_owned(), bucket);
         }
         recorded
     }
 
     /// Nombre total d'entrées retenues (toutes clés).
+    ///
+    /// B8 : seules les entrées non expirées sont comptées — le passage purge
+    /// chaque compartiment sous le verrou. Les compartiments devenus vides
+    /// restent en table jusqu'au nettoyage de croissance de `insert`, à la
+    /// création d'un compartiment nouveau.
     #[must_use]
     pub fn len(&self) -> usize {
+        let now = Instant::now();
         match self.state.lock() {
-            Ok(state) => state.values().map(|bucket| bucket.seen.len()).sum(),
+            Ok(mut state) => {
+                let mut total = 0usize;
+                for bucket in state.values_mut() {
+                    bucket.purge(now, self.ttl);
+                    total += bucket.seen.len();
+                }
+                total
+            }
             Err(_) => 0,
         }
     }
@@ -194,15 +269,26 @@ impl NonceCache {
     }
 
     /// Nombre d'entrées retenues pour une clé.
+    ///
+    /// B8 : comme [`NonceCache::len`], seules les entrées non expirées
+    /// comptent ; le compartiment est purgé sous le verrou au passage.
     #[must_use]
     pub fn entries_for(&self, keyid: &str) -> usize {
+        let now = Instant::now();
         match self.state.lock() {
-            Ok(state) => state.get(keyid).map_or(0, |bucket| bucket.seen.len()),
+            Ok(mut state) => state.get_mut(keyid).map_or(0, |bucket| {
+                bucket.purge(now, self.ttl);
+                bucket.seen.len()
+            }),
             Err(_) => 0,
         }
     }
 
     /// Nombre de compartiments (clés distinctes retenues).
+    ///
+    /// Compte aussi les compartiments déjà vides mais pas encore sortis de la
+    /// table par le nettoyage de croissance (B8) : c'est la taille de la
+    /// table, pas le nombre de clés actives.
     #[must_use]
     pub fn keys(&self) -> usize {
         match self.state.lock() {
@@ -482,5 +568,116 @@ mod tests {
             "aucune éviction attendue"
         );
         assert_eq!(cache.keys(), 1);
+    }
+
+    // —— Audit 2026-11-25, B8 : compartiments morts jamais purgés,
+    //    contains/len insensibles au ttl. ——
+
+    /// Un nonce expiré n'est plus rapporté présent, même si aucune écriture
+    /// n'est passée sur sa clé depuis (purge paresseuse à la lecture).
+    #[test]
+    fn un_nonce_expire_n_est_plus_rapporte_present() {
+        let cache = NonceCache::new(8, Duration::from_millis(60));
+        assert!(cache.remember("clé", &nonce(1)));
+        assert!(cache.contains("clé", &nonce(1)));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            !cache.contains("clé", &nonce(1)),
+            "nonce expiré rapporté encore présent"
+        );
+        // Sorti par la purge, il redevient enregistrable : même sémantique
+        // qu'avant le correctif à l'insertion suivante.
+        assert_eq!(cache.insert("clé", &nonce(1)), NonceInsert::Fresh);
+    }
+
+    /// `len` et `entries_for` ne comptent que les entrées non expirées.
+    #[test]
+    fn les_entrees_expirees_sortent_des_compteurs() {
+        let cache = NonceCache::new(64, Duration::from_millis(60));
+        assert!(cache.remember("clé-a", &nonce(1)));
+        assert!(cache.remember("clé-b", &nonce(2)));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.entries_for("clé-a"), 1);
+        assert_eq!(cache.entries_for("clé-b"), 1);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(cache.len(), 0, "entrées expirées encore comptées");
+        assert_eq!(cache.entries_for("clé-a"), 0, "entrée expirée comptée");
+        assert_eq!(cache.entries_for("clé-b"), 0);
+        assert!(cache.is_empty());
+        // Les compartiments vides restent en table : ils ne sortent qu'au
+        // nettoyage de croissance, déclenché par un keyid nouveau.
+        assert_eq!(cache.keys(), 2);
+    }
+
+    /// À la création d'un compartiment de plus que le seuil, les
+    /// compartiments entièrement expirés sortent de la table : la rotation
+    /// légitime des clés clientes ne fait plus croître le cache sans borne.
+    #[test]
+    fn les_compartiments_morts_sortent_de_la_table_a_la_croissance() {
+        let cache = NonceCache::new(8, Duration::from_millis(60));
+        for k in 0..MAX_KEYS {
+            assert!(
+                cache.remember(&format!("éphémère-{k}"), &nonce(1)),
+                "compartiment {k}"
+            );
+        }
+        assert_eq!(cache.keys(), MAX_KEYS);
+        std::thread::sleep(Duration::from_millis(80));
+        // Le keyid nouveau franchit le seuil : purge des compartiments morts
+        // avant l'insertion du sien.
+        assert!(cache.remember("nouvelle-clé", &nonce(1)));
+        assert_eq!(cache.keys(), 1, "compartiments morts retenus en table");
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.contains("éphémère-0", &nonce(1)));
+    }
+
+    /// Le nettoyage de croissance épargne les compartiments encore vivants :
+    /// aucune éviction, seules les entrées expirées disparaissent.
+    #[test]
+    fn le_nettoyage_de_croissance_epargne_les_compartiments_vivants() {
+        let cache = NonceCache::new(8, Duration::from_millis(60));
+        assert!(cache.remember("vivante", &nonce(1)));
+        for k in 0..MAX_KEYS {
+            assert!(
+                cache.remember(&format!("éphémère-{k}"), &nonce(1)),
+                "compartiment {k}"
+            );
+        }
+        assert_eq!(cache.keys(), MAX_KEYS + 1);
+        std::thread::sleep(Duration::from_millis(80));
+        // « vivante » est refraîchie juste avant le keyid nouveau : son
+        // compartiment doit survivre au nettoyage ; l'entrée expirée de son
+        // propre compartiment part, pas le compartiment.
+        assert!(cache.remember("vivante", &nonce(2)));
+        assert!(!cache.contains("vivante", &nonce(1)));
+        assert!(cache.remember("nouvelle-clé", &nonce(1)));
+        assert_eq!(
+            cache.keys(),
+            2,
+            "seuls les compartiments vivants doivent rester"
+        );
+        assert_eq!(cache.entries_for("vivante"), 1);
+        assert!(cache.contains("vivante", &nonce(2)));
+        assert_eq!(cache.len(), 2);
+    }
+
+    /// La purge paresseuse ne rouvre pas le rejeu d'un nonce frais : ni
+    /// `contains`, ni `remember`, ni `insert` n'oublient une entrée encore
+    /// dans son ttl.
+    #[test]
+    fn un_nonce_frais_reste_un_rejeu_malgre_les_purges() {
+        let cache = NonceCache::with_default_policy();
+        assert!(cache.remember("clé", &nonce(1)));
+        for _ in 0..3 {
+            assert!(cache.contains("clé", &nonce(1)));
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.entries_for("clé"), 1);
+        }
+        assert!(!cache.remember("clé", &nonce(1)), "rejeu accepté");
+        assert_eq!(cache.insert("clé", &nonce(1)), NonceInsert::Replay);
+        // Les autres clés ne sont pas touchées par les purges.
+        assert!(cache.remember("autre", &nonce(1)));
+        assert!(cache.contains("autre", &nonce(1)));
+        assert_eq!(cache.len(), 2);
     }
 }
