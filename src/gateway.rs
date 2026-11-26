@@ -448,7 +448,7 @@ pub(crate) fn bind_dispatch_depth(depth: usize) -> DepthBinding {
 }
 
 impl Gateway {
-    /// Entre dans un dispatch gardé — `None` = limite de récursion atteinte
+    /// Entre dans un dispatch gardé — `None` = profondeur maximale atteinte
     /// (l'appelant rend alors [`recursion_limit_response`] sans exécuter le
     /// corps).
     fn enter_dispatch() -> Option<DispatchDepthGuard> {
@@ -496,9 +496,9 @@ fn recursion_limit_response(body: &[u8]) -> Option<(Vec<u8>, i64)> {
             crate::jsonrpc::ErrorObject::new(
                 crate::jsonrpc::ErrorObject::INTERNAL_ERROR,
                 format!(
-                    "limite de récursion gateway atteinte (plus de {MAX_DISPATCH_DEPTH} \
-                     dispatch imbriqués sur le même thread, tous gateways confondus, \
-                     depuis un handler)"
+                    "gateway recursion limit exceeded (more than {MAX_DISPATCH_DEPTH} \
+                     nested dispatches on the same thread, across all gateways, \
+                     from within a handler)"
                 ),
             ),
         )
