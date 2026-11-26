@@ -16,7 +16,7 @@ categories = ["api-bindings", "network-programming", "web-programming::http-serv
 # hors du paquet même si une copie réapparaît le temps d'une campagne.
 # `auth-rapports/` : rapports internes du chantier d'authentification, hors
 # paquet comme `.zwork/` (le dossier reste dans l'arbre, ignoré par Git).
-exclude = [".github", "docs", ".zwork", "auth-rapports", "scripts", "examples/audit_target.rs"]
+exclude = [".github", "docs", ".zwork", "auth-rapports", "examples/audit_target.rs"]
 
 [features]
 # Macros `#[tool]`/`#[resource]`/`#[prompt]` — **incluses par défaut** :
