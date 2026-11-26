@@ -530,7 +530,41 @@ impl ServerCore {
                 CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
             );
         };
-        let Some(def) = self.resources.get(uri) else {
+        let contents = if let Some(def) = self.resources.get(uri) {
+            let handler = def.handler.clone();
+            let owned_round = round.clone();
+            match self.run_bounded(move || match &handler {
+                ResourceHandler::Plain(f) => f().map(ResourceOutcome::Data),
+                ResourceHandler::Mrtr(f) => f(&owned_round),
+            }) {
+                Ok(contents) => contents,
+                Err(failure) => {
+                    let code = failure.code;
+                    return (
+                        Outgoing::failure(id.clone(), failure).to_bounded(cap),
+                        CallStatus::ProtocolError(code),
+                    );
+                }
+            }
+        } else if let Some((handler, extracted)) = self.templates.values().find_map(|def| {
+            let handler = def.handler.as_ref()?;
+            let extracted = super::authz::match_simple_template(&def.template.uri_template, uri)?;
+            Some((Arc::clone(handler), extracted))
+        }) {
+            let owned_uri = uri.to_string();
+            match self
+                .run_bounded(move || handler(&owned_uri, &extracted).map(ResourceOutcome::Data))
+            {
+                Ok(contents) => contents,
+                Err(failure) => {
+                    let code = failure.code;
+                    return (
+                        Outgoing::failure(id.clone(), failure).to_bounded(cap),
+                        CallStatus::ProtocolError(code),
+                    );
+                }
+            }
+        } else {
             return (
                 Outgoing::failure(
                     id.clone(),
@@ -542,21 +576,6 @@ impl ServerCore {
                 .to_bounded(cap),
                 CallStatus::ProtocolError(ErrorObject::INVALID_PARAMS),
             );
-        };
-        let handler = def.handler.clone();
-        let owned_round = round.clone();
-        let contents = match self.run_bounded(move || match &handler {
-            ResourceHandler::Plain(f) => f().map(ResourceOutcome::Data),
-            ResourceHandler::Mrtr(f) => f(&owned_round),
-        }) {
-            Ok(contents) => contents,
-            Err(failure) => {
-                let code = failure.code;
-                return (
-                    Outgoing::failure(id.clone(), failure).to_bounded(cap),
-                    CallStatus::ProtocolError(code),
-                );
-            }
         };
         match contents {
             Ok(ResourceOutcome::InputRequired(spec)) => {

@@ -10,7 +10,7 @@ l'essentiel.
 
 ## Macros `#[tool]` · `#[resource]` · `#[prompt]` (incluses par défaut)
 
-Le schéma est **dérivé des types des paramètres** d'une fonction ordinaire — plus de double déclaration schéma/struct. Chaque macro génère `register_<fonction>`, à enchaîner avec `.with_tool(…)` :
+Le schéma est **dérivé des types des paramètres** d'une fonction ordinaire — plus de double déclaration schéma/struct. Chaque macro génère `register_<fonction>` (avec la même visibilité que la fonction annotée), à enchaîner avec `.register(…)` (ou `.with_tool(…)`). Lorsque `description = "…"` est omis, les doc-comments `///` de la fonction servent automatiquement de description ; `#[resource]` accepte en outre `mime_type = "…"` pour publier le type MIME dans `resources/list` :
 
 ```rust
 use litemcp::macros::{prompt, resource, tool}; // incluses par défaut

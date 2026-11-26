@@ -17,11 +17,29 @@ use super::sse::{
 };
 use super::*;
 
+/// Source du noyau servi par une connexion — choisie **une fois par
+/// connexion** par la boucle d'accept.
+///
+/// - [`CoreSource::Static`] : le noyau immuable d'un serveur lié classique
+///   ([`crate::ServerBuilder::bind`]) — toute la connexion sert le même
+///   instantané, aucun coût par requête (chemin historique) ;
+/// - [`CoreSource::Gateway`] : un [`crate::Gateway`] dynamique — un
+///   snapshot **frais** est publié à chaque requête (voir
+///   [`crate::Gateway::bind`]) : une édition (ajout ou retrait d'outil)
+///   survenue entre deux requêtes d'une même connexion keep-alive est
+///   visible dès la requête suivante.
+pub(super) enum CoreSource<'a> {
+    /// Noyau figé d'un serveur lié statique.
+    Static(&'a ServerCore),
+    /// Gateway dynamique — snapshot repris à chaque requête.
+    Gateway(&'a crate::gateway::Gateway),
+}
+
 /// État partagé d'une connexion — tout ce qui vit au-delà d'une requête,
 /// référencé depuis le [`BoundServer`] (cloné en `Arc` par la boucle
 /// d'accept).
 pub(super) struct ConnectionEnv<'a> {
-    pub(super) core: &'a ServerCore,
+    pub(super) core: CoreSource<'a>,
     pub(super) route: &'a str,
     pub(super) allow_origins: &'a [String],
     /// Hôtes acceptés dans `Host` (vide : règle locale par défaut).
@@ -67,12 +85,9 @@ pub(super) fn handle_connection(stream: Conn, env: ConnectionEnv<'_>) -> std::io
     } = env;
     // Un hook de requête est enregistré ? Sans lui, la rétention des en-têtes
     // bruts n'existe pas : le chemin chaud ne réserve rien, ne copie rien.
+    // (`auth_active` et `retain_headers` sont lus **par requête** dans la
+    // boucle : sur un gateway, un `edit` peut changer l'état du snapshot.)
     let hook_present = !request_hooks.is_empty();
-    // L'autorisation lit les en-têtes bruts (signature RFC 9421) : un
-    // vérificateur configuré les retient donc exactement comme un hook —
-    // sans hook **ni** vérificateur, le chemin chaud reste sans allocation.
-    let auth_active = core.authorization_active();
-    let retain_headers = hook_present || auth_active;
     // Entrepôt des en-têtes bruts — alloué une fois par connexion et
     // réinitialisé (sans désallocation) à chaque requête de la keep-alive.
     // Borné par construction : MAX_HEADERS (64) lignes de MAX_LINE (16 Kio)
@@ -188,6 +203,30 @@ pub(super) fn handle_connection(stream: Conn, env: ConnectionEnv<'_>) -> std::io
             // slowloris (timeout OU deadline globale) ou coupure : sans réponse
             Err(_) => return Ok(()),
         }
+        // Snapshot servi par CETTE requête — pris **après** l'arrivée de la
+        // ligne de requête (jamais pendant l'attente keep-alive) : une édition
+        // survenue entre deux requêtes sur la même connexion est ainsi visible
+        // dès la requête suivante, et aucun ancien snapshot n'est retenu sur
+        // une connexion oisive. Le serveur statique garde son noyau unique
+        // (aucun coût, chemin historique inchangé).
+        let snapshot_vivant: Option<Arc<ServerCore>> = match &core {
+            CoreSource::Static(_) => None,
+            CoreSource::Gateway(gw) => Some(gw.snapshot()),
+        };
+        let core: &ServerCore = match (&core, snapshot_vivant.as_deref()) {
+            (CoreSource::Static(noyau), _) => noyau,
+            (CoreSource::Gateway(_), Some(vivant)) => vivant,
+            (CoreSource::Gateway(_), None) => {
+                unreachable!("le snapshot du gateway vient d'être pris ci-dessus")
+            }
+        };
+        // L'autorisation lit les en-têtes bruts (signature RFC 9421) : un
+        // vérificateur configuré les retient donc exactement comme un hook —
+        // sans hook **ni** vérificateur, le chemin chaud reste sans
+        // allocation. Lu **par requête** : sur un gateway, un `edit` peut
+        // changer l'état d'autorisation du snapshot courant.
+        let auth_active = core.authorization_active();
+        let retain_headers = hook_present || auth_active;
         // RFC 9112 §3 : la ligne de requête n'accepte qu'un **unique** espace
         // ASCII (SP) entre ses trois jetons (`method SP request-target SP
         // HTTP-version`), sans espace initial ni final.

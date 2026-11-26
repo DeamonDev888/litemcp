@@ -118,6 +118,10 @@ pub enum ToolOutcome {
 
 type ToolFn = dyn Fn(&Value) -> Result<ToolOutcome, ToolFailure> + Send + Sync;
 type ResourceFn = dyn Fn() -> Result<ResourceData, ToolError> + Send + Sync;
+/// Handler dynamique d'un gabarit de ressource RFC 6570 simple (`{var}`) :
+/// reçoit l'URI complète demandée et la map des variables extraites.
+type TemplateResourceFn =
+    dyn Fn(&str, &BTreeMap<String, String>) -> Result<ResourceData, ToolError> + Send + Sync;
 type PromptFn = dyn Fn(&Value) -> Result<Vec<PromptMessage>, ToolError> + Send + Sync;
 
 /// Handler d'outil MRTR — reçoit les arguments **et** le contexte du tour
@@ -319,6 +323,9 @@ enum ResourceHandler {
 struct ResourceDef {
     name: String,
     description: Option<String>,
+    /// Type MIME statique publié dans `resources/list` (optionnel — voir
+    /// [`ServerBuilder::resource_mime_type`]).
+    mime_type: Option<String>,
     /// Droits exigés pour lire cette ressource (ET) — vide avec
     /// autorisation active : `resources/read` refusé, absente de
     /// `resources/list`.
@@ -344,16 +351,15 @@ struct PromptDef {
     handler: PromptHandler,
 }
 
-/// Gabarit de ressource **et** le droit qu'il exige.
-///
-/// Les gabarits n'ont pas de handler de lecture (catalogue pur servi par
-/// `resources/templates/list`) : leurs droits ne portent donc que sur leur
-/// **présence dans la liste**.
+/// Gabarit de ressource, ses droits et son éventuel handler dynamique
+/// ([`ServerBuilder::resource_template_handler`]).
 #[derive(Clone)]
 struct TemplateDef {
     template: ResourceTemplate,
-    /// Droits exigés pour voir ce gabarit (ET).
+    /// Droits exigés pour voir ce gabarit (ET) et lire les URI qu'il couvre.
     required_rights: Vec<String>,
+    /// Handler optionnel de lecture dynamique pour un gabarit simple `{var}`.
+    handler: Option<Arc<TemplateResourceFn>>,
 }
 
 /// En-têtes de routage MCP 2026-07-28 (SEP-2243).
@@ -758,9 +764,16 @@ pub struct ServerBuilder {
     #[cfg(feature = "tls")]
     tls: Option<crate::tls::TlsConfig>,
     resources: BTreeMap<String, ResourceDef>,
-    /// Gabarits de ressources (clé : `uriTemplate`) — catalogue pur :
-    /// `resources/templates/list`, pas de handler de lecture.
+    /// Types MIME statiques en attente (clé : `uri` ou `uriTemplate`) — même
+    /// mécanique indépendante de l'ordre que [`Self::annotate`].
+    resource_mime_types: BTreeMap<String, String>,
+    /// Gabarits de ressources (clé : `uriTemplate`) — catalogue
+    /// `resources/templates/list` et routage optionnel.
     resource_templates: BTreeMap<String, ResourceTemplate>,
+    /// Handlers dynamiques attachés aux gabarits simples `{var}`.
+    resource_template_handlers: BTreeMap<String, Arc<TemplateResourceFn>>,
+    /// Titres statiques de gabarits en attente (clé : `uriTemplate`).
+    template_titles: BTreeMap<String, String>,
     /// Fournisseur de complétion posé par [`Self::completions`] — le
     /// dernier enregistré gagne.
     completions: Option<Arc<CompletionFn>>,

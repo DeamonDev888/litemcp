@@ -104,7 +104,8 @@ type MacroResult<T> = core::result::Result<T, Diag>;
 /// `register_<fonction>` → `ServerBuilder::tool_typed`.
 ///
 /// Attributs : `name = "…"` (défaut : nom de la fonction),
-/// `description = "…"` (**requis**) et `default(param = littéral, …)`.
+/// `description = "…"` (défaut : doc-comment `///` de la fonction) et
+/// `default(param = littéral, …)`.
 #[proc_macro_attribute]
 pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     generate_parametrized(attr, item, Target::Tool)
@@ -115,7 +116,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `ServerBuilder::prompt_typed`.
 ///
 /// Attributs : `name = "…"` (défaut : nom de la fonction),
-/// `description = "…"` (**requis**) et `default(param = littéral, …)`.
+/// `description = "…"` (défaut : doc-comment `///` de la fonction) et
+/// `default(param = littéral, …)`.
 #[proc_macro_attribute]
 pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
     generate_parametrized(attr, item, Target::Prompt)
@@ -126,7 +128,8 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `ServerBuilder::resource`.
 ///
 /// Attributs : `uri = "…"` (**requis**), `name = "…"` (défaut : nom de la
-/// fonction) et `description = "…"` (**requis**).
+/// fonction), `description = "…"` (défaut : doc-comment `///` de la fonction)
+/// et `mime_type = "…"` (optionnel, publié dans `resources/list`).
 #[proc_macro_attribute]
 pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
@@ -137,11 +140,12 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(sig) => sig,
         Err(diag) => return err(diag),
     };
-    if attrs.uri.is_none() || attrs.description.is_none() {
+    let description = attrs.description.or(sig.doc);
+    if attrs.uri.is_none() || description.is_none() {
         // Aucun jeton n'est fautif : c'est une clé *absente*. Le span d'appel
         // souligne l'attribut entier, qui est ici le bon repère.
         return err(Diag::new(
-            "#[resource] exige uri = \"…\" et description = \"…\"",
+            "#[resource] exige uri = \"…\" et description = \"…\" (ou un doc-comment `///`)",
         ));
     }
     if let Some(first_param) = sig.raw_params.first() {
@@ -152,19 +156,20 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         ));
     }
     let uri = attrs.uri.expect("vérifié ci-dessus");
-    let description = attrs.description.expect("vérifié ci-dessus");
+    let description = description.expect("vérifié ci-dessus");
     let fn_name = &sig.name;
     let fn_ident = strip_raw_ident(fn_name);
     let name = attrs.name.unwrap_or_else(|| fn_ident.to_string());
     let register = format!("register_{fn_ident}");
     let doc = format!("Enregistre la ressource `{uri}` (généré par #[resource]).");
 
-    let registration = registration_item(
-        &sig.visibility,
-        &doc,
-        &register,
-        &format!("__litemcp_server.resource({uri:?}, {name:?}, {description:?}, {fn_name})"),
-    );
+    let call = match attrs.mime_type {
+        Some(mime) => format!(
+            "__litemcp_server.resource({uri:?}, {name:?}, {description:?}, {fn_name}).resource_mime_type({uri:?}, {mime:?})"
+        ),
+        None => format!("__litemcp_server.resource({uri:?}, {name:?}, {description:?}, {fn_name})"),
+    };
+    let registration = registration_item(&sig.visibility, &doc, &register, &call);
 
     let mut out = item;
     out.extend(TokenStream::from_str(&registration).expect("code généré valide"));
@@ -192,9 +197,16 @@ fn generate_parametrized(attr: TokenStream, item: TokenStream, target: Target) -
         Ok(sig) => sig,
         Err(diag) => return err(diag),
     };
-    let Some(description) = attrs.description else {
+    if attrs.mime_type.is_some() {
+        return err(Diag::new(format!(
+            "{macro_name} : `mime_type` est réservé à #[resource]"
+        )));
+    }
+    let Some(description) = attrs.description.or(sig.doc) else {
         // Clé absente : rien de plus précis que l'attribut entier.
-        return err(Diag::new(format!("{macro_name} exige description = \"…\"")));
+        return err(Diag::new(format!(
+            "{macro_name} exige description = \"…\" (ou un doc-comment `///`)"
+        )));
     };
     let params = match collect_params(&sig.raw_params, macro_name, &attrs.defaults) {
         Ok(params) => params,
@@ -369,12 +381,48 @@ struct DefaultDecl {
     name_span: Span,
 }
 
+/// Extrait la documentation `/// ...` (`#[doc = "..."]`) écrite avant `fn`.
+/// Chaque ligne est rognée ; les lignes vides en tête/fin sont supprimées.
+/// Rend `None` si aucun commentaire de documentation non vide n'est présent.
+fn doc_before_fn(prefix: &[TokenTree]) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < prefix.len() {
+        if is_punct(&prefix[i], '#') {
+            if let Some(TokenTree::Group(group)) = prefix.get(i + 1) {
+                if group.delimiter() == Delimiter::Bracket {
+                    let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                    if inner.len() == 3
+                        && matches!(&inner[0], TokenTree::Ident(id) if id.to_string() == "doc")
+                        && is_punct(&inner[1], '=')
+                    {
+                        if let Some(text) = parse_token_string_lit(&inner[2]) {
+                            lines.push(text.trim().to_string());
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    let joined = lines.join("\n");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Attributs acceptés par les trois macros.
 #[derive(Default)]
 struct Attrs {
     name: Option<String>,
     description: Option<String>,
     uri: Option<String>,
+    mime_type: Option<String>,
     /// Valeurs par défaut des paramètres : `default(limit = 10, mode = "fast")`.
     defaults: Vec<DefaultDecl>,
 }
@@ -391,13 +439,13 @@ fn parse_attrs(attr: TokenStream) -> MacroResult<Attrs> {
         }
         let Some(TokenTree::Ident(ident)) = entry.first() else {
             return Err(Diag::over(
-                "attribut invalide — attendus : name, description, uri, default(nom = valeur)",
+                "attribut invalide — attendus : name, description, uri, mime_type, default(nom = valeur)",
                 entry,
             ));
         };
         let key = ident.to_string();
         match key.as_str() {
-            "name" | "description" | "uri" => {
+            "name" | "description" | "uri" | "mime_type" => {
                 if entry.len() != 3 || !is_punct(&entry[1], '=') {
                     return Err(Diag::over(
                         format!("syntaxe attendue : `{key} = \"…\"`"),
@@ -414,6 +462,7 @@ fn parse_attrs(attr: TokenStream) -> MacroResult<Attrs> {
                     "name" => out.name = Some(value),
                     "description" => out.description = Some(value),
                     "uri" => out.uri = Some(value),
+                    "mime_type" => out.mime_type = Some(value),
                     _ => unreachable!(),
                 }
             }
@@ -489,6 +538,9 @@ struct FnSig {
     /// une fonction privée, sinon `pub`, `pub(crate)`, `pub(super)`,
     /// `pub(self)` ou `pub(in chemin)`.
     visibility: String,
+    /// Doc-comment `/// ...` de la fonction (repli quand `description = "…"`
+    /// est omis dans l'attribut).
+    doc: Option<String>,
     raw_params: Vec<Vec<TokenTree>>,
 }
 
@@ -514,6 +566,7 @@ fn parse_fn_sig(item: &TokenStream, macro_name: &str) -> MacroResult<FnSig> {
                 // B10 (audit 2026-11-25) : la visibilité écrite avant `fn`
                 // est recopiée devant le `register_<nom>` généré.
                 let visibility = visibility_before_fn(&tokens[..i]);
+                let doc = doc_before_fn(&tokens[..i]);
                 let Some(TokenTree::Ident(fn_ident)) = tokens.get(i + 1) else {
                     return Err(Diag::at(
                         format!("{macro_name} : nom de fonction attendu après `fn`"),
@@ -549,6 +602,7 @@ fn parse_fn_sig(item: &TokenStream, macro_name: &str) -> MacroResult<FnSig> {
                             return Ok(FnSig {
                                 name,
                                 visibility,
+                                doc,
                                 raw_params,
                             });
                         }

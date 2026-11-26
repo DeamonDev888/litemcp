@@ -86,7 +86,9 @@ ServerBuilder::new("calc", "1.0.0")
     .serve()?;
 ```
 
-La borne de la spec (100 suggestions) est appliquée par le noyau : au-delà, troncature + `hasMore: true`. La **lecture** d'une ressource reste un match exact sur les URIs enregistrées — la substitution de gabarit côté noyau n'est pas implémentée (inscrivez les URIs concrètes correspondantes).
+La borne de la spec (100 suggestions) est appliquée par le noyau : au-delà, troncature + `hasMore: true`. Pour la lecture dynamique de gabarits simples RFC 6570 (`{var}`), `.resource_template_handler(uri_template, nom, desc, |uri, params| …)` extrait les segments et exécute le handler sur `resources/read` (les URI statiques exactes priment toujours, et `.require_resource_right` s'applique nativement) ; `.resource_mime_type` et `.resource_template_title` publient `mimeType` et `title` dans les catalogues.
+
+Pour les handlers riches et MRTR, les variantes typées `.tool_result_typed`, `.tool_result_parse`, `.tool_mrtr_typed`, `.prompt_mrtr_typed` et `.prompt_parse` appliquent un schéma `zod::Schema` exécuteur avant le handler.
 
 ## Multi round-trip (MRTR)
 

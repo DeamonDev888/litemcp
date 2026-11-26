@@ -186,7 +186,10 @@ impl ServerBuilder {
             #[cfg(feature = "tls")]
             tls: None,
             resources: BTreeMap::new(),
+            resource_mime_types: BTreeMap::new(),
             resource_templates: BTreeMap::new(),
+            resource_template_handlers: BTreeMap::new(),
+            template_titles: BTreeMap::new(),
             completions: None,
             prompts: BTreeMap::new(),
             connection_ttl: crate::http::CONNECTION_TTL,
@@ -418,6 +421,36 @@ impl ServerBuilder {
         self
     }
 
+    /// Comme [`Self::tool_mrtr`], avec un **schéma à la Zod** exécuteur
+    /// ([`crate::zod`]) : l'`inputSchema` est publié dans `tools/list` et les
+    /// arguments sont validés (avec injection des défauts et normalisation
+    /// des entiers) avant chaque passage du handler MRTR.
+    pub fn tool_mrtr_typed<S, F>(mut self, name: &str, description: &str, schema: S, f: F) -> Self
+    where
+        S: Schema + 'static,
+        F: Fn(&Value, &InputRound) -> Result<ToolOutcome, ToolError> + Send + Sync + 'static,
+    {
+        let schema_arc = Arc::new(schema);
+        require_object_input_schema(name, schema_arc.as_ref());
+        let mcp_params = extract_mcp_param_defs(&schema_arc.json())
+            .expect("invalid x-mcp-header in tool schema");
+        let (output_schema, annotations, required_capabilities) = self.take_tool_pending(name);
+        let mut def = ToolDef {
+            description: Some(description.to_string()),
+            schema: Some(schema_arc),
+            output_schema,
+            output_object_rooted: false,
+            annotations,
+            required_capabilities,
+            required_rights: Vec::new(),
+            mcp_params,
+            handler: ToolHandler::Mrtr(Arc::new(f)),
+        };
+        def.sync_output_shape();
+        self.tools.insert(name.to_string(), def);
+        self
+    }
+
     /// Enregistre un prompt **MRTR** — même cycle que [`Self::tool_mrtr`]
     /// sur `prompts/get` (méthode supportée par la spec) : le handler rend
     /// [`PromptOutcome::Messages`] ou [`PromptOutcome::InputRequired`].
@@ -442,6 +475,45 @@ impl ServerBuilder {
             PromptDef {
                 description: Some(description.to_string()),
                 schema: None,
+                required_rights: Vec::new(),
+                handler: PromptHandler::Mrtr(Arc::new(f)),
+            },
+        );
+        self
+    }
+
+    /// Comme [`Self::prompt_mrtr`], avec un **schéma à la Zod** exécuteur :
+    /// les arguments sont publiés dans `prompts/list` et validés avant le
+    /// handler MRTR.
+    pub fn prompt_mrtr_typed<S, F>(self, name: &str, description: &str, schema: S, f: F) -> Self
+    where
+        S: Schema + 'static,
+        F: Fn(&Value, &InputRound) -> Result<PromptOutcome, String> + Send + Sync + 'static,
+    {
+        self.prompt_mrtr_typed_with_error(name, description, schema, move |args, round| {
+            f(args, round).map_err(ToolError::from)
+        })
+    }
+
+    /// Comme [`Self::prompt_mrtr_typed`], avec une erreur **structurée**
+    /// ([`ToolError`]).
+    #[must_use]
+    pub fn prompt_mrtr_typed_with_error<S, F>(
+        mut self,
+        name: &str,
+        description: &str,
+        schema: S,
+        f: F,
+    ) -> Self
+    where
+        S: Schema + 'static,
+        F: Fn(&Value, &InputRound) -> Result<PromptOutcome, ToolError> + Send + Sync + 'static,
+    {
+        self.prompts.insert(
+            name.to_string(),
+            PromptDef {
+                description: Some(description.to_string()),
+                schema: Some(Arc::new(schema)),
                 required_rights: Vec::new(),
                 handler: PromptHandler::Mrtr(Arc::new(f)),
             },
@@ -476,11 +548,13 @@ impl ServerBuilder {
     where
         F: Fn(&InputRound) -> Result<ResourceOutcome, ToolError> + Send + Sync + 'static,
     {
+        let mime_type = self.take_resource_mime_type(uri);
         self.resources.insert(
             uri.to_string(),
             ResourceDef {
                 name: name.to_string(),
                 description: Some(description.to_string()),
+                mime_type,
                 required_rights: Vec::new(),
                 handler: ResourceHandler::Mrtr(Arc::new(f)),
             },
@@ -912,6 +986,72 @@ impl ServerBuilder {
         self.resource_with_error(uri, name, description, move || f().map_err(ToolError::from))
     }
 
+    /// Récupère le `mime_type` statique en attente ou existant pour une
+    /// ressource (`uri`), indépendamment de l'ordre d'appel.
+    fn take_resource_mime_type(&mut self, uri: &str) -> Option<String> {
+        let previous = self
+            .resources
+            .get(uri)
+            .and_then(|def| def.mime_type.clone());
+        self.resource_mime_types.remove(uri).or(previous)
+    }
+
+    /// Récupère `(title, mime_type)` en attente ou existants pour un gabarit
+    /// (`uri_template`), indépendamment de l'ordre d'appel.
+    fn take_template_meta(&mut self, uri_template: &str) -> (Option<String>, Option<String>) {
+        let previous_title = self
+            .resource_templates
+            .get(uri_template)
+            .and_then(|tpl| tpl.title.clone());
+        let previous_mime = self
+            .resource_templates
+            .get(uri_template)
+            .and_then(|tpl| tpl.mime_type.clone());
+        let title = self.template_titles.remove(uri_template).or(previous_title);
+        let mime_type = self
+            .resource_mime_types
+            .remove(uri_template)
+            .or(previous_mime);
+        (title, mime_type)
+    }
+
+    /// Déclare le **type MIME statique** d'une ressource (`resources/list`) ou
+    /// d'un gabarit de ressource (`resources/templates/list`) — indépendant de
+    /// l'ordre d'appel (avant ou après `.resource(...)` / `.resource_template(...)`).
+    ///
+    /// Les clients MCP connaissent ainsi le `mimeType` dès le listing, avant
+    /// d'appeler `resources/read`.
+    #[must_use]
+    pub fn resource_mime_type(mut self, uri_or_template: &str, mime_type: &str) -> Self {
+        let mut applied = false;
+        if let Some(def) = self.resources.get_mut(uri_or_template) {
+            def.mime_type = Some(mime_type.to_string());
+            applied = true;
+        }
+        if let Some(tpl) = self.resource_templates.get_mut(uri_or_template) {
+            tpl.mime_type = Some(mime_type.to_string());
+            applied = true;
+        }
+        if !applied {
+            self.resource_mime_types
+                .insert(uri_or_template.to_string(), mime_type.to_string());
+        }
+        self
+    }
+
+    /// Déclare le **titre lisible** (`title`) d'un gabarit de ressource publié
+    /// dans `resources/templates/list` — indépendant de l'ordre d'appel.
+    #[must_use]
+    pub fn resource_template_title(mut self, uri_template: &str, title: &str) -> Self {
+        if let Some(tpl) = self.resource_templates.get_mut(uri_template) {
+            tpl.title = Some(title.to_string());
+        } else {
+            self.template_titles
+                .insert(uri_template.to_string(), title.to_string());
+        }
+        self
+    }
+
     /// Comme [`Self::resource`], avec une erreur **structurée**
     /// ([`ToolError`]) : `code`, `retryable` et `retryAfterMs` partent dans
     /// `error.data` — même niveau que les outils, sans parser de prose.
@@ -920,11 +1060,13 @@ impl ServerBuilder {
     where
         F: Fn() -> Result<ResourceContents, ToolError> + Send + Sync + 'static,
     {
+        let mime_type = self.take_resource_mime_type(uri);
         self.resources.insert(
             uri.to_string(),
             ResourceDef {
                 name: name.to_string(),
                 description: Some(description.to_string()),
+                mime_type,
                 required_rights: Vec::new(),
                 handler: ResourceHandler::Plain(Arc::new(move || f().map(ResourceData::Text))),
             },
@@ -980,11 +1122,13 @@ impl ServerBuilder {
     where
         F: Fn() -> Result<ResourceData, ToolError> + Send + Sync + 'static,
     {
+        let mime_type = self.take_resource_mime_type(uri);
         self.resources.insert(
             uri.to_string(),
             ResourceDef {
                 name: name.to_string(),
                 description: Some(description.to_string()),
+                mime_type,
                 required_rights: Vec::new(),
                 handler: ResourceHandler::Plain(Arc::new(f)),
             },
@@ -997,23 +1141,88 @@ impl ServerBuilder {
     /// (`test://template/{id}/data`) décrit une famille de ressources.
     ///
     /// Le catalogue est un `BTreeMap` clé sur l'`uriTemplate` : réenregistrer
-    /// un gabarit existant le remplace. La **lecture** reste celle de
-    /// `resources/read` : le noyau matche des URIs exactes — la substitution
-    /// de gabarit côté noyau n'est pas implémentée, un client qui lit une
-    /// URI concrète doit trouver cette URI dans les ressources enregistrées
-    /// ([`Self::resource`] / [`Self::resource_data`]).
+    /// un gabarit existant le remplace (en conservant son `title`/`mimeType`
+    /// déclarés via [`Self::resource_template_title`] et
+    /// [`Self::resource_mime_type`]). Pour servir aussi les lectures
+    /// `resources/read` correspondant à un gabarit simple `{var}`, voir
+    /// [`Self::resource_template_handler`].
     #[must_use]
     pub fn resource_template(mut self, uri_template: &str, name: &str, description: &str) -> Self {
+        let (title, mime_type) = self.take_template_meta(uri_template);
         self.resource_templates.insert(
             uri_template.to_string(),
             ResourceTemplate {
                 uri_template: uri_template.to_string(),
                 name: name.to_string(),
-                title: None,
+                title,
                 description: Some(description.to_string()),
-                mime_type: None,
+                mime_type,
             },
         );
+        self
+    }
+
+    /// Comme [`Self::resource_template`], avec un **handler de lecture
+    /// dynamique** pour un gabarit RFC 6570 simple (`{var}`, segment non vide
+    /// sans `/`).
+    ///
+    /// Lors d'un `resources/read`, une ressource statique exacte
+    /// ([`Self::resource`] / [`Self::resource_data`]) prime toujours ; sinon,
+    /// le premier gabarit simple correspondant à l'URI (dans l'ordre du
+    /// `BTreeMap`) exécute ce handler avec `(uri, params)` où `params` associe
+    /// chaque nom de variable à son segment extrait.
+    ///
+    /// # Panics
+    ///
+    /// Panique si `uri_template` n'est pas un gabarit simple `{nom}` (ex.
+    /// opérateurs `{+x}`, `{?q}`, expressions accolées `{a}{b}` ou accolade
+    /// non fermée) — erreur de programmation détectée au démarrage.
+    #[must_use]
+    pub fn resource_template_handler<F>(
+        self,
+        uri_template: &str,
+        name: &str,
+        description: &str,
+        f: F,
+    ) -> Self
+    where
+        F: Fn(&str, &BTreeMap<String, String>) -> Result<ResourceData, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.resource_template_handler_with_error(
+            uri_template,
+            name,
+            description,
+            move |uri, params| f(uri, params).map_err(ToolError::from),
+        )
+    }
+
+    /// Comme [`Self::resource_template_handler`], avec une erreur
+    /// **structurée** ([`ToolError`]).
+    #[must_use]
+    pub fn resource_template_handler_with_error<F>(
+        mut self,
+        uri_template: &str,
+        name: &str,
+        description: &str,
+        f: F,
+    ) -> Self
+    where
+        F: Fn(&str, &BTreeMap<String, String>) -> Result<ResourceData, ToolError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        assert!(
+            super::authz::is_simple_template(uri_template),
+            "litemcp/server : `resource_template_handler` n'accepte que des gabarits RFC 6570 \
+             simples `{{var}}` (reçu : `{uri_template}`)"
+        );
+        self = self.resource_template(uri_template, name, description);
+        self.resource_template_handlers
+            .insert(uri_template.to_string(), Arc::new(f));
         self
     }
 
@@ -1022,6 +1231,9 @@ impl ServerBuilder {
     /// Retourne `true` si le gabarit existait.
     pub fn remove_resource_template(&mut self, uri_template: &str) -> bool {
         self.resource_rights.remove(uri_template);
+        self.resource_mime_types.remove(uri_template);
+        self.template_titles.remove(uri_template);
+        self.resource_template_handlers.remove(uri_template);
         self.resource_templates.remove(uri_template).is_some()
     }
 
@@ -1152,6 +1364,67 @@ impl ServerBuilder {
         self
     }
 
+    /// Comme [`Self::prompt_typed`], avec un handler **typé** : les arguments
+    /// validés par le schéma sont désérialisés dans `T` (`DeserializeOwned`) —
+    /// le pendant de [`Self::tool_parse`] pour les prompts.
+    pub fn prompt_parse<S, T, F>(self, name: &str, description: &str, schema: S, f: F) -> Self
+    where
+        S: Schema + 'static,
+        T: DeserializeOwned,
+        F: Fn(T) -> Result<Vec<PromptMessage>, String> + Send + Sync + 'static,
+    {
+        self.prompt_parse_with_error(name, description, schema, move |args| {
+            f(args).map_err(ToolError::from)
+        })
+    }
+
+    /// Comme [`Self::prompt_parse`], avec une erreur **structurée**
+    /// ([`ToolError`]).
+    pub fn prompt_parse_with_error<S, T, F>(
+        mut self,
+        name: &str,
+        description: &str,
+        schema: S,
+        f: F,
+    ) -> Self
+    where
+        S: Schema + 'static,
+        T: DeserializeOwned,
+        F: Fn(T) -> Result<Vec<PromptMessage>, ToolError> + Send + Sync + 'static,
+    {
+        let handler = Arc::new(move |value: &Value| match serde_json::to_vec(value) {
+            Err(error) => Err(ToolError::invalid_input(format!(
+                "unreadable arguments: {error}"
+            ))),
+            Ok(buffer) => match serde_json::from_slice::<T>(&buffer) {
+                Ok(parsed) => f(parsed),
+                Err(error) => Err(ToolError::invalid_input(format!(
+                    "arguments do not match the expected type: {error}"
+                ))),
+            },
+        });
+        self.prompts.insert(
+            name.to_string(),
+            PromptDef {
+                description: Some(description.to_string()),
+                schema: Some(Arc::new(schema)),
+                required_rights: Vec::new(),
+                handler: PromptHandler::Plain(handler),
+            },
+        );
+        self
+    }
+
+    /// Enchaîne un enregistrement généré par une macro (`#[tool]`,
+    /// `#[resource]`, `#[prompt]` — macros incluses par défaut) :
+    /// `builder.register(register_add)` ou `builder.register(register_doc)`.
+    ///
+    /// Alias lisible de [`Self::with_tool`] pour les ressources et prompts.
+    #[must_use]
+    pub fn register(self, register: impl FnOnce(Self) -> Self) -> Self {
+        register(self)
+    }
+
     /// Enchaîne un enregistrement généré par une macro (`#[tool]`,
     /// `#[resource]`, `#[prompt]` — macros incluses par défaut) :
     /// `builder.with_tool(register_add)` où `register_add` est la fonction
@@ -1227,6 +1500,7 @@ impl ServerBuilder {
     /// `false`, aucun autre changement.
     pub fn remove_resource(&mut self, uri: &str) -> bool {
         self.resource_rights.remove(uri);
+        self.resource_mime_types.remove(uri);
         self.resources.remove(uri).is_some()
     }
 
@@ -1328,6 +1602,89 @@ impl ServerBuilder {
             required_rights: Vec::new(),
             mcp_params: Vec::new(),
             handler: ToolHandler::Plain(Arc::new(wrapped)),
+        };
+        def.sync_output_shape();
+        self.tools.insert(name.to_string(), def);
+        self
+    }
+
+    /// Comme [`Self::tool_result`], avec un **schéma à la Zod** exécuteur
+    /// ([`crate::zod`]) : l'`inputSchema` est publié dans `tools/list` et les
+    /// arguments sont validés avant l'appel du handler riche (`CallToolResult`).
+    pub fn tool_result_typed<S, F>(mut self, name: &str, description: &str, schema: S, f: F) -> Self
+    where
+        S: Schema + 'static,
+        F: Fn(&Value) -> Result<CallToolResult, ToolError> + Send + Sync + 'static,
+    {
+        let wrapped =
+            move |args: &Value| f(args).map(ToolOutcome::Result).map_err(ToolFailure::Tool);
+        let schema_arc = Arc::new(schema);
+        require_object_input_schema(name, schema_arc.as_ref());
+        let mcp_params = extract_mcp_param_defs(&schema_arc.json())
+            .expect("invalid x-mcp-header in tool schema");
+        let (output_schema, annotations, required_capabilities) = self.take_tool_pending(name);
+        let mut def = ToolDef {
+            description: Some(description.to_string()),
+            schema: Some(schema_arc),
+            output_schema,
+            output_object_rooted: false,
+            annotations,
+            required_capabilities,
+            required_rights: Vec::new(),
+            mcp_params,
+            handler: ToolHandler::Plain(Arc::new(wrapped)),
+        };
+        def.sync_output_shape();
+        self.tools.insert(name.to_string(), def);
+        self
+    }
+
+    /// Comme [`Self::tool_result_typed`], avec un handler **typé** : les
+    /// arguments validés par le schéma sont désérialisés dans `T`
+    /// (`DeserializeOwned`) — combinaison de [`Self::tool_parse`] et
+    /// [`Self::tool_result`].
+    pub fn tool_result_parse<S, T, F>(
+        mut self,
+        name: &str,
+        description: &str,
+        schema: S,
+        f: F,
+    ) -> Self
+    where
+        S: Schema + 'static,
+        T: DeserializeOwned,
+        F: Fn(T) -> Result<CallToolResult, ToolError> + Send + Sync + 'static,
+    {
+        let handler = Arc::new(move |value: &Value| match serde_json::to_vec(value) {
+            Err(error) => Err(ToolFailure::Protocol(
+                ErrorObject::INVALID_PARAMS,
+                format!("unreadable arguments: {error}"),
+            )),
+            Ok(buffer) => match serde_json::from_slice::<T>(&buffer) {
+                Ok(parsed) => f(parsed)
+                    .map(ToolOutcome::Result)
+                    .map_err(ToolFailure::Tool),
+                Err(error) => Err(ToolFailure::Protocol(
+                    ErrorObject::INVALID_PARAMS,
+                    format!("arguments do not match the expected type: {error}"),
+                )),
+            },
+        });
+        let schema_arc = Arc::new(schema);
+        require_object_input_schema(name, schema_arc.as_ref());
+        let mcp_params = extract_mcp_param_defs(&schema_arc.json())
+            .expect("invalid x-mcp-header in tool schema");
+        let (output_schema, annotations, required_capabilities) = self.take_tool_pending(name);
+        let mut def = ToolDef {
+            description: Some(description.to_string()),
+            schema: Some(schema_arc),
+            output_schema,
+            output_object_rooted: false,
+            annotations,
+            required_capabilities,
+            required_rights: Vec::new(),
+            mcp_params,
+            handler: ToolHandler::Plain(handler),
         };
         def.sync_output_shape();
         self.tools.insert(name.to_string(), def);
@@ -1729,7 +2086,7 @@ impl ServerBuilder {
         })
     }
 
-    /// Catalogue des gabarits avec le droit déclaré de chacun.
+    /// Catalogue des gabarits avec le droit déclaré et le handler éventuel de chacun.
     fn templates(&self) -> BTreeMap<String, TemplateDef> {
         self.resource_templates
             .iter()
@@ -1739,6 +2096,7 @@ impl ServerBuilder {
                     TemplateDef {
                         template: template.clone(),
                         required_rights: Vec::new(),
+                        handler: self.resource_template_handlers.get(key).cloned(),
                     },
                 )
             })
@@ -1913,19 +2271,7 @@ impl ServerBuilder {
         apply_rights(&self.prompt_rights, prompts.iter_mut(), |def| {
             &mut def.required_rights
         });
-        let mut templates: BTreeMap<String, TemplateDef> = self
-            .resource_templates
-            .iter()
-            .map(|(key, template)| {
-                (
-                    key.clone(),
-                    TemplateDef {
-                        template: template.clone(),
-                        required_rights: Vec::new(),
-                    },
-                )
-            })
-            .collect();
+        let mut templates = self.templates();
         apply_rights(&self.resource_rights, templates.iter_mut(), |def| {
             &mut def.required_rights
         });

@@ -12,7 +12,18 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
-Corrections d'audit (transport HTTP, liaison RFC 9421, `Mcp-Param` entiers, gate de publication), leurs tests de régression et la documentation, plus un changement interne sans rupture d'API.
+## [0.12.2] - 2026-11-26
+
+Lot complet de l'audit du 2026-11-25 : tous les correctifs de sécurité/protocole/CI (**B1–B10**, **D1–D3**), toutes les améliorations d'API et d'ergonomie (**A1–A7**), et `litemcp-macros` `0.4.3`.
+
+### Ajouté
+
+- **`Gateway` complet et transport HTTP intégré (`Gateway::bind`)** (audit 2026-11-25, A1) : `Gateway::remove_tool`, `Gateway::remove_resource_template`, `Gateway::dispatch_request_with_progress` / `dispatch_authenticated_with_progress` (sous garde anti-récursion), et `Gateway::bind(addr) -> GatewayServer` qui sert le catalogue vivant sur le transport HTTP intégré (snapshot repris par requête après réception de la ligne de requête, même en keep-alive).
+- **Symétrie typée sur `ServerBuilder`** (audit 2026-11-25, A2) : `tool_result_typed`, `tool_result_parse`, `tool_mrtr_typed`, `prompt_mrtr_typed` (`_with_error`) et `prompt_parse` (`_with_error`) — validation `zod::Schema` exécuteur avant le handler pour les contenus riches, MRTR et prompts typés.
+- **`mimeType` et `title` statiques sur les catalogues de ressources** (audit 2026-11-25, A3) : `ServerBuilder::resource_mime_type` (ressources et gabarits) et `ServerBuilder::resource_template_title` (ordre d'appel libre, purgés au retrait).
+- **Ergonomie des macros (`litemcp-macros` `0.4.3`) et `.register(…)`** (audit 2026-11-25, A4) : les doc-comments `///` servent automatiquement de `description` quand l'attribut `description = "…"` est omis sur `#[tool]`/`#[prompt]`/`#[resource]` ; `#[resource]` accepte `mime_type = "…"` ; `ServerBuilder::register(f)` complète `.with_tool(f)`.
+- **Routage dynamique des gabarits RFC 6570 simples** (audit 2026-11-25, A7) : `ServerBuilder::resource_template_handler` (`_with_error`) associe un handler `(&str, &BTreeMap<String, String>) -> Result<ResourceData, …>` à un gabarit `{var}` sans regex ni dépendance, en donnant toujours la priorité aux URI statiques et en appliquant `.require_resource_right`.
+- **CI multi-OS** (audit 2026-11-25, A6) : `cargo clippy --workspace --all-targets --all-features -- -D warnings` ajouté aux jobs `windows` et `macos`.
 
 ### Modifié
 

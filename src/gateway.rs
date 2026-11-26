@@ -38,9 +38,10 @@
 //! });
 //!
 //! // Dispatch embarqué (l'app hôte possède sa propre route HTTP) ou socket
-//! // dédié : le snapshot courant sert la requête. Un corps nu ne passe pas
-//! // le profil strict — `dispatch_unchecked` est réservé aux appelants qui
-//! // garantissent déjà des corps MCP 2026-07-28 conformes.
+//! // dédié ([`Gateway::bind`] — transport HTTP intégré) : le snapshot
+//! // courant sert la requête. Un corps nu ne passe pas le profil strict —
+//! // `dispatch_unchecked` est réservé aux appelants qui garantissent déjà
+//! // des corps MCP 2026-07-28 conformes.
 //! let snapshot = gw.snapshot();
 //! let _ = snapshot.dispatch_unchecked(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
 //! # Ok(())
@@ -242,6 +243,51 @@ impl Gateway {
         removed
     }
 
+    /// Retire un **outil** du registre — le pendant direct de
+    /// [`ServerBuilder::remove_tool`] : un serveur détecté disparaît, son
+    /// outil disparaît de `tools/list`, sans passer par une closure
+    /// d'`edit`.
+    ///
+    /// Retourne `true` si l'outil existait. Un outil absent → `false`,
+    /// aucun autre changement. Les métadonnées en attente pour ce nom
+    /// (annotations, `outputSchema`, capacités requises) sont purgées en
+    /// même temps — un ré-enregistrement du même nom repart propre, comme
+    /// pour un retrait opéré dans un `edit`.
+    ///
+    /// ```no_run
+    /// # use litemcp::prelude::*;
+    /// # fn main() {
+    /// # let gw = Gateway::new(ServerBuilder::new("gw", "1.0")
+    /// #     .tool("srv__echo", "Echo du serveur détecté", |_a| Ok(serde_json::json!({}))));
+    /// let retire = gw.remove_tool("srv__echo"); // `true` : quitte `tools/list`
+    /// # let _ = retire;
+    /// # }
+    /// ```
+    pub fn remove_tool(&self, name: &str) -> bool {
+        let mut removed = false;
+        self.edit(|mut builder| {
+            removed = builder.remove_tool(name);
+            builder
+        });
+        removed
+    }
+
+    /// Retire un **gabarit de ressource** du registre — le pendant direct de
+    /// [`ServerBuilder::remove_resource_template`] : le gabarit disparaît de
+    /// `resources/templates/list`.
+    ///
+    /// Retourne `true` si le gabarit existait, `false` sinon (aucun autre
+    /// changement). Les ressources **fixes** ne sont pas touchées — voir
+    /// [`Gateway::remove_resource`].
+    pub fn remove_resource_template(&self, uri_template: &str) -> bool {
+        let mut removed = false;
+        self.edit(|mut builder| {
+            removed = builder.remove_resource_template(uri_template);
+            builder
+        });
+        removed
+    }
+
     /// Nombre d'outils du snapshot courant — pour les journaux et les tests.
     #[must_use]
     pub fn tool_count(&self) -> usize {
@@ -373,6 +419,125 @@ impl Gateway {
         self.snapshot().dispatch_verified(request)
     }
 
+    /// Dispatch sur le snapshot courant avec progression **request-scoped**
+    /// — voir [`ServerCore::dispatch_request_with_progress`]. Le canal
+    /// fourni reçoit les `notifications/progress` émises par le handler
+    /// pendant l'exécution ([`crate::progress::report`]) : c'est le point
+    /// d'entrée d'un hôte qui sert lui-même le flux SSE du POST, **sans**
+    /// contourner la garde de récursion en reprenant [`Gateway::snapshot`]
+    /// à chaque requête (audit 2026-11-25, A1).
+    ///
+    /// **Garde de récursion** : identique à [`Gateway::dispatch`] — au-delà
+    /// de `MAX_DISPATCH_DEPTH` dispatchs imbriqués sur le thread courant,
+    /// l'appel reçoit une enveloppe `-32603` au lieu d'exécuter le corps,
+    /// avec le statut canonique du noyau pour ce code.
+    pub fn dispatch_request_with_progress(
+        &self,
+        body: &[u8],
+        headers: Option<&McpHeaders>,
+        channel: Arc<dyn crate::progress::ProgressChannel>,
+    ) -> Option<crate::server::DispatchResponse> {
+        let Some(_garde) = Self::enter_dispatch() else {
+            // Le statut suit le corps rendu : `-32603` d'ordinaire, `-32700`
+            // (400) quand le corps de la requête était illisible.
+            return recursion_limit_response(body).map(|(corps, code)| {
+                crate::server::DispatchResponse {
+                    body: corps,
+                    status: crate::server::HttpStatus::from_error_code(code),
+                }
+            });
+        };
+        self.snapshot()
+            .dispatch_request_with_progress(body, headers, channel)
+    }
+
+    /// Idem [`Gateway::dispatch_request_with_progress`], avec une identité
+    /// **déjà établie** par le transport hôte — voir
+    /// [`ServerCore::dispatch_authenticated_with_progress`].
+    ///
+    /// **Garde de récursion** : identique à [`Gateway::dispatch`].
+    pub fn dispatch_authenticated_with_progress(
+        &self,
+        body: &[u8],
+        headers: Option<&McpHeaders>,
+        context: &crate::auth::AuthContext,
+        channel: Arc<dyn crate::progress::ProgressChannel>,
+    ) -> Option<crate::server::DispatchResponse> {
+        let Some(_garde) = Self::enter_dispatch() else {
+            return recursion_limit_response(body).map(|(corps, code)| {
+                crate::server::DispatchResponse {
+                    body: corps,
+                    status: crate::server::HttpStatus::from_error_code(code),
+                }
+            });
+        };
+        self.snapshot()
+            .dispatch_authenticated_with_progress(body, headers, context, channel)
+    }
+
+    /// Lie le gateway au **transport HTTP intégré** — un socket dédié qui
+    /// sert le registre vivant sans que l'app hôte réécrive une boucle
+    /// socket : `POST /mcp` (réponse JSON ou flux SSE de progression),
+    /// sonde `/health`, gardes `Origin`/`Host`, plafond de connexions,
+    /// arrêt propre ([`GatewayServer::handle`] /
+    /// [`crate::http::ServerHandle::shutdown`]).
+    ///
+    /// Chaque requête re-publie un snapshot **au moment où elle est
+    /// servie** : une édition ([`Gateway::edit`],
+    /// [`Gateway::remove_tool`]…) survenue entre deux requêtes — y compris
+    /// sur la même connexion keep-alive — est visible dès la requête
+    /// suivante. La cohérence est **par requête**, sans snapshot figé : une
+    /// requête en vol finit sur le snapshot où elle a commencé, jamais sur
+    /// un catalogue à moitié reconstruit (voir [`Gateway::edit`]).
+    ///
+    /// # Configuration du transport
+    ///
+    /// Celle du chemin [`crate::ServerBuilder::bind`] **sans aucune
+    /// option** : route `/mcp`, aucun hook de requête, aucune origine CORS
+    /// autorisée (le préflight d'un navigateur est refusé, hors exception
+    /// bouclage même-origine), hôtes locaux par défaut, timeouts et
+    /// plafonds par défaut, pas d'annonce MCP Control, pas d'anti-zombie,
+    /// pas de TLS. Une gateway qui a besoin d'une de ces options (TLS,
+    /// CORS, hooks, autorisation) monte [`Gateway::snapshot`] dans son
+    /// propre socket durci — ou passe par un reverse proxy amont. La liste
+    /// `Access-Control-Allow-Headers` du préflight est la base commune ;
+    /// elle n'est pas recalculée quand un `edit` ajoute un outil portant
+    /// des `Mcp-Param-*`.
+    ///
+    /// # Exemple
+    ///
+    /// ```no_run
+    /// use litemcp::prelude::*;
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let gw = Arc::new(Gateway::new(
+    ///     ServerBuilder::new("gateway", "1.0.0")
+    ///         .tool("ping", "Sonner le gateway", |_a| {
+    ///             Ok(serde_json::json!({ "pong": true }))
+    ///         }),
+    /// ));
+    /// let serveur = gw.bind("127.0.0.1:23080")?;
+    /// let handle = serveur.handle();
+    /// std::thread::spawn(move || {
+    ///     let _ = serveur.serve();
+    /// });
+    /// // … plus tard :
+    /// handle.shutdown();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn bind(self: &Arc<Self>, addr: &str) -> std::io::Result<GatewayServer> {
+        // L'instantané initial n'est PAS celui qui sert : il n'alimente que
+        // l'état du `Drop` du serveur lié — chaque requête re-publie un
+        // snapshot depuis le gateway (voir `serve_with_gateway`).
+        let bound = crate::http::BoundServer::bind_for_gateway(addr, self.snapshot())?;
+        Ok(GatewayServer {
+            inner: bound,
+            gateway: Arc::clone(self),
+        })
+    }
+
     fn read_current(&self) -> Arc<ServerCore> {
         Arc::clone(
             &self
@@ -380,6 +545,42 @@ impl Gateway {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+}
+
+/// Serveur HTTP intégré lié à un [`Gateway`] dynamique — le résultat de
+/// [`Gateway::bind`].
+///
+/// La plomberie est celle d'un [`crate::http::BoundServer`] : un thread par
+/// connexion dans la limite du plafond, keep-alive borné, gardes
+/// `Origin`/`Host`, arrêt gracieux. La seule différence est la source du
+/// noyau : chaque requête re-publie un snapshot du gateway (cohérence **par
+/// requête**, pas de snapshot figé).
+pub struct GatewayServer {
+    inner: crate::http::BoundServer,
+    gateway: Arc<Gateway>,
+}
+
+impl GatewayServer {
+    /// Adresse locale effective — utile après un bind sur le port 0.
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    /// Poignée d'arrêt — à prendre **avant** [`GatewayServer::serve`].
+    /// [`crate::http::ServerHandle::shutdown`] est idempotente : la boucle
+    /// d'accept cesse immédiatement, les connexions vivantes se ferment
+    /// **entre deux requêtes**, la requête en cours termine proprement.
+    #[must_use]
+    pub fn handle(&self) -> crate::http::ServerHandle {
+        self.inner.handle()
+    }
+
+    /// Bloque et sert les connexions — chaque requête est servie par le
+    /// snapshot **courant** du gateway. Rend `Ok(())` après un arrêt demandé
+    /// ([`GatewayServer::handle`]).
+    pub fn serve(self) -> std::io::Result<()> {
+        self.inner.serve_with_gateway(self.gateway)
     }
 }
 

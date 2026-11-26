@@ -55,8 +55,8 @@ Relevé dans `.github/workflows/ci.yml` le 2026-11-16 — cinq jobs :
 |---|---|---|
 | `test` | `ubuntu-latest` | `cargo fmt --check` ; clippy `--all-features` ; clippy `--no-default-features` ; `cargo test --workspace --all-features` ; `cargo test --workspace` (configuration par défaut) ; `cargo test --workspace --no-default-features` ; **chaque feature isolée** (`macros`, `schemars`, `auth-sign`, `tls`) en `cargo check` **et** `cargo test` ; `cargo build --examples --all-features` ; simulations du pipeline de publication (dans `cargo test --workspace`, crate `release-tool`) ; rustdoc strict (`RUSTDOCFLAGS=-D warnings`) |
 | `msrv` | `ubuntu-latest`, toolchain 1.85 | `cargo check --workspace --all-targets --all-features` |
-| `windows` | `windows-latest` | `cargo test --workspace` **et** `cargo test --workspace --all-features` |
-| `macos` | `macos-latest` | `cargo test --workspace` **et** `cargo test --workspace --all-features` |
+| `windows` | `windows-latest` | `cargo clippy --workspace --all-targets --all-features -- -D warnings` ; `cargo test --workspace` **et** `cargo test --workspace --all-features` |
+| `macos` | `macos-latest` | `cargo clippy --workspace --all-targets --all-features -- -D warnings` ; `cargo test --workspace` **et** `cargo test --workspace --all-features` |
 | `advisories` | `ubuntu-latest` | `cargo deny check advisories` |
 
 Trois affirmations périmées, corrigées ici :
@@ -71,9 +71,7 @@ Trois affirmations périmées, corrigées ici :
   port libre restant ; si les vingt ports sont pris, il vérifie seulement le repli sur un port
   éphémère, hors tranche et sur loopback.
 
-Ce que la CI **ne** couvre pas : ni clippy ni rustdoc sur Windows/macOS (seuls les tests y
-tournent), ni les features isolées hors Linux, ni la conformance MCP
-(`node .github/conformance/check_baseline.js`), ni les campagnes de mesure de `docs/bench/`.
+Ce que la CI **ne** couvre pas : rustdoc sur Windows/macOS (clippy et les tests y tournent), ni les features isolées hors Linux, ni la conformance MCP (`node .github/conformance/check_baseline.js`), ni les campagnes de mesure de `docs/bench/`.
 
 ## Sockets réelles
 

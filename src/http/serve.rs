@@ -1,12 +1,14 @@
 //! Serveur lié : `BoundServer`, boucle d'accept et poignée d'arrêt.
 
 use super::conn::Conn;
-use super::connection::{ConnectionEnv, handle_connection};
+use super::connection::{ConnectionEnv, CoreSource, handle_connection};
 use super::response::{ResponseHead, respond_version, shutdown_gracefully, shutdown_plain};
 use super::*;
 
 /// Serveur HTTP attaché à un socket bindé
-/// (résultat de [`crate::ServerBuilder::bind`]).
+/// (résultat de [`crate::ServerBuilder::bind`]) — et moteur, derrière
+/// [`crate::gateway::GatewayServer`], du socket dédié d'un gateway
+/// ([`crate::Gateway::bind`]).
 pub struct BoundServer {
     pub(crate) listener: TcpListener,
     pub(crate) core: Arc<ServerCore>,
@@ -156,12 +158,27 @@ impl BoundServer {
         // Le retrait de l'annonce est assuré par `Drop for BoundServer`,
         // déclenché quand le `self` consommé ici finit de vivre — ce qui
         // couvre aussi un `BoundServer` lié puis droppé sans `serve()`.
-        self.serve_loop()
+        self.serve_loop(None)
+    }
+
+    /// Sert ce serveur en reprenant un snapshot du gateway **à chaque
+    /// requête** — le socle de [`crate::gateway::GatewayServer::serve`]
+    /// (voir [`crate::Gateway::bind`]). La plomberie est exactement celle
+    /// de [`Self::serve`] : même boucle d'accept, mêmes plafonds, même
+    /// arrêt gracieux.
+    pub(crate) fn serve_with_gateway(
+        self,
+        gateway: Arc<crate::gateway::Gateway>,
+    ) -> std::io::Result<()> {
+        self.serve_loop(Some(gateway))
     }
 
     /// Boucle d'accept — corps de [`Self::serve`], qui ne fait plus que la
-    /// déléguer (le retrait d'annonce vit dans le `Drop`).
-    fn serve_loop(self) -> std::io::Result<()> {
+    /// déléguer (le retrait d'annonce vit dans le `Drop`). `gateway` :
+    /// source dynamique du noyau — chaque requête re-publie un snapshot du
+    /// gateway (voir [`crate::Gateway::bind`]) ; `None` : noyau figé du
+    /// serveur lié (chemin historique).
+    fn serve_loop(self, gateway: Option<Arc<crate::gateway::Gateway>>) -> std::io::Result<()> {
         let is_loopback_listener = self
             .listener
             .local_addr()
@@ -284,6 +301,10 @@ impl BoundServer {
                 continue;
             }
             let core = Arc::clone(&self.core);
+            // Gateway dynamique : un clone d'`Arc` par connexion — le
+            // snapshot, lui, est repris à chaque requête (voir `CoreSource`
+            // dans `handle_connection`).
+            let gateway_conn = gateway.as_ref().map(Arc::clone);
             let route = Arc::clone(&self.route);
             let allow_origins = Arc::clone(&self.allow_origins);
             let allowed_hosts = Arc::clone(&self.allowed_hosts);
@@ -343,10 +364,16 @@ impl BoundServer {
                         }
                     }
                     let _guard = LiveGuard(live);
+                    // Source du noyau : gateway dynamique (snapshot repris
+                    // à chaque requête) ou noyau figé du serveur lié.
+                    let core = match gateway_conn.as_deref() {
+                        Some(gw) => CoreSource::Gateway(gw),
+                        None => CoreSource::Static(&core),
+                    };
                     let _ = handle_connection(
                         spawn_stream,
                         ConnectionEnv {
-                            core: &core,
+                            core,
                             route: &route,
                             allow_origins: &allow_origins,
                             allowed_hosts: &allowed_hosts,
@@ -386,6 +413,57 @@ impl BoundServer {
             }
         }
         Ok(())
+    }
+}
+
+impl BoundServer {
+    /// Lie un socket au nom d'un gateway dynamique — le socle de
+    /// [`crate::Gateway::bind`]. La configuration du transport est celle du
+    /// chemin [`crate::ServerBuilder::bind`] **sans aucune option** : route
+    /// `/mcp`, aucun hook de requête, aucune origine CORS autorisée, hôtes
+    /// locaux par défaut (règle `host_autorise`), timeouts et plafonds par
+    /// défaut, pas d'annonce MCP Control, pas d'anti-zombie, pas de TLS —
+    /// le gateway n'expose pas de configuration de certificat ; le TLS
+    /// reste le fait d'un bind `ServerBuilder` ou d'un reverse proxy amont.
+    ///
+    /// Le noyau reçu n'est **pas** celui qui sert : c'est l'instantané
+    /// initial du gateway, conservé pour l'état du `Drop` — chaque requête
+    /// re-publie un snapshot depuis le gateway (câblé par
+    /// `serve_with_gateway`, voir le `CoreSource` de la connexion).
+    pub(crate) fn bind_for_gateway(addr: &str, core: Arc<ServerCore>) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        Ok(BoundServer {
+            listener,
+            core,
+            route: Arc::new("/mcp".to_string()),
+            // Liste `Access-Control-Allow-Headers` du préflight : la même
+            // base qu'un `ServerBuilder::finish` sans vérificateur ni
+            // déclaration utilisateur (B3, audit 2026-11-25). Les
+            // `Mcp-Param-*` déclarés par des outils ajoutés après le bind ne
+            // réécrivent pas la liste — même limite que le chemin statique,
+            // où la liste est figée au bind.
+            allow_preflight_headers: String::from(
+                "Content-Type, Accept, MCP-Protocol-Version, Mcp-Method, Mcp-Name",
+            ),
+            allow_origins: Arc::new(Vec::new()),
+            allowed_hosts: Arc::new(Vec::new()),
+            request_hooks: Arc::new(Vec::new()),
+            read_timeout: READ_TIMEOUT,
+            write_deadline: None,
+            max_connections: MAX_CONNECTIONS,
+            connection_ttl: CONNECTION_TTL,
+            live_connections: Arc::new(AtomicUsize::new(0)),
+            refusals_in_flight: Arc::new(AtomicUsize::new(0)),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            announce_name: None,
+            instance_id: crate::registry::generate_instance_id(port),
+            zombie: None,
+            #[cfg(feature = "tls")]
+            tls: None,
+            #[cfg(feature = "tls")]
+            certificate_fingerprint: None,
+        })
     }
 }
 

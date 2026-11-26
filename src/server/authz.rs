@@ -54,7 +54,7 @@ fn template_covers(pattern: &str, uri: &str) -> bool {
 /// `{nom}`, séparées par des littéraux **non vides** (préfixe et suffixe
 /// pouvant être vides) ? C'est la seule forme que la règle segment par segment
 /// sait lire sans ambiguïté.
-fn is_simple_template(pattern: &str) -> bool {
+pub(super) fn is_simple_template(pattern: &str) -> bool {
     let mut cursor = 0usize;
     let mut first = true;
     loop {
@@ -82,6 +82,30 @@ fn is_simple_template(pattern: &str) -> bool {
 /// Motif simple : littéraux comparés octet par octet, une variable `{nom}`
 /// couvrant un segment **non vide** sans `/`.
 fn simple_template_covers(pattern: &str, uri: &str) -> bool {
+    match_simple_template_impl(pattern, uri, None)
+}
+
+/// Comme [`simple_template_covers`], mais extrait les paires `(nom, valeur)`
+/// des variables `{nom}` — utilisé pour le routage dynamique optionnel de
+/// `resources/read` ([`ServerBuilder::resource_template_handler`]).
+///
+/// Aucune regex, aucune dépendance : même parcours zéro-copie que l'autorisation.
+pub(super) fn match_simple_template<'a>(
+    pattern: &'a str,
+    uri: &'a str,
+) -> Option<BTreeMap<String, String>> {
+    if !is_simple_template(pattern) {
+        return None;
+    }
+    let mut params = BTreeMap::new();
+    match_simple_template_impl(pattern, uri, Some(&mut params)).then_some(params)
+}
+
+fn match_simple_template_impl(
+    pattern: &str,
+    uri: &str,
+    mut capture: Option<&mut BTreeMap<String, String>>,
+) -> bool {
     let mut rest = uri;
     let mut cursor = 0usize;
     loop {
@@ -112,6 +136,9 @@ fn simple_template_covers(pattern: &str, uri: &str) -> bool {
             if span == 0 || span != rest.len() {
                 return false;
             }
+            if let Some(map) = capture.as_deref_mut() {
+                map.insert(name.to_string(), rest.to_string());
+            }
             rest = "";
         } else {
             // Bornes de caractères uniquement : une URI non-ASCII vient du
@@ -129,6 +156,9 @@ fn simple_template_covers(pattern: &str, uri: &str) -> bool {
             let Some(len) = chosen else {
                 return false;
             };
+            if let Some(map) = capture.as_deref_mut() {
+                map.insert(name.to_string(), rest[..len].to_string());
+            }
             rest = &rest[len..];
         }
         cursor = after;

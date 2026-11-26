@@ -443,7 +443,7 @@ impl ServerCore {
                 uri: uri.clone(),
                 name: def.name.clone(),
                 description: def.description.clone(),
-                mime_type: None,
+                mime_type: def.mime_type.clone(),
             })
             .collect();
         ResourcesListResult {
