@@ -6,7 +6,12 @@
 //!
 //! Le schéma d'entrée est **dérivé des types des paramètres** (module
 //! `litemcp::zod`), et une fonction `register_<nom>` est générée à côté de
-//! chaque fonction annotée, à enchaîner via `.with_tool(…)`.
+//! chaque fonction annotée, à enchaîner via `.with_tool(…)`. La visibilité
+//! du `register_<nom>` généré recopie celle de la fonction annotée (B10,
+//! audit 2026-11-25) : `fn` génère un `register_<nom>` privé — utilisable
+//! dans le module qui déclare la fonction —, `pub(crate)` génère
+//! `pub(crate)`, `pub(in chemin)` est recopié tel quel, et `pub` reste
+//! `pub`.
 //!
 //! ```ignore
 //! use litemcp::macros::{prompt, resource, tool};
@@ -154,16 +159,11 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
     let register = format!("register_{fn_ident}");
     let doc = format!("Enregistre la ressource `{uri}` (généré par #[resource]).");
 
-    let registration = format!(
-        r#"
-        #[doc = {doc:?}]
-        #[allow(non_snake_case)]
-        pub fn {register}(
-            __litemcp_server: ::litemcp::ServerBuilder,
-        ) -> ::litemcp::ServerBuilder {{
-            __litemcp_server.resource({uri:?}, {name:?}, {description:?}, {fn_name})
-        }}
-        "#
+    let registration = registration_item(
+        &sig.visibility,
+        &doc,
+        &register,
+        &format!("__litemcp_server.resource({uri:?}, {name:?}, {description:?}, {fn_name})"),
     );
 
     let mut out = item;
@@ -261,21 +261,14 @@ fn generate_parametrized(attr: TokenStream, item: TokenStream, target: Target) -
         ),
     };
 
-    let registration = format!(
-        r#"
-        #[doc = {doc:?}]
-        #[allow(non_snake_case)]
-        pub fn {register}(
-            __litemcp_server: ::litemcp::ServerBuilder,
-        ) -> ::litemcp::ServerBuilder {{
-            __litemcp_server.{builder_method}(
-                {name:?},
-                {description:?},
-                {schema_chain},
-                |__litemcp_args| {fn_name}({args_joined}),
-            )
-        }}
-        "#
+    let registration = registration_item(
+        &sig.visibility,
+        &doc,
+        &register,
+        &format!(
+            "__litemcp_server.{builder_method}({name:?}, {description:?}, {schema_chain}, \
+             |__litemcp_args| {fn_name}({args_joined}))"
+        ),
     );
 
     let mut out = item;
@@ -285,6 +278,83 @@ fn generate_parametrized(attr: TokenStream, item: TokenStream, target: Target) -
 
 fn strip_raw_ident(ident: &str) -> &str {
     ident.strip_prefix("r#").unwrap_or(ident)
+}
+
+/// Extrait la visibilité (`pub`, `pub(crate)`, `pub(in chemin)`, …) écrite
+/// avant le mot-clé `fn` ; chaîne vide pour une fonction privée. B10
+/// (audit 2026-11-25) : cette visibilité est recopiée devant le
+/// `register_<nom>` généré au lieu du `pub` inconditionnel qui déclenchait
+/// `unreachable_pub` chez les utilisateurs activant le lint.
+fn visibility_before_fn(prefix: &[TokenTree]) -> String {
+    let mut visibility = String::new();
+    for (idx, token) in prefix.iter().enumerate() {
+        if !matches!(token, TokenTree::Ident(ident) if ident.to_string() == "pub") {
+            continue;
+        }
+        visibility = match prefix.get(idx + 1) {
+            Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis => {
+                let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                format!("pub({})", render_visibility_path(&inner))
+            }
+            _ => "pub".to_string(),
+        };
+    }
+    visibility
+}
+
+/// Rend les jetons d'une visibilité restreinte sous forme compacte : `crate`,
+/// `super`, `self` ou `in ::a::b` — les deux-points d'un séparateur de chemin
+/// sont toujours émis collés (`::`), sans espace parasite.
+fn render_visibility_path(tokens: &[TokenTree]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        match token {
+            TokenTree::Punct(p) if p.as_char() == ':' => out.push(':'),
+            TokenTree::Punct(p) => {
+                out.push(p.as_char());
+                out.push(' ');
+            }
+            other => {
+                out.push_str(&other.to_string());
+                out.push(' ');
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// Préfixe de visibilité devant le `fn` généré : vide pour une fonction
+/// privée (visibilité par défaut d'un item), sinon la visibilité de la
+/// fonction source suivie d'une espace (`pub fn`, `pub(crate) fn`, …).
+fn visibility_prefix(visibility: &str) -> String {
+    if visibility.is_empty() {
+        String::new()
+    } else {
+        format!("{visibility} ")
+    }
+}
+
+/// Assemble l'item `fn register_<nom>` partagé par `#[tool]`, `#[prompt]` et
+/// `#[resource]` : `visibility` est la visibilité de la fonction source
+/// (chaîne vide = fonction privée), recopiée devant le `fn` généré, et
+/// `call` est l'expression d'enregistrement appelée sur `__litemcp_server`.
+///
+/// La chaîne rendue est exactement celle que `TokenStream::from_str` parse
+/// en jetons de l'item généré : c'est elle que vérifient les tests
+/// unitaires, l'API `proc_macro` n'étant pas invocable hors expansion.
+fn registration_item(visibility: &str, doc: &str, register: &str, call: &str) -> String {
+    let visibility = visibility_prefix(visibility);
+    format!(
+        r#"
+        #[doc = {doc:?}]
+        #[allow(non_snake_case)]
+        {visibility}fn {register}(
+            __litemcp_server: ::litemcp::ServerBuilder,
+        ) -> ::litemcp::ServerBuilder {{
+            {call}
+        }}
+        "#
+    )
 }
 
 /// `default(param = littéral)` déclaré dans l'attribut.
@@ -414,6 +484,11 @@ fn parse_attrs(attr: TokenStream) -> MacroResult<Attrs> {
 /// Signature extraite de la fonction annotée.
 struct FnSig {
     name: String,
+    /// Visibilité de la fonction annotée, recopiée telle quelle devant le
+    /// `register_<nom>` généré (B10, audit 2026-11-25) : chaîne vide pour
+    /// une fonction privée, sinon `pub`, `pub(crate)`, `pub(super)`,
+    /// `pub(self)` ou `pub(in chemin)`.
+    visibility: String,
     raw_params: Vec<Vec<TokenTree>>,
 }
 
@@ -436,6 +511,9 @@ fn parse_fn_sig(item: &TokenStream, macro_name: &str) -> MacroResult<FnSig> {
     while i < tokens.len() {
         if let TokenTree::Ident(ident) = &tokens[i] {
             if ident.to_string() == "fn" {
+                // B10 (audit 2026-11-25) : la visibilité écrite avant `fn`
+                // est recopiée devant le `register_<nom>` généré.
+                let visibility = visibility_before_fn(&tokens[..i]);
                 let Some(TokenTree::Ident(fn_ident)) = tokens.get(i + 1) else {
                     return Err(Diag::at(
                         format!("{macro_name} : nom de fonction attendu après `fn`"),
@@ -468,7 +546,11 @@ fn parse_fn_sig(item: &TokenStream, macro_name: &str) -> MacroResult<FnSig> {
                                 .filter(|slice| !slice.is_empty())
                                 .map(<[TokenTree]>::to_vec)
                                 .collect();
-                            return Ok(FnSig { name, raw_params });
+                            return Ok(FnSig {
+                                name,
+                                visibility,
+                                raw_params,
+                            });
                         }
                     }
                     j += 1;
@@ -1199,7 +1281,7 @@ fn err(diag: Diag) -> TokenStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{DefaultLit, ParamType, parse_numeric_lit};
+    use super::{DefaultLit, ParamType, parse_numeric_lit, registration_item};
 
     fn int(n: i128) -> DefaultLit {
         DefaultLit::Int(n)
@@ -1301,5 +1383,62 @@ mod tests {
                 .contains("compile_error!"),
             "i64::MIN - 1 doit produire un diagnostic, jamais une troncature"
         );
+    }
+
+    /// B10 (audit 2026-11-25) : la visibilité du `register_<nom>` généré
+    /// recopie celle de la fonction source. Les assertions portent sur la
+    /// **chaîne source** de l'item généré — `TokenStream::from_str` la parse
+    /// en jetons exactement telle quelle — car l'API `proc_macro` ne peut
+    /// pas être invoquée hors expansion (aucun jeton constructible en test
+    /// unitaire). Le bout-en-bout réel est couvert côté utilisateur par
+    /// `tests/audit_2026_11_25_macros_visibilite.rs` de la crate `litemcp`.
+    #[test]
+    fn register_prive_ne_commence_pas_par_pub() {
+        let code = registration_item(
+            "",
+            "Enregistre l'outil `add`.",
+            "register_add",
+            "__litemcp_server.tool_typed(\"add\", \"…\", schema, |__a| add(__a))",
+        );
+        assert!(code.contains("\n        fn register_add("), "{code}");
+        assert!(!code.contains("pub"), "{code}");
+    }
+
+    /// `pub(crate)` est recopié devant le `fn` généré.
+    #[test]
+    fn register_pub_crate_recopie_devant_le_fn_genere() {
+        let code = registration_item(
+            "pub(crate)",
+            "Enregistre l'outil `add`.",
+            "register_add",
+            "__litemcp_server.tool_typed(\"add\", \"…\", schema, |__a| add(__a))",
+        );
+        assert!(code.contains("pub(crate) fn register_add("), "{code}");
+    }
+
+    /// `pub` reste inchangé : les appels extérieurs existants continuent de
+    /// compiler.
+    #[test]
+    fn register_pub_reste_inchange() {
+        let code = registration_item(
+            "pub",
+            "Enregistre l'outil `add`.",
+            "register_add",
+            "__litemcp_server.tool_typed(\"add\", \"…\", schema, |__a| add(__a))",
+        );
+        assert!(code.contains("pub fn register_add("), "{code}");
+        assert!(!code.contains("pub(crate)"), "{code}");
+    }
+
+    /// `pub(in chemin)` est recopié tel quel devant le `fn` généré.
+    #[test]
+    fn register_pub_in_recopie_tel_quel() {
+        let code = registration_item(
+            "pub(in ::a::b)",
+            "Enregistre l'outil `add`.",
+            "register_add",
+            "__litemcp_server.tool_typed(\"add\", \"…\", schema, |__a| add(__a))",
+        );
+        assert!(code.contains("pub(in ::a::b) fn register_add("), "{code}");
     }
 }
