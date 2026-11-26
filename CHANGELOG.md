@@ -12,7 +12,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/) — versioning : SemVer
 
 ## [Unreleased]
 
-Tests, CI et dépôt, plus un changement interne sans rupture d'API.
+Corrections d'audit (transport HTTP, liaison RFC 9421, `Mcp-Param` entiers, gate de publication), leurs tests de régression et la documentation, plus un changement interne sans rupture d'API.
 
 ### Modifié
 
@@ -24,6 +24,8 @@ Tests, CI et dépôt, plus un changement interne sans rupture d'API.
 - **Exception loopback même-origine sous TLS** (`http/connection.rs`) : le préfixe d'`Origin` attendu dans l'exception loopback stricte suit désormais le schéma réel du listener (`http://` en clair, `https://` sous `.tls(…)`) au lieu d'un `http://` en dur — un navigateur même-origine sur `https://127.0.0.1:PORT` n'est plus rejeté en 403, et une `Origin: http://…` sur un listener TLS l'est (audit 2026-11-25, B2).
 - **Flux SSE sur `id` malformé** (`http/sse.rs`) : un `id` `null`, booléen ou tableau portant un `progressToken` reçoit le `400` du noyau (`-32600`) au lieu d'ouvrir un flux `200 OK` avant le verdict (audit 2026-11-25, B9).
 - **Gate de publication aligné sur la CI** (`release-tool`) : `verify` reflète désormais exactement le job `test` de `ci.yml` — clippy sans features par défaut, `cargo test --workspace` (configuration par défaut), chaque feature isolée en check **et** test (`macros`, `schemars`, `auth-sign`, `tls`), `cargo build --examples --all-features` (9 → 17 étapes). La parité est verrouillée par `tests/release_pipeline.rs`, qui exige la présence **exacte** de chaque commande des deux côtés (audit 2026-11-25, B6).
+- **Liaison `Mcp-Name` non-ASCII (RFC 9421 × SEP-2243)** (`auth/sign.rs`) : la sentinelle `=?base64?…?=` est décodée avant la comparaison au corps — une requête signée visant un outil, un prompt ou une URI non-ASCII n'échoue plus en 401 (`covered_set_not_allowed`) ; une sentinelle indécodable reste un refus ; la base de signature garde la valeur brute reçue. Le décodeur de la signature est aligné sur celui du transport (`server/dispatch.rs`), sentinelle pour sentinelle (audit 2026-11-25, B1).
+- **`Mcp-Param-*` entier au-delà de `i64::MAX`** (`server/dispatch.rs`) : un u64 compris entre `i64::MAX + 1` et `u64::MAX` est comparé exactement via `as_u64()` — `zod::uint().header(…)` publie « integer » sur toute la plage u64 mais l'en-tête était systématiquement refusée en `-32020` (audit 2026-11-25, B5).
 
 ### Corrigé (CI)
 

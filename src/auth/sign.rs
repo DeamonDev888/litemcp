@@ -25,7 +25,8 @@
 //! 1. en-têtes présents, uniques, non vides, `Mcp-Param-*` absent ;
 //! 2. composants et paramètres (`Signature-Input`), étiquette ;
 //! 3. `Content-Digest` comparé au corps reçu ;
-//! 4. cohérence `Mcp-Method`/`Mcp-Name` avec le corps ;
+//! 4. cohérence `Mcp-Method`/`Mcp-Name` avec le corps (sentinelle
+//!    `=?base64?…?=` de `Mcp-Name` décodée avant la comparaison) ;
 //! 5. fenêtre d'horloge ±60 s ;
 //! 6. nonce déjà vu ;
 //! 7. `keyid` → [`KeyStore`], statut ;
@@ -813,6 +814,12 @@ fn mcp_name_field(method: &str) -> Option<&'static str> {
 /// pour `resources/read`, `params.name` pour `tools/call` et `prompts/get`.
 /// Un `Mcp-Name` présent sur une méthode qui n'en admet pas est refusé.
 ///
+/// En profil moderne (SEP-2243), un nom non-ASCII voyage encodé en
+/// `=?base64?…?=` dans `Mcp-Name` : la liaison décode la sentinelle avant
+/// de comparer (une valeur non décodable est un refus). La base de
+/// signature, elle, porte la valeur **brute** reçue — la liaison n'altère
+/// jamais ce qui a été scellé.
+///
 /// Le motif est `covered_set_not_allowed` : la liste fermée de §2.7 n'a pas de
 /// motif dédié à une contradiction en-tête/corps, et un composant couvert qui
 /// ne décrit pas la requête ne peut pas être accepté.
@@ -839,11 +846,48 @@ fn check_mcp_binding(
             .and_then(|params| params.get(field))
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| AuthError::new("covered_set_not_allowed"))?;
-        if declared != name {
+        // SEP-2243 : la liaison compare la valeur **décodée** de la
+        // sentinelle, jamais la sentinelle brute.
+        let decoded = decode_mcp_name(name)?;
+        if declared != decoded {
             return Err(AuthError::new("covered_set_not_allowed"));
         }
     }
     Ok(())
+}
+
+/// Décode la sentinelle `=?base64?…?=` de `Mcp-Name` (SEP-2243).
+///
+/// Un nom d'outil/prompt ou une URI non-ASCII voyage encodée dans l'en-tête :
+/// c'est la valeur **décodée** qui désigne l'élément appelé. Hors sentinelle,
+/// la valeur est rendue telle quelle (OWS de bord compris) : un nom ASCII
+/// se compare directement, comme avant.
+///
+/// Une valeur non décodable (base64 invalide, octets non UTF-8) est un échec
+/// de liaison : le motif reste `covered_set_not_allowed`, comme toute
+/// contradiction en-tête/corps.
+///
+/// Même grammaire et même base64 standard que le décodeur du transport
+/// (`decode_mcp_header_value` dans `src/server/dispatch.rs`) : le profil de
+/// signature est auto-contenu — il possède déjà son décodeur base64 strict —
+/// et `dispatch` est un module privé du noyau, les deux décodeurs restent
+/// donc volontairement en phase, sentinelle pour sentinelle.
+fn decode_mcp_name(raw: &str) -> Result<String, AuthError> {
+    const SENTINELLE: &[u8] = b"=?base64?";
+    let raw_trimmed = raw.trim();
+    // La comparaison se fait sur les octets : un préfixe non-ASCII ne peut
+    // jamais y ressembler, et aucune frontière de caractère n'est coupée.
+    if raw_trimmed.len() >= 11
+        && raw_trimmed.as_bytes()[..9].eq_ignore_ascii_case(SENTINELLE)
+        && raw_trimmed.ends_with("?=")
+    {
+        let encoded = &raw_trimmed[9..raw_trimmed.len() - 2];
+        let bytes =
+            base64::decode(encoded).map_err(|_| AuthError::new("covered_set_not_allowed"))?;
+        String::from_utf8(bytes).map_err(|_| AuthError::new("covered_set_not_allowed"))
+    } else {
+        Ok(raw_trimmed.to_string())
+    }
 }
 
 /// Retire les OWS de bord d'une valeur d'en-tête (RFC 9110 §5.5).
@@ -1114,5 +1158,60 @@ mod tests {
             "Signature realm=\"litemcp\", tag=\"litemcp-auth-v1\""
         );
         assert_eq!(UNAUTHORIZED_STATUS, 401);
+    }
+}
+
+/// Liaison `Mcp-Name` ↔ corps avec sentinelle `=?base64?…?=` (audit
+/// 2026-11-25, B1) : le nom non-ASCII doit être décodé avant la comparaison,
+/// une valeur non décodable reste un refus de liaison.
+#[cfg(test)]
+mod tests_liaison_mcp_name_2026_11_25 {
+    use super::*;
+
+    const CORPS: &str =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"outil-café"}}"#;
+
+    #[test]
+    fn la_liaison_decode_la_sentinelle_base64_avant_comparaison() {
+        // base64 standard de « outil-café » : `b3V0aWwtY2Fmw6k=`.
+        assert!(
+            check_mcp_binding(
+                CORPS.as_bytes(),
+                "tools/call",
+                Some("=?base64?b3V0aWwtY2Fmw6k=?=")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn la_liaison_refuse_une_sentinelle_ne_correspondant_pas() {
+        // base64 de « echo » : la sentinelle décode vers un autre nom.
+        let erreur = check_mcp_binding(CORPS.as_bytes(), "tools/call", Some("=?base64?ZWNoby==?="))
+            .expect_err("la liaison doit échouer");
+        assert_eq!(erreur.reason(), "covered_set_not_allowed");
+    }
+
+    #[test]
+    fn la_liaison_refuse_une_sentinelle_indecodable() {
+        for brute in [
+            "=?base64?b3V0aWwtY2Fmw6?=", // longueur non multiple de 4
+            "=?base64?ZW!oby==?=",       // caractère hors alphabet
+            "=?base64?/w==?=",           // décode hors UTF-8
+        ] {
+            let erreur = check_mcp_binding(CORPS.as_bytes(), "tools/call", Some(brute))
+                .expect_err("une valeur non décodable est un échec de liaison");
+            assert_eq!(
+                erreur.reason(),
+                "covered_set_not_allowed",
+                "accepté : {brute}"
+            );
+        }
+    }
+
+    #[test]
+    fn la_liaison_compare_le_nom_brut_hors_sentinelle() {
+        assert!(check_mcp_binding(CORPS.as_bytes(), "tools/call", Some("outil-café")).is_ok());
+        assert!(check_mcp_binding(CORPS.as_bytes(), "tools/call", Some("echo")).is_err());
     }
 }

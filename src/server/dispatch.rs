@@ -819,7 +819,8 @@ impl ServerCore {
                                     let matched = match param_def.param_type {
                                         McpParamType::String => val.as_str() == Some(&decoded),
                                         McpParamType::Integer => {
-                                            if let Ok(parsed_int) = decoded.trim().parse::<i64>() {
+                                            let trimmed = decoded.trim();
+                                            if let Ok(parsed_int) = trimmed.parse::<i64>() {
                                                 if let Some(arg_i) = val.as_i64() {
                                                     arg_i == parsed_int
                                                 } else if let Some(arg_f) = val.as_f64() {
@@ -828,6 +829,16 @@ impl ServerCore {
                                                 } else {
                                                     false
                                                 }
+                                            } else if let Ok(parsed_uint) = trimmed.parse::<u64>() {
+                                                // `z.uint().header(…)` publie « integer »
+                                                // sur [0, u64::MAX] : un u64 au-delà de
+                                                // i64::MAX échoue à parse::<i64>() par
+                                                // dépassement positif — il est comparé
+                                                // exactement en u64. Tout autre échec
+                                                // (négatif, invalide, hors u64) échoue
+                                                // aussi au parse u64 : comportement
+                                                // inchangé pour i64 et flottants exacts.
+                                                val.as_u64() == Some(parsed_uint)
                                             } else {
                                                 false
                                             }
@@ -1355,5 +1366,95 @@ mod tests_codes_erreurs_2026_11_10 {
                 .contains("too many concurrent handlers in flight"),
             "{v}"
         );
+    }
+}
+
+/// Entiers `Mcp-Param-*` sur toute la plage u64 publiée par `z.uint()`
+/// (audit 2026-11-25, B5) : un u64 au-delà de `i64::MAX` doit matcher son
+/// en-tête ; i64 et flottants exacts gardent leur comportement.
+#[cfg(test)]
+mod tests_entier_u64_2026_11_25 {
+    use super::*;
+    use crate::protocol::{META_CLIENT_CAPABILITIES, META_PROTOCOL_VERSION, PROTOCOL_VERSION};
+    use crate::zod;
+
+    fn core_compteur() -> ServerCore {
+        ServerBuilder::new("audit-u64", "1.0.0")
+            .tool_typed(
+                "u64_tool",
+                "Unsigned counter promoted to header",
+                zod::object().field("count", zod::uint().header("count")),
+                |args| Ok(args.clone()),
+            )
+            .core()
+    }
+
+    /// Appel `tools/call` sur l'outil compteur : `count` dans le corps,
+    /// `valeur` dans l'en-tête `Mcp-Param-count`.
+    fn appel(core: &ServerCore, count: Value, valeur: &str) -> Value {
+        let corps = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "u64_tool",
+                "arguments": { "count": count },
+                "_meta": {
+                    META_PROTOCOL_VERSION: PROTOCOL_VERSION,
+                    META_CLIENT_CAPABILITIES: {}
+                }
+            }
+        })
+        .to_string();
+        let en_tetes = McpHeaders {
+            protocol_version: Some(PROTOCOL_VERSION.to_string()),
+            method: Some("tools/call".to_string()),
+            name: Some("u64_tool".to_string()),
+            params: vec![("count".to_string(), valeur.to_string())],
+        };
+        let reponse = core
+            .dispatch_request(corps.as_bytes(), Some(&en_tetes))
+            .expect("une requête avec id reçoit toujours une réponse");
+        serde_json::from_slice(&reponse.body).expect("corps JSON-RPC lisible")
+    }
+
+    #[test]
+    fn un_u64_au_dela_de_i64_max_matche_son_en_tete() {
+        let core = core_compteur();
+        let reponse = appel(&core, json!(9223372036854775808u64), "9223372036854775808");
+        assert!(reponse.get("error").is_none(), "doit réussir : {reponse}");
+        assert_eq!(
+            reponse["result"]["structuredContent"]["count"],
+            json!(9223372036854775808u64),
+            "le handler reçoit l'argument exact : {reponse}"
+        );
+    }
+
+    #[test]
+    fn u64_max_matche_son_en_tete() {
+        let core = core_compteur();
+        let reponse = appel(&core, json!(u64::MAX), "18446744073709551615");
+        assert!(reponse.get("error").is_none(), "doit réussir : {reponse}");
+    }
+
+    #[test]
+    fn un_u64_au_dela_de_i64_max_refuse_une_en_tete_divergente() {
+        let core = core_compteur();
+        for valeur in ["42", "9223372036854775809", "18446744073709551616"] {
+            let reponse = appel(&core, json!(9223372036854775808u64), valeur);
+            assert_eq!(
+                reponse["error"]["code"], -32020,
+                "en-tête {valeur} doit être refusée : {reponse}"
+            );
+        }
+    }
+
+    #[test]
+    fn i64_et_flottant_exact_restantent_inchanges() {
+        let core = core_compteur();
+        let reponse = appel(&core, json!(42), "42");
+        assert!(reponse.get("error").is_none(), "42 : {reponse}");
+        let reponse = appel(&core, json!(42.0), "42");
+        assert!(reponse.get("error").is_none(), "42.0 : {reponse}");
     }
 }
