@@ -202,6 +202,18 @@ pub fn announce_at_with(
     }
 }
 
+/// Lecture de l'empreinte de certificat **publiée par une annonce parsée** —
+/// le pendant lecture du champ `certificateFingerprint` écrit par
+/// [`announce_at_with`] : le format du fichier ne change pas, un lecteur
+/// tolérant (sweep anti-zombie, MCP Control) n'y voit qu'un champ de plus.
+/// `None` : champ absent (serveur clair, annonce d'une version antérieure)
+/// ou vide — aucune empreinte à épingler.
+pub(crate) fn announcement_certificate_fingerprint(doc: &serde_json::Value) -> Option<&str> {
+    doc.get("certificateFingerprint")
+        .and_then(serde_json::Value::as_str)
+        .filter(|valeur| !valeur.is_empty())
+}
+
 /// Identité d'instance — un `u64` non nul propre à CETTE instance liée :
 /// publiée dans l'annonce (`instance`) et servie par `/health` (en-tête
 /// `X-Instance-Id`) pour qu'une sonde puisse prouver quelle instance occupe

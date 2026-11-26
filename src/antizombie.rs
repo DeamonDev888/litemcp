@@ -11,7 +11,13 @@
 //!    (`instance`, servie par `/health` en en-tête `X-Instance-Id`) prouve
 //!    que l'annonceur ne possède plus le port (réutilisé par une autre
 //!    instance) — elle est retirée, décision re-vérifiée sous le verrou du
-//!    nom. En revanche, **un port sans réponse n'est pas une preuve de
+//!    nom. L'identité est prouvée sur le **canal annoncé** : une annonce qui
+//!    publie une empreinte de certificat (serveur `.tls(...)`) est sondée en
+//!    TLS 1.3 avec épinglage de cette empreinte (feature `tls`) — sans
+//!    l'empreinte publiée, ou sans la feature, une telle annonce reste dans
+//!    le doute (audit 2026-11-25, B4) : un binaire de sweep compilé sans
+//!    `tls` ne sait pas sonder un serveur TLS. En revanche, **un port sans
+//!    réponse n'est pas une preuve de
 //!    mort** — un serveur vivant peut refuser (saturé, pare-feu, bind sur
 //!    une autre interface que celle sondée) — et une identité invérifiable
 //!    non plus : dans le doute, l'annonce est **conservée** (`undecided`)
@@ -108,6 +114,11 @@ const ANNOUNCEMENT_MAX_BYTES: u64 = 64 * 1024;
 /// annonce se termine en millisecondes) — un `.tmp` récent peut être le
 /// fichier temporaire d'un écrivain concurrent **vivant** : il est respecté.
 pub const DEBRIS_AGE: Duration = Duration::from_secs(60);
+
+/// Plafond de lecture d'une **réponse de sonde** — les en-têtes d'une sonde
+/// de santé font quelques centaines d'octets ; un répondant bavard est
+/// coupé (borne partagée par la sonde claire et la sonde TLS).
+const PROBE_MAX_BYTES: usize = 4096;
 
 /// Bilan d'un **sweep** du registre d'annonce — les compteurs sont
 /// disjoints : chaque fichier du dossier tombe dans exactement une case
@@ -576,12 +587,18 @@ pub fn sweep_dir(dir: &Path) -> SweepReport {
             report.undecided += 1;
             continue;
         };
+        // Empreinte de certificat **annoncée** — pendant lecture du champ
+        // `certificateFingerprint` écrit par `announce_at_with` : elle fait
+        // passer la sonde du clair au TLS épinglé (audit 2026-11-25, B4).
+        // Sans elle, l'annonce d'un serveur `.tls(...)` resterait à jamais
+        // indécise — et son usurpation jamais prouvée.
+        let empreinte = crate::registry::announcement_certificate_fingerprint(&doc);
         if probe_spent >= SWEEP_BUDGET {
             report.skipped += 1;
             continue;
         }
         let probe_started = Instant::now();
-        let verdict = probe_identity(probe_addr, expected);
+        let verdict = probe_identity(probe_addr, expected, empreinte);
         probe_spent += probe_started.elapsed();
         match verdict {
             Identity::Verified => {
@@ -689,7 +706,33 @@ enum Identity {
 /// page d'erreur ne prouve rien. Un échec de connexion, un statut non 2xx,
 /// des en-têtes incomplets ou un dépassement de [`PROBE_TIMEOUT`] rendent
 /// `Unproven` : ce n'est pas une preuve de mort.
-fn probe_identity(addr: SocketAddr, expected: u64) -> Identity {
+///
+/// Une annonce qui publie une **empreinte de certificat** (serveur
+/// `.tls(...)`) est sondée **exclusivement** en TLS 1.3 avec épinglage de
+/// cette empreinte (module `pinned_probe`, feature `tls`) : l'identité ne
+/// vaut qu'au travers du canal dont le certificat est celui annoncé — aucun
+/// repli vers la sonde claire, un échec d'épinglage (autre certificat servi)
+/// reste un doute. Sans la feature `tls` : comportement inchangé, sonde en
+/// clair — un binaire de sweep compilé sans `tls` ne sait pas sonder un
+/// serveur TLS : une annonce à empreinte y reste `Unproven` (conservée,
+/// jamais déclarée vivante ni usurpée) ; compiler le sweep avec la feature
+/// `tls` pour les sonder.
+fn probe_identity(addr: SocketAddr, expected: u64, empreinte: Option<&str>) -> Identity {
+    #[cfg(feature = "tls")]
+    {
+        if let Some(empreinte) = empreinte {
+            return pinned_probe::probe(addr, expected, empreinte);
+        }
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        // Limite assumée (voir la documentation ci-dessus) : sans la feature
+        // `tls`, ce binaire ne sait pas ouvrir de session TLS — l'empreinte
+        // annoncée est ignorée et la sonde reste en clair ; face à un vrai
+        // serveur TLS, une réponse claire est illisible : `Unproven`
+        // (l'annonce est conservée, jamais déclarée vivante ni usurpée).
+        let _ = empreinte;
+    }
     let mut stream = match TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) {
         Ok(stream) => stream,
         Err(_) => return Identity::Unproven, // refus ou timeout : pas une preuve
@@ -701,12 +744,21 @@ fn probe_identity(addr: SocketAddr, expected: u64) -> Identity {
         return Identity::Unproven;
     }
     // En-têtes d'une sonde de santé : quelques centaines d'octets — la
-    // lecture est bornée (cap + timeout) pour qu'un répondant bavard ne
+    // lecture est bornée (plafond + timeout) pour qu'un répondant bavard ne
     // retienne pas le sweep.
-    let mut head = [0u8; 4096];
+    let mut head = [0u8; PROBE_MAX_BYTES];
+    let read = read_bounded_response(&mut stream, &mut head);
+    identity_of_response(&head[..read], expected)
+}
+
+/// Lecture **bornée** d'une réponse de sonde — plafond [`PROBE_MAX_BYTES`]
+/// et timeout déjà posé sur le socket sous-jacent : ce qui a été reçu avant
+/// une fermeture, une erreur ou le plafond suffit, un répondant bavard ne
+/// retient pas le sweep. Partagée par la sonde claire et la sonde TLS.
+fn read_bounded_response(flux: &mut impl std::io::Read, head: &mut [u8; PROBE_MAX_BYTES]) -> usize {
     let mut read = 0usize;
     loop {
-        match stream.read(&mut head[read..]) {
+        match flux.read(&mut head[read..]) {
             Ok(0) => break,
             Ok(n) => {
                 read += n;
@@ -717,14 +769,20 @@ fn probe_identity(addr: SocketAddr, expected: u64) -> Identity {
             Err(_) => break, // timeout : ce qui a été lu suffit (ou rien)
         }
     }
-    let Ok(text) = std::str::from_utf8(&head[..read]) else {
+    read
+}
+
+/// Verdict porté par une **réponse HTTP déjà lue** — le seul code qui
+/// interprète une réponse `/health`, partagé par la sonde claire et la sonde
+/// TLS : statut 2xx, en-tête `X-Instance-Id` dans le **bloc d'en-têtes**,
+/// comparaison à l'identité attendue. Une identité dans le corps d'une page
+/// d'erreur ne prouve rien ; un statut non 2xx n'est pas la sonde `/health`
+/// de LiteMCP ; des en-têtes tronqués, une réponse non UTF-8 ou une identité
+/// illisible sont un doute : `Unproven`, l'annonce est conservée.
+fn identity_of_response(response: &[u8], expected: u64) -> Identity {
+    let Ok(text) = std::str::from_utf8(response) else {
         return Identity::Unproven;
     };
-    // Une identité ne vaut que dans le **bloc d'en-têtes** d'une réponse HTTP
-    // réussie : une chaîne `x-instance-id:` dans le corps (page d'erreur,
-    // JSON d'un autre service sur un port réutilisé) ne prouve rien — le
-    // doute conserve l'annonce. Un statut non 2xx n'est pas la sonde
-    // `/health` de LiteMCP.
     let Some((status_line, headers_and_body)) = text.split_once('\n') else {
         return Identity::Unproven;
     };
@@ -759,6 +817,170 @@ fn probe_identity(addr: SocketAddr, expected: u64) -> Identity {
         }
     }
     Identity::Unproven
+}
+
+/// Sonde d'identité **TLS épinglée** (feature `tls`) — audit 2026-11-25 B4 :
+/// une annonce qui publie une empreinte de certificat décrit un serveur
+/// `.tls(...)` ; la sonder en clair ne prouve rien (un serveur TLS répond du
+/// bruit à du texte HTTP). La connexion est ouverte via `rustls` avec un
+/// vérificateur maison qui n'accepte que le certificat terminal dont le
+/// SHA-256 correspond à l'empreinte **annoncée** — l'annonce est l'autorité,
+/// aucune racine n'est consultée — tandis que les signatures de handshake
+/// restent vérifiées normalement ([`rustls::crypto::verify_tls13_signature`])
+/// : l'épinglage remplace la confiance en une autorité, pas la
+/// cryptographie de la session. Tout échec (connexion, handshake,
+/// épinglage, empreinte malformée) est un doute — [`Identity::Unproven`] —
+/// jamais un repli vers la sonde claire.
+#[cfg(feature = "tls")]
+mod pinned_probe {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::{
+        WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
+    };
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+    use std::io::Write as _;
+    use std::net::{SocketAddr, TcpStream};
+    use std::sync::Arc;
+
+    use super::{
+        Identity, PROBE_MAX_BYTES, PROBE_TIMEOUT, identity_of_response, read_bounded_response,
+    };
+
+    /// Vérificateur de certificat serveur par **épinglage d'empreinte** :
+    /// n'accepte que le certificat terminal dont le SHA-256 est celui
+    /// annoncé. L'épinglage est le pendant client de `auth::PinnedServer`,
+    /// réutilisé tel quel (forme canonique validée, comparaison en temps
+    /// constant) ; les signatures de handshake sont déléguées aux
+    /// algorithmes du fournisseur `ring` configuré.
+    pub(super) struct FingerprintVerifier {
+        pinned: crate::auth::PinnedServer,
+        algorithms: WebPkiSupportedAlgorithms,
+    }
+
+    // `WebPkiSupportedAlgorithms` n'a pas de `Debug` chez rustls : le bilan
+    // ne montre que l'empreinte épinglée, jamais d'état interne.
+    impl std::fmt::Debug for FingerprintVerifier {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FingerprintVerifier")
+                .field("pinned", &self.pinned)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl FingerprintVerifier {
+        /// Vérificateur pour les tests unitaires de l'épinglage (empreinte
+        /// attendue + algorithmes du fournisseur `ring` par défaut).
+        #[cfg(test)]
+        pub(super) fn for_tests(pinned: &crate::auth::PinnedServer) -> Self {
+            Self {
+                pinned: pinned.clone(),
+                algorithms: rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms,
+            }
+        }
+    }
+
+    impl ServerCertVerifier for FingerprintVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            // L'identité est l'empreinte annoncée : ni nom, ni autorité, ni
+            // intermédiaires, ni fraîcheur — un certificat éphémère reste
+            // prouvable tant que le DER servi est celui publié (la fraîcheur
+            // du certificat est la responsabilité de l'annonceur, pas du
+            // sweep).
+            let observed = crate::tls::CertificateFingerprint::of_der(end_entity.as_ref());
+            if self.pinned.matches(&observed.to_hex()) {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer,
+                ))
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            // Inatteignable en pratique (TLS 1.3 seul configuré) ; la
+            // vérification reste correcte si 1.2 était un jour accepté.
+            verify_tls12_signature(message, cert, dss, &self.algorithms)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            // Les signatures de handshake restent vérifiées normalement :
+            // l'épinglage ne court-circuite pas la cryptographie.
+            verify_tls13_signature(message, cert, dss, &self.algorithms)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.algorithms.supported_schemes()
+        }
+    }
+
+    /// Sonde `GET /health` **sur TLS épinglé** — même contrat que la sonde
+    /// claire : requête identique, lecture bornée identique, interprétation
+    /// de la réponse partagée. Le handshake se joue au premier write/read :
+    /// un refus d'épinglage y sort en erreur — un doute, jamais une preuve.
+    pub(super) fn probe(addr: SocketAddr, expected: u64, empreinte: &str) -> Identity {
+        // Empreinte malformée : rien n'est épinglable, rien n'est prouvable
+        // — doute immédiat, sans connexion (surtout jamais de repli en
+        // clair).
+        let Ok(pinned) = crate::auth::PinnedServer::new(empreinte) else {
+            return Identity::Unproven;
+        };
+        let stream = match TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) {
+            Ok(stream) => stream,
+            Err(_) => return Identity::Unproven, // refus ou timeout : pas une preuve
+        };
+        let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(PROBE_TIMEOUT));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(FingerprintVerifier {
+            pinned,
+            algorithms: provider.signature_verification_algorithms,
+        });
+        let config = match rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+        {
+            Ok(builder) => builder
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth(),
+            Err(_) => return Identity::Unproven,
+        };
+        // SNI « localhost » : le nom n'est PAS l'identité ici — le
+        // vérificateur ignore `server_name` (l'empreinte est l'identité) et
+        // le serveur LiteMCP sert son certificat quel que soit le SNI.
+        let Ok(name) = ServerName::try_from("localhost") else {
+            return Identity::Unproven;
+        };
+        let mut flux = match rustls::ClientConnection::new(Arc::new(config), name) {
+            Ok(connexion) => rustls::StreamOwned::new(connexion, stream),
+            Err(_) => return Identity::Unproven,
+        };
+        let request = format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        if flux.write_all(request.as_bytes()).is_err() {
+            return Identity::Unproven;
+        }
+        let mut head = [0u8; PROBE_MAX_BYTES];
+        let read = read_bounded_response(&mut flux, &mut head);
+        identity_of_response(&head[..read], expected)
+    }
 }
 
 /// Compte honnêtement le retrait d'un débris : `corrupt` seulement si le
@@ -998,14 +1220,14 @@ mod tests {
         let responder = health_responder(0xA1B2_C3D4_5E6F_7081);
         assert!(
             matches!(
-                probe_identity(responder, 0xA1B2_C3D4_5E6F_7081),
+                probe_identity(responder, 0xA1B2_C3D4_5E6F_7081, None),
                 Identity::Verified
             ),
             "l'identité qui répond est celle attendue"
         );
         assert!(
             matches!(
-                probe_identity(responder, 0x0102_0304_0506_0708),
+                probe_identity(responder, 0x0102_0304_0506_0708, None),
                 Identity::Usurped
             ),
             "une identité différente prouve l'usurpation du port"
@@ -1036,7 +1258,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nx-instance-id: 0000000000000002\n",
         );
         assert!(
-            matches!(probe_identity(body_only, 1), Identity::Unproven),
+            matches!(probe_identity(body_only, 1, None), Identity::Unproven),
             "une identité dans le corps n'est pas un en-tête : aucune preuve d'usurpation"
         );
 
@@ -1046,7 +1268,7 @@ mod tests {
             b"HTTP/1.1 404 Not Found\r\nX-Instance-Id: 0000000000000002\r\nConnection: close\r\n\r\n",
         );
         assert!(
-            matches!(probe_identity(error_status, 1), Identity::Unproven),
+            matches!(probe_identity(error_status, 1, None), Identity::Unproven),
             "un statut non 2xx ne prouve rien — le doute conserve l'annonce"
         );
 
@@ -1055,7 +1277,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nX-Instance-Id: 0000000000000002\r\nConnection: close\r\n\r\nok",
         );
         assert!(
-            matches!(probe_identity(ok_other, 1), Identity::Usurped),
+            matches!(probe_identity(ok_other, 1, None), Identity::Usurped),
             "200 + identité différente = usurpation prouvée"
         );
     }
@@ -1070,7 +1292,7 @@ mod tests {
             let _ = listener.accept(); // ne répond jamais
         });
         assert!(
-            matches!(probe_identity(addr, 42), Identity::Unproven),
+            matches!(probe_identity(addr, 42, None), Identity::Unproven),
             "réponse absente = doute"
         );
         // Port sans aucun auditeur : refus = doute aussi (un vivant saturé
@@ -1079,9 +1301,115 @@ mod tests {
         let free_addr = free.local_addr().unwrap();
         drop(free);
         assert!(
-            matches!(probe_identity(free_addr, 42), Identity::Unproven),
+            matches!(probe_identity(free_addr, 42, None), Identity::Unproven),
             "un refus TCP n'est pas une preuve de mort"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Audit 2026-11-25, B4 : parseur partagé et sonde TLS épinglée
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn le_parseur_partage_ne_prouve_que_2xx_et_en_tete() {
+        // Le même parseur sert la sonde claire et la sonde TLS : 200 +
+        // en-tête prouvent (identité attendue ou usurpée), tout le reste —
+        // identité dans le corps, statut d'erreur, en-têtes tronqués,
+        // réponse non UTF-8 — est un doute.
+        let ok = b"HTTP/1.1 200 OK\r\nX-Instance-Id: 00000000000000ff\r\n\r\nok";
+        assert!(
+            matches!(identity_of_response(ok, 0xff), Identity::Verified),
+            "200 + en-tête exact : vivante"
+        );
+        assert!(
+            matches!(identity_of_response(ok, 1), Identity::Usurped),
+            "200 + en-tête d'une autre identité : usurpation"
+        );
+        let body_only = b"HTTP/1.1 200 OK\r\n\r\nx-instance-id: 00000000000000ff\n";
+        assert!(matches!(
+            identity_of_response(body_only, 0xff),
+            Identity::Unproven
+        ));
+        let erreur = b"HTTP/1.1 404 Not Found\r\nX-Instance-Id: 00000000000000ff\r\n\r\n";
+        assert!(matches!(
+            identity_of_response(erreur, 0xff),
+            Identity::Unproven
+        ));
+        let tronquee = b"HTTP/1.1 200 OK\r\nX-Instance-Id: 00000000000000ff\r\n";
+        assert!(matches!(
+            identity_of_response(tronquee, 0xff),
+            Identity::Unproven
+        ));
+        assert!(matches!(
+            identity_of_response(&[0xff, 0xfe, 0x48, 0x54], 1),
+            Identity::Unproven
+        ));
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn le_verificateur_epingle_exactement_le_certificat_annonce() {
+        use rustls::client::danger::ServerCertVerifier as _;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        // Deux DER quelconques : la décision d'épinglage ne dépend que du
+        // SHA-256 du certificat terminal — nom, intermédiaires, OCSP et date
+        // sont ignorés (l'annonce est l'autorité).
+        let announced = crate::tls::CertificateFingerprint::of_der(b"cert-a");
+        let pinned = crate::auth::PinnedServer::new(&announced.to_hex()).expect("empreinte");
+        let verifier = pinned_probe::FingerprintVerifier::for_tests(&pinned);
+        let name = ServerName::try_from("autre.example").expect("nom de test");
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_700_000_000));
+        let accepte = verifier.verify_server_cert(
+            &CertificateDer::from(b"cert-a".to_vec()),
+            &[CertificateDer::from(b"intermediaire".to_vec())],
+            &name,
+            b"ocsp quelconque",
+            now,
+        );
+        assert!(
+            accepte.is_ok(),
+            "le certificat servi porte l'empreinte annoncée : accepté"
+        );
+        let refuse = verifier.verify_server_cert(
+            &CertificateDer::from(b"cert-b".to_vec()),
+            &[],
+            &name,
+            b"",
+            now,
+        );
+        assert!(
+            refuse.is_err(),
+            "un autre certificat n'est jamais accepté : {refuse:?}"
+        );
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn une_sonde_tls_face_a_un_repondeur_clair_est_un_doute() {
+        // Un répondant **en clair** qui sert la bonne identité sur un port
+        // annoncé TLS ne prouve rien : la sonde ouvre TLS (échec face à un
+        // répondeur HTTP nu) et reste dans le doute — surtout pas de repli
+        // vers la sonde claire, qui verrait un faux vivant.
+        let responder = health_responder(0x1234_5678_9ABC_DEF0);
+        let announced = crate::tls::CertificateFingerprint::of_der(b"cert-a");
+        assert!(matches!(
+            probe_identity(responder, 0x1234_5678_9ABC_DEF0, Some(&announced.to_hex())),
+            Identity::Unproven
+        ));
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn une_empreinte_malformee_est_un_doute_sans_sonde_claire() {
+        // Empreinte illisible : rien n'est épinglable, aucun TLS ne part —
+        // et la sonde ne replie JAMAIS en clair (le répondeur sert la bonne
+        // identité : un repli ferait de ce doute un faux Verified).
+        let responder = health_responder(0x0102_0304_0506_0708);
+        assert!(matches!(
+            probe_identity(responder, 0x0102_0304_0506_0708, Some("pas-une-empreinte")),
+            Identity::Unproven
+        ));
     }
 
     #[test]
