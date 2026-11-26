@@ -400,16 +400,39 @@ fn macros_requirement(manifest: &str) -> Option<String> {
     after_key.split('"').nth(1).map(str::to_string)
 }
 
+/// Présence EXACTE d'une commande d'étape : ligne `run: <commande>` dans un
+/// workflow, ou littérale `command: "<commande>",` dans la source du gate
+/// (`release-tool/src/lib.rs`). Un `contains` nu ne suffit pas :
+/// `cargo test --workspace` est un préfixe de
+/// `cargo test --workspace --all-features` — l'assertion resterait verte si
+/// l'étape exacte disparaissait d'un des deux côtés.
+fn has_exact_step(text: &str, command: &str) -> bool {
+    let ci_form = format!("run: {command}");
+    let gate_form = format!("command: \"{command}\",");
+    text.lines().any(|line| {
+        let line = line.trim();
+        line == ci_form || line == gate_form
+    })
+}
+
 #[test]
 fn feature_matrix_is_enforced_in_ci_and_release_gate() {
     // `--all-features` ne prouve rien des configurations servies aux
-    // utilisateurs : le noyau sans features par défaut et chaque feature
-    // isolée sont des surfaces publiques. Les mêmes commandes doivent tourner
-    // en CI (retour rapide) et dans le gate de release (avant publication).
-    const COMMANDS: [&str; 3] = [
+    // utilisateurs : la configuration par défaut (`default = ["macros"]`),
+    // le noyau sans features par défaut et chaque feature isolée sont des
+    // surfaces publiques — une feature isolée est testée, pas seulement
+    // compilée, et les exemples (porte d'entrée du README) doivent compiler
+    // dans la configuration la plus large. Les mêmes commandes doivent
+    // tourner en CI (retour rapide) et dans le gate de release (avant
+    // publication) : le gate ne peut pas être plus laxiste que la CI.
+    const COMMANDS: [&str; 7] = [
+        "cargo test --workspace",
         "cargo test --workspace --no-default-features",
         "cargo check -p litemcp --no-default-features --features macros",
+        "cargo test -p litemcp --no-default-features --features macros",
         "cargo check -p litemcp --no-default-features --features schemars",
+        "cargo test -p litemcp --no-default-features --features schemars",
+        "cargo build --examples --all-features",
     ];
 
     let Some(ci) = workflow("ci.yml") else {
@@ -417,8 +440,8 @@ fn feature_matrix_is_enforced_in_ci_and_release_gate() {
     };
     for command in COMMANDS {
         assert!(
-            ci.contains(command),
-            "ci.yml : la matrice de features doit exécuter `{command}`"
+            has_exact_step(&ci, command),
+            "ci.yml : le job `test` doit exécuter `{command}`"
         );
     }
 
@@ -433,23 +456,27 @@ fn feature_matrix_is_enforced_in_ci_and_release_gate() {
     };
     for command in COMMANDS {
         assert!(
-            release.contains(command),
-            "release-tool (verify) : la matrice de features doit exécuter `{command}`"
+            has_exact_step(&release, command),
+            "release-tool (verify) : le gate doit exécuter `{command}`"
         );
     }
 }
 
 #[test]
-fn auth_feature_matrix_is_enforced_in_ci() {
+fn auth_feature_matrix_is_enforced_in_ci_and_release_gate() {
     // Le chantier d'authentification ajoute deux features qui ne compilent pas
     // dans le noyau : `auth-sign` (ed25519-dalek) et `tls` (rustls + rcgen).
     // `--all-features` ne prouve rien d'elles isolément : une cible de test
     // cassée sous l'une ou l'autre passait la CI. Le clippy sans feature par
-    // défaut couvre la configuration minimale servie aux utilisateurs.
-    const COMMANDS: [&str; 3] = [
-        "cargo test -p litemcp --no-default-features --features auth-sign",
-        "cargo test -p litemcp --no-default-features --features tls",
+    // défaut couvre la configuration minimale servie aux utilisateurs. La CI
+    // et le gate de release exécutent les mêmes commandes : le gate ne peut
+    // pas être plus laxiste que la CI.
+    const COMMANDS: [&str; 5] = [
         "cargo clippy --workspace --all-targets --no-default-features -- -D warnings",
+        "cargo check -p litemcp --no-default-features --features auth-sign",
+        "cargo test -p litemcp --no-default-features --features auth-sign",
+        "cargo check -p litemcp --no-default-features --features tls",
+        "cargo test -p litemcp --no-default-features --features tls",
     ];
 
     let Some(ci) = workflow("ci.yml") else {
@@ -457,8 +484,24 @@ fn auth_feature_matrix_is_enforced_in_ci() {
     };
     for command in COMMANDS {
         assert!(
-            ci.contains(command),
-            "ci.yml : la matrice de features doit exécuter `{command}`"
+            has_exact_step(&ci, command),
+            "ci.yml : le job `test` doit exécuter `{command}`"
+        );
+    }
+
+    // Même garde-fou côté gate : `release-tool/` est un membre du workspace,
+    // pas une dépendance du paquet publié — absent d'une crate empaquetée,
+    // l'assertion est sans objet.
+    let Ok(release) =
+        std::fs::read_to_string(workspace().join("release-tool").join("src").join("lib.rs"))
+    else {
+        eprintln!("release-tool absent (paquet crates.io) — assertion ignorée");
+        return;
+    };
+    for command in COMMANDS {
+        assert!(
+            has_exact_step(&release, command),
+            "release-tool (verify) : le gate doit exécuter `{command}`"
         );
     }
 }

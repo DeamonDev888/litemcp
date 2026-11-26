@@ -23,6 +23,7 @@ Tests, CI et dépôt, plus un changement interne sans rupture d'API.
 
 - **Exception loopback même-origine sous TLS** (`http/connection.rs`) : le préfixe d'`Origin` attendu dans l'exception loopback stricte suit désormais le schéma réel du listener (`http://` en clair, `https://` sous `.tls(…)`) au lieu d'un `http://` en dur — un navigateur même-origine sur `https://127.0.0.1:PORT` n'est plus rejeté en 403, et une `Origin: http://…` sur un listener TLS l'est (audit 2026-11-25, B2).
 - **Flux SSE sur `id` malformé** (`http/sse.rs`) : un `id` `null`, booléen ou tableau portant un `progressToken` reçoit le `400` du noyau (`-32600`) au lieu d'ouvrir un flux `200 OK` avant le verdict (audit 2026-11-25, B9).
+- **Gate de publication aligné sur la CI** (`release-tool`) : `verify` reflète désormais exactement le job `test` de `ci.yml` — clippy sans features par défaut, `cargo test --workspace` (configuration par défaut), chaque feature isolée en check **et** test (`macros`, `schemars`, `auth-sign`, `tls`), `cargo build --examples --all-features` (9 → 17 étapes). La parité est verrouillée par `tests/release_pipeline.rs`, qui exige la présence **exacte** de chaque commande des deux côtés (audit 2026-11-25, B6).
 
 ### Corrigé (CI)
 

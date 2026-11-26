@@ -14,10 +14,11 @@
 //!              ligne de sortie : `version=<x.y.z>` (les workflows la
 //!              capturent dans `$GITHUB_OUTPUT`) ;
 //!   verify   — gate qualité : simulations du pipeline (les tests de cette
-//!              crate), fmt, clippy `-D warnings`, tests all-features ET
-//!              sans features par défaut, chaque feature isolée, doc rustdoc
-//!              STRICTE, contenu des deux paquets — chaque étape
-//!              court-circuite tout le pipeline ;
+//!              crate), fmt, clippy `-D warnings` (all-features ET sans
+//!              features par défaut), tests all-features, configuration par
+//!              défaut ET sans features par défaut, chaque feature isolée
+//!              (check + test), exemples, doc rustdoc STRICTE, contenu des
+//!              deux paquets — chaque étape court-circuite tout le pipeline ;
 //!   publish  — publication crates.io IDEMPOTENTE : `litemcp-macros` d'abord
 //!              puis `litemcp`, avec distinction stricte entre « déjà
 //!              indexée » (crates.io le confirme) et toute autre erreur
@@ -288,7 +289,11 @@ pub struct Gate {
 
 const SANS_ENV: &[(&str, &str)] = &[];
 
-/// Les étapes du gate `verify`, dans l'ordre de l'ancien script. Les mêmes
+/// Les étapes du gate `verify` : les simulations d'abord (rapides, sans
+/// réseau), puis exactement les étapes du job `test` de la CI dans son ordre
+/// — fmt, clippy all-features puis sans features par défaut, tests
+/// all-features, configuration par défaut puis sans features par défaut,
+/// chaque feature isolée (check puis test), exemples, doc. Les mêmes
 /// commandes que la CI (invariant : le gate de release ne peut pas être plus
 /// laxiste que la CI) — `tests/release_pipeline.rs` fige l'égalité.
 pub const GATES: &[Gate] = &[
@@ -303,13 +308,23 @@ pub const GATES: &[Gate] = &[
         env: SANS_ENV,
     },
     Gate {
-        name: "cargo clippy (-D warnings)",
+        name: "cargo clippy (all-features, -D warnings)",
         command: "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+        env: SANS_ENV,
+    },
+    Gate {
+        name: "cargo clippy (sans features par defaut, -D warnings)",
+        command: "cargo clippy --workspace --all-targets --no-default-features -- -D warnings",
         env: SANS_ENV,
     },
     Gate {
         name: "cargo test (all-features)",
         command: "cargo test --workspace --all-features",
+        env: SANS_ENV,
+    },
+    Gate {
+        name: "cargo test (configuration par defaut)",
+        command: "cargo test --workspace",
         env: SANS_ENV,
     },
     Gate {
@@ -323,8 +338,43 @@ pub const GATES: &[Gate] = &[
         env: SANS_ENV,
     },
     Gate {
+        name: "cargo test (feature macros isolee)",
+        command: "cargo test -p litemcp --no-default-features --features macros",
+        env: SANS_ENV,
+    },
+    Gate {
         name: "cargo check (feature schemars isolee)",
         command: "cargo check -p litemcp --no-default-features --features schemars",
+        env: SANS_ENV,
+    },
+    Gate {
+        name: "cargo test (feature schemars isolee)",
+        command: "cargo test -p litemcp --no-default-features --features schemars",
+        env: SANS_ENV,
+    },
+    Gate {
+        name: "cargo check (feature auth-sign isolee)",
+        command: "cargo check -p litemcp --no-default-features --features auth-sign",
+        env: SANS_ENV,
+    },
+    Gate {
+        name: "cargo test (feature auth-sign isolee)",
+        command: "cargo test -p litemcp --no-default-features --features auth-sign",
+        env: SANS_ENV,
+    },
+    Gate {
+        name: "cargo check (feature tls isolee)",
+        command: "cargo check -p litemcp --no-default-features --features tls",
+        env: SANS_ENV,
+    },
+    Gate {
+        name: "cargo test (feature tls isolee)",
+        command: "cargo test -p litemcp --no-default-features --features tls",
+        env: SANS_ENV,
+    },
+    Gate {
+        name: "cargo build (examples, toutes features)",
+        command: "cargo build --examples --all-features",
         env: SANS_ENV,
     },
     Gate {

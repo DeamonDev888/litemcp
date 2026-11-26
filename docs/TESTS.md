@@ -20,22 +20,29 @@ tests `#[cfg(unix)]` du registre et du budget d'écriture).
 
 ## Matrice complète
 
-Commandes rejouées telles quelles en local (ce sont celles de la CI et du
-gate `verify` de `release-tool`) :
+Commandes rejouées telles quelles en local, dans l'ordre du gate `verify` de
+`release-tool` (simulations du pipeline en tête, puis les étapes du job
+`test` de la CI) ; `cargo tree` et le check MSRV en fin de liste restent des
+compléments d'inspection (le check MSRV est le job `msrv` de la CI) :
 
 ```bash
+cargo test -p release-tool   # simulations du pipeline (1re étape du gate verify)
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy --workspace --all-targets --no-default-features -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 cargo test --workspace --all-features
 cargo test --workspace
 cargo test --workspace --no-default-features
+cargo check -p litemcp --no-default-features --features macros
 cargo test -p litemcp --no-default-features --features macros
+cargo check -p litemcp --no-default-features --features schemars
 cargo test -p litemcp --no-default-features --features schemars
+cargo check -p litemcp --no-default-features --features auth-sign
 cargo test -p litemcp --no-default-features --features auth-sign
+cargo check -p litemcp --no-default-features --features tls
 cargo test -p litemcp --no-default-features --features tls
 cargo build --examples --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 cargo tree -p litemcp --no-default-features -e normal --depth 1   # 3 dépendances directes : serde, serde_json, getrandom
 cargo +1.85 check --workspace --all-targets --all-features        # MSRV déclarée
 ```
