@@ -26,9 +26,10 @@ et de la confirmation (§5). Ce profil **n'est pas** le flux OAuth de MCP 2026-0
 | `Signature-Input`, `Signature` | RFC 9421 §4.1/§4.2 | **exactement un membre** chacun, même label |
 
 Non couverts, sans effet sur l'exécution : `Accept`, `User-Agent`, `Date`, `Origin`, `X-Forwarded-For`, `Expect`, `MCP-Protocol-Version`
-(contredit par `_meta.protocolVersion` du corps couvert). `Mcp-Param-*` : **refusé en 401** dès que l'authentification est
-active — inutilisé aujourd'hui (`ToolDef::mcp_params` : `#[allow(dead_code)]`) mais réservé : on refuse plutôt que de
-signer à moitié.
+(contredit par `_meta.protocolVersion` du corps couvert). `Mcp-Param-*` : câblé côté transport — un outil déclare ses
+paramètres d'en-tête avec `.header(…)` (`x-mcp-header`, SEP-2243) et le dispatch refuse toute incohérence
+argument/en-tête en `-32020`/`400` ; le profil de signature, lui, **refuse en 401** tout `Mcp-Param-*`
+(`mcp_param_present`) : non couvert par la signature, on refuse plutôt que de signer à moitié.
 
 ### 2.2 Composants couverts
 

@@ -723,7 +723,7 @@ impl ServerBuilder {
     /// # Panics
     ///
     /// Si `name` est vide ou contient autre chose que de l'ASCII (hors
-    /// espaces et `:`) — même contrat que les `x-mcp-header` de [`zod`].
+    /// espaces et `:`) — même contrat que les `x-mcp-header` de [`crate::zod`].
     ///
     /// # Exemple
     ///
@@ -1333,7 +1333,6 @@ impl ServerBuilder {
         self.tools.insert(name.to_string(), def);
         self
     }
-    ///
     /// Le schéma dérive l'`inputSchema` de `tools/list` **et** valide chaque
     /// appel : un `tools/call` hors schéma reçoit `-32602` avec la liste des
     /// problèmes dans `error.data.issues` et n'exécute jamais le handler.
@@ -1559,14 +1558,23 @@ impl ServerBuilder {
     ///
     /// # Transport HTTP
     ///
-    /// Le transport HTTP intégré n'est pas encore branché sur
-    /// [`ServerCore::authenticate`] (il n'y a pas encore de
-    /// `AuthenticatedRequest` à lui donner) : un serveur **bindé** avec un
-    /// vérificateur refuse donc toute requête HTTP en `403` / `-32023` /
-    /// `unauthenticated` — échec fermé, jamais un passage silencieux. Les
-    /// hôtes qui possèdent leur propre socket passent par
-    /// [`ServerCore::authenticate`] puis
-    /// [`ServerCore::dispatch_authenticated`].
+    /// Le transport HTTP intégré est branché sur
+    /// [`ServerCore::authenticate`] : sur la route MCP, après tous les
+    /// contrôles de transport (cadrage, `Host`, `Origin`, méthode), il
+    /// construit la [`auth::VerifiedRequest`] — méthode, chemin, autorité
+    /// `Host`, en-têtes bruts retenus pour l'occasion, corps — et appelle
+    /// le vérificateur. Un refus reçoit `401 Unauthorized` avec l'en-tête
+    /// [`auth::WWW_AUTHENTICATE`] et un corps **constant** : le motif
+    /// précis ne sort jamais sur le réseau, il ne part que vers le journal
+    /// applicatif ([`Self::on_auth_decision`]). Un succès établit la
+    /// [`auth::AuthContext`] et le dispatch est fait avec
+    /// ([`ServerCore::dispatch_authenticated`], variante SSE comprise) :
+    /// droits, listes filtrées et confirmation s'appliquent. Sans
+    /// vérificateur, ce chemin n'existe pas et le dispatch historique est
+    /// servi tel quel. Les hôtes qui possèdent leur propre socket passent
+    /// par [`ServerCore::authenticate`] puis
+    /// [`ServerCore::dispatch_authenticated`] — ou, en un seul appel, par
+    /// [`ServerCore::dispatch_verified`].
     #[must_use]
     pub fn verifier(mut self, verifier: Arc<dyn auth::Verifier>) -> Self {
         self.verifier = Some(verifier);

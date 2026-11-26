@@ -105,9 +105,10 @@
 //!
 //! Aucune cryptographie, aucune signature, aucun TLS, aucun état : le noyau
 //! ne fait que comparer des chaînes et appeler des traits fournis par
-//! l'application. Les vérificateurs de signature (`auth-sign`) et de jetons
-//! (`auth-oauth`) sont d'autres lots ; l'application fournit le magasin de
-//! clés, l'écran de confirmation et le journal d'audit.
+//! l'application. Le vérificateur de signature est livré dans le
+//! sous-module `sign` (feature `auth-sign`) ; les jetons (`auth-oauth`)
+//! restent à l'application, qui fournit aussi le magasin de clés, l'écran
+//! de confirmation et le journal d'audit.
 
 use serde_json::Value;
 use std::cell::RefCell;

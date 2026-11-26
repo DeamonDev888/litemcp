@@ -3,7 +3,8 @@
 //!
 //! Le framework MCP (Model Context Protocol) le plus léger pour Rust :
 //! **Streamable HTTP stateless sur un socket bindé — zéro runtime async,
-//! `serde` + `serde_json` seulement.**
+//! trois dépendances directes seulement : `serde`, `serde_json` et
+//! `getrandom`.**
 //!
 //! Transport unique : Streamable HTTP — chaque message est un `POST /mcp`
 //! sur un socket TCP bindé, la réponse arrive en JSON ou en flux SSE.
@@ -107,9 +108,9 @@
 //! **Contrôle d'accès**
 //! ([`on_request`](crate::server::ServerBuilder::on_request)) : un verdict
 //! par requête HTTP — auth par token, rate-limit par source ou par clé —
-//! rejeté en `401`/`403`/`429` **avant la lecture du corps**. TLS et OIDC
-//! restent à la périphérie (gateway / mesh) ; le verrou applicatif, lui,
-//! vit ici.
+//! rejeté en `401`/`403`/`429` **avant la lecture du corps**. L'OIDC reste
+//! à la périphérie (gateway / mesh) ; le TLS 1.3 serveur est intégré
+//! derrière la feature `tls` ; le verrou applicatif, lui, vit ici.
 //!
 //! **Autorisation** ([`auth`]) : l'identité est établie par le transport
 //! ([`auth::AuthContext`]), les droits sont déclarés par élément

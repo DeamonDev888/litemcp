@@ -53,7 +53,8 @@
 //!
 //! Coût : deux dépendances de plus (`schemars` pour la dérivation,
 //! `jsonschema` pour l'exécution) — **uniquement** si vous activez la
-//! feature ; le cœur du crate garde exactement `serde` + `serde_json`.
+//! feature ; le cœur du crate garde exactement `serde`, `serde_json` et
+//! `getrandom`.
 
 use crate::zod::{Issues, Path, Schema};
 use serde_json::Value;
