@@ -26,7 +26,7 @@ comportements (codes, en-têtes, erreurs) et l'enveloppe obligatoire du profil s
 | `prompts/list` / `prompts/get` | `200` — catalogue et rendu (messages `user`/`assistant`, `content` = bloc `ContentBlock` complet : texte, image, audio, `resource_link`, ressource embarquée) ; nom inconnu : `-32602` ; `arguments` non-objet : `-32602` |
 | `completion/complete` | `200` — suggestions (`completion.values`, ≤ 100 : au-delà tronquées + `hasMore: true`) ; fournisseur absent ou params invalides (`ref`, `argument`) : `-32602` ; échec du fournisseur : `-32603` (data `handler_failed`) ; capacité `completions` annoncée seulement quand un fournisseur existe |
 | Résultat `input_required` (MRTR) | `200` — `{ resultType: "input_required", inputRequests?, requestState, _meta }` ; rejeu (id **différent**) avec `inputResponses` + écho du jeton ; état signé HMAC-SHA256 (TTL 10 min ; payload `v, method, digest, sub, turn, exp, state` — `sub` = client authentifié, présent seulement sous autorisation, exigé et comparé à la reprise ; l'`id` n'est **pas** lié, la spec exige un id différent au rejeu) : altéré/expiré/malformé/autre clé/requête modifiée/client différent → `-32602` avant tout handler ; requête embarquée dont la capacité client n'est pas déclarée → `-32021` ; requête embarquée invalide ou état > 8 Kio → `-32603` (bogue de handler, rien n'est émis) ; `inputResponses` sans `requestState` → `-32602` ; champs MRTR ignorés sur toute autre méthode |
-| `notifications/progress` | `200 text/event-stream` — flux ouvert **avant** le dispatch quand `_meta.progressToken` est fourni et que le client accepte SSE : chaque `progress::report` écrit une notification (jeton de la requête, `progress`/`total`/`message`), l'événement final clôt le flux ; le temps **cumulé** passé à écrire est borné par le budget d'écriture du serveur (épuisé → flux fermé, annulation levée), pas par une durée de vie ; sans jeton ou sans SSE, rapport ignoré et réponse JSON unique ; aucune notification après la réponse |
+| `notifications/progress` | `200 text/event-stream` — flux ouvert **avant** le dispatch quand `_meta.progressToken` est fourni, que l'`id` est une chaîne ou un nombre (`null`, booléen, tableau : `400` `-32600`, aucun flux) et que le client accepte SSE : chaque `progress::report` écrit une notification (jeton de la requête, `progress`/`total`/`message`), l'événement final clôt le flux ; le temps **cumulé** passé à écrire est borné par le budget d'écriture du serveur (épuisé → flux fermé, annulation levée), pas par une durée de vie ; sans jeton ou sans SSE, rapport ignoré et réponse JSON unique ; aucune notification après la réponse |
 | Annulation par fermeture du flux SSE (`2026-07-28`, MUST) | la première écriture SSE qui échoue (client déconnecté) lève le drapeau **coopératif** `litemcp::cancel` de la requête : le handler le consulte à ses points sûrs (`cancel::is_cancelled()`, jeton clonable via `cancel::token()`) et sort de lui-même. Aucune interruption n'est imposée (Rust n'a pas d'annulation de thread) et `notifications/cancelled` n'est pas traitée ; hors flux SSE, le drapeau vaut `false` |
 | Capacités `tools` / `resources` / `prompts` | **toujours** annoncées dans `server/discover` (et dans `initialize`, en profil legacy) — les méthodes correspondantes sont servies même à registre vide (aucune sous-capacité non servie déclarée) |
 | `Mcp-Method` / `Mcp-Name` (SEP-2243) | acceptés ; **incohérents avec le corps** → `-32020` (`HeaderMismatch`) |
@@ -39,7 +39,7 @@ comportements (codes, en-têtes, erreurs) et l'enveloppe obligatoire du profil s
 | `Content-Type` ≠ `application/json` | `415 Unsupported Media Type` (absent : accepté) |
 | `Transfer-Encoding` présent (toute route) · `Content-Length` dupliqué | `400` (anti request-smuggling) |
 | `Content-Type` / `Mcp-Method` / `Mcp-Name` dupliqués | `400` (en-têtes à valeur unique — un proxy combine ou retient la première valeur : le verdict ne doit pas dépendre de l'ordre) |
-| En-tête `Origin` non autorisé | `403` (garde DNS-rebinding ; exception par défaut : origine loopback strictement égale au `Host` et au listener sur un bind loopback ; CLI sans `Origin` : libre) |
+| En-tête `Origin` non autorisé | `403` (garde DNS-rebinding ; exception par défaut : origine loopback strictement égale au `Host` et au listener sur un bind loopback, au schéma réel du listener (`https://` sous TLS, `http://` refusé sur un listener TLS) ; CLI sans `Origin` : libre) |
 | Requête refusée par un verrou `on_request` | statut du rejet (`401`/`403`/`429`… — hors `400`–`599` corrigé à `400`), message en corps JSON-RPC, en-têtes supplémentaires **assainis** (nom hors jeton ou valeur à CRLF écartés), connexion fermée · hook en panique : `500` générique, le serveur continue · `/health` et les routes inconnues ne passent jamais par le verrou |
 | Toute erreur JSON-RPC | l'`id` de la requête est **repris** dans la réponse (JSON-RPC 2.0 §5) |
 
@@ -66,8 +66,9 @@ curl -s -i http://127.0.0.1:23080/mcp \
 | `_meta.io.modelcontextprotocol/protocolVersion` | obligatoire, valeur supportée | `400` + `-32602` (absente) / `-32022` (inconnue, `data.supported` fourni) |
 | `_meta.io.modelcontextprotocol/clientCapabilities` | obligatoire, objet JSON | `400` + `-32602` |
 
-`Mcp-Param-*` est accepté et vérifié quand il est présent. Le sentinel `=?base64?…?=` est décodé
-côté `Mcp-Name`.
+`Mcp-Param-*` est accepté et vérifié quand il est présent — un paramètre entier compare exactement
+toute la plage `u64` publiée par `z.uint()` (un `u64` au-delà de `i64::MAX` matche son en-tête).
+Le sentinel `=?base64?…?=` est décodé côté `Mcp-Name`.
 
 ### Profil legacy (`.legacy(true)`)
 
