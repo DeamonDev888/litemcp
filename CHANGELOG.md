@@ -19,6 +19,11 @@ Tests, CI et dépôt, plus un changement interne sans rupture d'API.
 - **Clé HMAC des `requestState` tirée paresseusement** (point 3.5 de la revue) : `ServerBuilder::new` ne consomme plus d'entropie ; la clé est tirée au premier `core()`/`bind()`, une seule fois, puis partagée par les clones (snapshots de gateway) et les appels suivants. Une clé fournie par `request_state_key` reste prioritaire et n'entraîne aucun tirage. La panique documentée (CSPRNG indisponible) se déplace de `new()` vers `core()`/`bind()`.
 - **Description du paquet** (`Cargo.toml`) : « trois dépendances directes » devient « un cœur qui ne dépend que de serde, serde_json et getrandom » — `litemcp-macros` est aussi une dépendance directe du build par défaut. Visible sur crates.io à la prochaine publication.
 
+### Corrigé
+
+- **Exception loopback même-origine sous TLS** (`http/connection.rs`) : le préfixe d'`Origin` attendu dans l'exception loopback stricte suit désormais le schéma réel du listener (`http://` en clair, `https://` sous `.tls(…)`) au lieu d'un `http://` en dur — un navigateur même-origine sur `https://127.0.0.1:PORT` n'est plus rejeté en 403, et une `Origin: http://…` sur un listener TLS l'est (audit 2026-11-25, B2).
+- **Flux SSE sur `id` malformé** (`http/sse.rs`) : un `id` `null`, booléen ou tableau portant un `progressToken` reçoit le `400` du noyau (`-32600`) au lieu d'ouvrir un flux `200 OK` avant le verdict (audit 2026-11-25, B9).
+
 ### Corrigé (CI)
 
 - **macOS : `m1_timeout_de_lecture_nest_plus_herite`** échouait depuis 0.12.1 (« la requête 1 doit réussir ») : le dribble en tranches régulières dépassait le budget de requête sur les runners macOS. La version intermédiaire passait, mais **ne détectait plus la régression**, ce qui a été vérifié en supprimant la restauration du timeout dans `handle_connection` : le timeout resserré restait au-dessus du gap testé. Le test resserre maintenant le timeout à 2,6 s (T ≈ 1,4 s, chaque attente du serveur sous `read_timeout`) puis exige un gap légal de 1,7 s. Il échoue bien si la restauration manque. La gigue d'un runner ne fait qu'allonger S, donc baisser T ; la détection suppose que le départ du budget de requête n'est pas retardé de plus de 0,3 s — c'est la marge retenue.

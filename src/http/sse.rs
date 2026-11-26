@@ -21,7 +21,10 @@ const PROGRESS_TOKEN_MARKER: &[u8] = b"progressToken";
 ///
 /// Une notification (sans `id`) ne reçoit aucun flux ; les méthodes non
 /// actionnables n'exécutent rien qui puisse rapporter une progression. Le
-/// jeton doit être une chaîne ou un nombre (forme fil de la spec).
+/// jeton doit être une chaîne ou un nombre (forme fil de la spec), et
+/// l'`id` doit être une chaîne ou un nombre : un `id` malformé (`null`,
+/// booléen, tableau) rejoint le chemin 400 du noyau au lieu d'ouvrir un
+/// flux 200 dont le verdict partirait dans l'événement final.
 pub(super) fn progress_token_of(body: &[u8]) -> Option<serde_json::Value> {
     if !body
         .windows(PROGRESS_TOKEN_MARKER.len())
@@ -31,7 +34,13 @@ pub(super) fn progress_token_of(body: &[u8]) -> Option<serde_json::Value> {
     }
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let request = value.as_object()?;
-    request.get("id")?;
+    // L'`id` doit être une chaîne ou un nombre (même forme que le jeton) :
+    // `get("id")?` laissait passer `"id": null` / `true` / `[]` et ouvrait
+    // le flux avant que le noyau ne rejette la requête en -32600.
+    match request.get("id") {
+        Some(serde_json::Value::String(_) | serde_json::Value::Number(_)) => {}
+        _ => return None,
+    }
     let method = request.get("method")?.as_str()?;
     if !crate::protocol::is_action(method) {
         return None;

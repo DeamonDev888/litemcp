@@ -37,8 +37,9 @@ pub(super) struct ConnectionEnv<'a> {
     pub(super) connection_ttl: Duration,
     pub(super) shutdown: &'a std::sync::atomic::AtomicBool,
     pub(super) is_loopback_listener: bool,
-    /// Schéma externe annoncé (`http` ou `https` selon TLS) — sert au
-    /// document RFC 9728, jamais à une décision.
+    /// Schéma externe (`http` ou `https` selon TLS) : annonce du document
+    /// RFC 9728 **et** préfixe attendu de l'`Origin` dans l'exception
+    /// loopback même-origine.
     pub(super) scheme: &'static str,
 }
 
@@ -760,7 +761,8 @@ pub(super) fn handle_connection(stream: Conn, env: ConnectionEnv<'_>) -> std::io
 
         // Exception loopback stricte (garde DNS-rebinding) : autorise par défaut une origine
         // loopback strictement cohérente avec le `Host` et le listener local,
-        // à condition que la requête ne soit pas cross-site et que le schéma soit http://.
+        // à condition que la requête ne soit pas cross-site et que le schéma
+        // de l'origine soit celui du listener (`http` ou `https` selon TLS).
         let local_addr = stream.local_addr().ok();
         if is_loopback_listener
             && !origin_allowed
@@ -774,10 +776,15 @@ pub(super) fn handle_connection(stream: Conn, env: ConnectionEnv<'_>) -> std::io
                 local_addr,
             ) {
                 if !origin_str.eq_ignore_ascii_case("null") {
-                    let scheme_auth = if origin_str.len() >= 7
-                        && origin_str[..7].eq_ignore_ascii_case("http://")
+                    // Préfixe attendu : le schéma **réel** du listener, pas
+                    // `http://` en dur — un navigateur même-origine sur TLS
+                    // porte `https://127.0.0.1:PORT` et était sinon rejeté.
+                    // La longueur suit le schéma (7 ou 8), sans troncature.
+                    let prefixe = format!("{scheme}://");
+                    let scheme_auth = if origin_str.len() >= prefixe.len()
+                        && origin_str[..prefixe.len()].eq_ignore_ascii_case(&prefixe)
                     {
-                        Some(&origin_str[7..])
+                        Some(&origin_str[prefixe.len()..])
                     } else {
                         None
                     };
